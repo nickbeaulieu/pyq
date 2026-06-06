@@ -47,6 +47,14 @@ If yes, don't rebuild it — unless we can do it **deeper** (see below).
    (suffix-based, alias-following, like `inputs`), so a hit means "appears to,"
    and effects behind dynamically/attribute-dispatched calls are not followed.
    "Is this pure / safe in a test / will it hit the network."
+6. **Mock-target drift** (`mock-targets`, shipped) — resolve every
+   `mock.patch("a.b.c")` string against the project and flag paths that no
+   longer exist. The point ruff/pyright miss: `patch` binds *where a name is
+   looked up*, not where it's defined, so the index recording import bindings as
+   defs is exactly what makes this resolvable. High-precision by construction —
+   `drifted` only when the prefix is a project module and the name is provably
+   absent; third-party (`external`), computed (`dynamic`), and
+   non-class-attribute (`unverifiable`) targets are reported but never flagged.
 
 ## Worth building *deeper* than the existing tools (the exception to the filter)
 These exist elsewhere but a pyq-native version is better because it rides the

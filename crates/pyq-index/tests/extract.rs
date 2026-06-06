@@ -355,3 +355,37 @@ fn a_pure_function_records_no_effects_for_its_scope() {
         idx.effects
     );
 }
+
+const MOCKS: &str = r#"
+from unittest import mock
+from unittest.mock import patch
+
+@patch("a.b.thing")
+def test_one(m): ...
+
+def test_two():
+    with mock.patch("c.d") as p:
+        ...
+    patch("e.f" + g)              # computed first arg -> dynamic
+    mock.patch.object(Foo, "bar") # patch.object -> not a string-target patch
+    patch.dict("os.environ", {})  # patch.dict -> excluded too
+"#;
+
+#[test]
+fn captures_string_target_patch_calls_only() {
+    let idx = extract("t.py", MOCKS);
+    let targets: Vec<Option<&str>> = idx
+        .mocks
+        .iter()
+        .map(|m| m.target.as_deref())
+        .collect();
+
+    // Decorator and `with` string-target forms are captured …
+    assert!(targets.contains(&Some("a.b.thing")), "{targets:?}");
+    assert!(targets.contains(&Some("c.d")), "{targets:?}");
+    // … a computed first arg is captured as a dynamic (None) target …
+    assert!(targets.contains(&None), "computed target should be recorded: {targets:?}");
+    // … and `patch.object`/`patch.dict` are NOT (their target isn't a dotted string).
+    assert!(!targets.contains(&Some("os.environ")), "patch.dict must be excluded: {targets:?}");
+    assert_eq!(idx.mocks.len(), 3, "exactly the three patch(...) calls: {targets:?}");
+}

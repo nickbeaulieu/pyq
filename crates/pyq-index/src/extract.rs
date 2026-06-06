@@ -10,8 +10,8 @@ use ruff_python_parser::parse_unchecked_source;
 use ruff_text_size::{Ranged, TextSize};
 
 use crate::model::{
-    Def, DefKind, Effect, EffectKind, FileIndex, ImportContext, ImportStmt, Input, InputKind, Pos,
-    Ref,
+    Def, DefKind, Effect, EffectKind, FileIndex, ImportContext, ImportStmt, Input, InputKind,
+    MockTarget, Pos, Ref,
 };
 
 /// Parse `source` and extract its facts. `path` is recorded verbatim for output.
@@ -40,6 +40,7 @@ pub fn extract(path: &str, source: &str) -> FileIndex {
         inputs: Vec::new(),
         imports: Vec::new(),
         effects: Vec::new(),
+        mocks: Vec::new(),
     };
     for stmt in &parsed.syntax().body {
         collector.visit_stmt(stmt);
@@ -51,6 +52,7 @@ pub fn extract(path: &str, source: &str) -> FileIndex {
         inputs: collector.inputs,
         imports: collector.imports,
         effects: collector.effects,
+        mocks: collector.mocks,
     }
 }
 
@@ -70,6 +72,7 @@ struct Collector<'src> {
     inputs: Vec<Input>,
     imports: Vec<ImportStmt>,
     effects: Vec<Effect>,
+    mocks: Vec<MockTarget>,
 }
 
 impl<'src> Collector<'src> {
@@ -118,6 +121,30 @@ impl<'src> Collector<'src> {
             }
             _ => {}
         }
+    }
+
+    /// Capture a `mock.patch("target")` call site — the dotted lookup path the
+    /// patch replaces. Matches the string-target form of `patch` regardless of
+    /// how it's imported (`mock.patch`, `unittest.mock.patch`, bare `patch`,
+    /// `@patch(...)`); the `patch.object`/`patch.dict` forms (whose callee ends
+    /// `.object`/`.dict`) are deliberately excluded — their target isn't a
+    /// dotted string. A non-literal first argument is recorded as `None`
+    /// (computed → unverifiable), so it's reported, never silently dropped.
+    fn collect_mock(&mut self, call: &ruff_python_ast::ExprCall) {
+        let Some(callee) = dotted_name(&call.func) else {
+            return;
+        };
+        if callee != "patch" && !callee.ends_with(".patch") {
+            return;
+        }
+        let target = match call.arguments.args.first() {
+            Some(Expr::StringLiteral(s)) => Some(s.value.to_str().to_string()),
+            _ => None,
+        };
+        self.mocks.push(MockTarget {
+            target,
+            pos: self.pos(call.range().start()),
+        });
     }
 
     /// Detect env-var reads and literal file opens. Syntactic and
@@ -331,6 +358,7 @@ impl<'src, 'ast> Visitor<'ast> for Collector<'src> {
         // A call's callee, when a bare name, is recorded as a call reference and
         // we skip re-walking it as a plain load (so `f` in `f()` is one ref).
         if let Expr::Call(call) = expr {
+            self.collect_mock(call);
             if let Expr::Name(n) = call.func.as_ref() {
                 self.refs.push(Ref {
                     name: n.id.as_str().to_string(),

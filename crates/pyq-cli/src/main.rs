@@ -6,6 +6,7 @@
 //! a directory of Python files, single-file name resolution.
 
 mod graph;
+mod mock;
 mod walk;
 
 use clap::{Parser, Subcommand};
@@ -64,6 +65,10 @@ enum Command {
     /// The external input surface — env vars, literal files opened, CLI args,
     /// and pydantic settings fields. "What does this need to run."
     Inputs,
+    /// Resolve every `mock.patch("a.b.c")` target against the project and flag
+    /// drifted paths — a patch whose target no longer exists silently does
+    /// nothing, so the test passes while exercising the real code.
+    MockTargets,
     /// The project import graph. With no module: every import edge. With a
     /// module (`pkg.models` or `pkg/models.py`): what it imports, or — with
     /// `--reverse` — who imports it (blast radius). `--cycles`: import cycles.
@@ -123,6 +128,10 @@ fn dispatch(cli: &Cli) -> anyhow::Result<Envelope> {
         Command::Inputs => {
             let files = walk::index_tree(&cli.root)?;
             query_inputs(&files)
+        }
+        Command::MockTargets => {
+            let files = walk::index_tree(&cli.root)?;
+            query_mock_targets(&files)
         }
         Command::Imports {
             module,
@@ -389,6 +398,61 @@ fn query_inputs(files: &[FileIndex]) -> Envelope {
     let summary = format!("{} inputs", results.len());
     // Uniform query schema: every verb echoes kind + target (null where none).
     Envelope::new(json!({ "kind": "inputs", "target": null }), results).with_summary(summary)
+}
+
+/// Every `mock.patch("...")` target across the tree, resolved against the
+/// project. Drifted targets (a real project module, missing the looked-up name)
+/// are the actionable signal — surfaced as warnings as well as results.
+fn query_mock_targets(files: &[FileIndex]) -> Envelope {
+    let resolver = mock::PatchResolver::build(files);
+    let mut rows: Vec<(String, serde_json::Value)> = Vec::new();
+    let mut warnings = Vec::new();
+    let mut drifted = 0usize;
+    for f in files {
+        for m in &f.mocks {
+            let status = resolver.resolve(m.target.as_deref());
+            let loc = format!("{}:{}:{}", f.path, m.pos.line, m.pos.col);
+            let shown = m.target.as_deref().unwrap_or("<dynamic>");
+            let tag = status.tag();
+            let detail = match &status {
+                mock::Status::Drifted(why) | mock::Status::Unverifiable(why) => Some(why.clone()),
+                _ => None,
+            };
+            let label = match &detail {
+                Some(why) => format!("{tag} {shown} — {why}"),
+                None => format!("{tag} {shown}"),
+            };
+            if matches!(status, mock::Status::Drifted(_)) {
+                drifted += 1;
+                warnings.push(format!("drifted patch `{shown}` ({loc}): {}", detail.clone().unwrap_or_default()));
+            }
+            rows.push((
+                loc.clone(),
+                json!({
+                    "loc": loc,
+                    "label": label,
+                    "target": m.target,
+                    "status": tag,
+                }),
+            ));
+        }
+    }
+    rows.sort_by(|a, b| a.0.cmp(&b.0));
+    let results: Vec<serde_json::Value> = rows.into_iter().map(|(_, v)| v).collect();
+    let n = results.len();
+    let summary = if n == 0 {
+        "no mock.patch targets".to_string()
+    } else if drifted == 0 {
+        format!("{n} patch {}, none drifted", plural(n, "target"))
+    } else {
+        format!(
+            "{n} patch {}, {drifted} drifted",
+            plural(n, "target")
+        )
+    };
+    Envelope::new(json!({ "kind": "mock-targets", "target": null }), results)
+        .with_summary(summary)
+        .with_warnings(warnings)
 }
 
 /// The project import graph. Modes: cycles, reverse deps, forward deps, or —

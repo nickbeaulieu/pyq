@@ -31,6 +31,7 @@ pyq defs User                 # every definition of `User`
 pyq graph main                # everything `main` transitively calls
 pyq graph User --reverse      # everything that transitively reaches `User`
 pyq effects handle_request    # side effects it transitively performs (io/net/db/…)
+pyq mock-targets              # resolve every mock.patch("…") — flag drifted paths
 pyq inputs                    # the external input surface of the project
 pyq imports pkg.models --reverse   # who imports pkg.models (blast radius)
 pyq imports --cycles          # import cycles among project modules
@@ -45,6 +46,7 @@ pyq imports --cycles          # import cycles among project modules
 | `defs <symbol>` | Every definition (function/class/variable/import binding), each tagged `role` (`definition`/`binding`); a `binding` points at its canonical def via `resolves_to`. |
 | `graph <symbol>` | The transitive call graph: everything the symbol calls (forward closure), or — with `--reverse` — everything that calls it. Nodes are stable fully-qualified IDs (`pkg.models.User.__init__`) re-queryable after edits; `--depth N` caps the hops. |
 | `effects <symbol>` | The transitive effect surface: which side effects (`fs`, `network`, `subprocess`, `env`, `db`, `random`, `clock`, `global`) the symbol and everything it transitively calls statically perform, plus import-time effects of the modules involved. "Is this pure / safe in a test." |
+| `mock-targets` | Resolve every `mock.patch("a.b.c")` target against the project and flag *drifted* paths — a patch whose looked-up name no longer exists silently no-ops, so the test passes while exercising the real code. |
 | `inputs` | What the code needs to run: env vars, literal files opened, CLI args (argparse/click), pydantic settings fields. |
 | `imports [module]` | The import graph. No arg: every edge. With a module: what it imports; `--reverse`: who imports it (blast radius); `--cycles`: import cycles. Accepts a module name or a file path. |
 
@@ -133,6 +135,37 @@ callable. Detection is syntactic and over-approximate by design: a hit means the
 code *appears* to perform the effect, and — as with `callers` — effects behind
 calls that resolve through attribute/dynamic dispatch aren't followed, so "pure"
 means "no effect found," not a proof of purity.
+
+## Mock-target drift
+
+`mock.patch` replaces a name *where it is looked up*, not where it is defined —
+so a test patches `myapp.client.requests` because `client.py` does `import
+requests`. Refactor that import away and the patch silently does nothing: the
+test keeps passing while it now exercises the real `requests`. `mock-targets`
+resolves every `patch("…")` string against the project's actual module/symbol
+structure (import bindings included, since the index records them) and flags the
+ones that no longer resolve.
+
+```console
+$ pyq mock-targets --root path/to/project
+8 patch targets, 2 drifted
+tests_demo.py:13:10  drifted myapp.client.Client.gone — `gone` is not a member of `myapp.client.Client`
+tests_demo.py:17:10  drifted myapp.client.deleted_fn — `deleted_fn` is not bound in module `myapp.client`
+tests_demo.py:4:2    valid myapp.client.requests
+tests_demo.py:11:10  valid myapp.client.Client.fetch
+tests_demo.py:19:10  external os.path.exists
+tests_demo.py:22:10  dynamic <dynamic>
+...
+! drifted patch `myapp.client.Client.gone` (tests_demo.py:13:10): `gone` is not a member of `myapp.client.Client`
+! drifted patch `myapp.client.deleted_fn` (tests_demo.py:17:10): `deleted_fn` is not bound in module `myapp.client`
+```
+
+Precision over recall: a target is `drifted` only when its prefix is a *project*
+module and the looked-up name is provably absent. Targets into third-party /
+stdlib modules (`external`) and computed, non-literal targets (`dynamic`) are
+reported but never flagged broken, and an attribute on a non-class binding is
+`unverifiable` — so a flagged drift is a real one. (`patch.object` /
+`patch.dict`, whose target isn't a dotted string, are out of scope.)
 
 ## Output envelope
 

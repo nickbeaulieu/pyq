@@ -41,8 +41,6 @@ completed work is logged at the bottom. `→ blocked by #N` marks a dependency.
   `@pytest.fixture`, `@celery.task`, …), specialized into route maps
   (Flask/FastAPI/Django), ORM model maps (SQLAlchemy/Django), and registry/DI maps
   (click/celery/signals/`entry_points`).
-- **#18 · `mock-targets` verb.** Every `mock.patch("a.b.c")` string resolved
-  against the graph to flag drifted/invalid patch paths. → blocked by #16
 - **#19 · `raises` verb — static exception surface.** What a function transitively
   `raise`s and where it's caught. "What can blow up if I call this." (now
   unblocked: `CallGraph` forward closure)
@@ -72,6 +70,13 @@ completed work is logged at the bottom. `→ blocked by #N` marks a dependency.
 ## Completed
 
 ### Verbs & infrastructure
+- **#18 · `mock-targets` verb.** Resolve every `mock.patch("a.b.c")` string
+  against the project's module/symbol structure and flag *drifted* paths (the
+  patch-where-looked-up gotcha — a silently-no-op patch). Built a focused
+  syntactic resolver (modules + top-level bound names incl. import bindings +
+  class members) rather than waiting on the full #16 resolution surface.
+  High-precision: `drifted` only when the module is first-party and the name is
+  provably absent; `external`/`dynamic`/`unverifiable` are reported, not flagged.
 - **#11 · `effects` verb — static effect surface.** Transitive effect surface as
   a projection of `CallGraph`'s forward closure: `fs`/`network`/`subprocess`/
   `env`/`db`/`random`/`clock`/`global` per reachable callable, each attributed to

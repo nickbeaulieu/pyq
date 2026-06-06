@@ -9,6 +9,6 @@ pub mod model;
 
 pub use extract::extract;
 pub use model::{
-    Def, DefKind, Effect, EffectKind, FileIndex, ImportContext, ImportStmt, Input, InputKind, Pos,
-    Ref,
+    Def, DefKind, Effect, EffectKind, FileIndex, ImportContext, ImportStmt, Input, InputKind,
+    MockTarget, Pos, Ref,
 };

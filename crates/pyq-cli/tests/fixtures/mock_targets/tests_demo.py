@@ -1,0 +1,26 @@
+from unittest import mock
+from unittest.mock import patch
+
+
+@patch("myapp.client.requests")
+def test_a(m): ...
+
+
+@mock.patch("myapp.client.requests.get")
+def test_b(m): ...
+
+
+def test_c():
+    with patch("myapp.client.Client.fetch"):
+        ...
+    with patch("myapp.client.Client.gone"):
+        ...
+    with patch("myapp.client.helper"):
+        ...
+    with patch("myapp.client.deleted_fn"):
+        ...
+    with patch("os.path.exists"):
+        ...
+    target = "myapp.client." + "helper"
+    with patch(target):
+        ...

@@ -154,6 +154,17 @@ pub struct ImportStmt {
     pub pos: Pos,
 }
 
+/// A `mock.patch("target")` call site — the dotted lookup path the patch
+/// replaces at runtime. Resolving it against the project flags drifted/typo'd
+/// paths: a patch whose target no longer exists silently does nothing, and the
+/// test passes while testing the real code. `target` is `None` when the first
+/// argument isn't a string literal (computed → not statically verifiable).
+#[derive(Clone, Debug, Serialize)]
+pub struct MockTarget {
+    pub target: Option<String>,
+    pub pos: Pos,
+}
+
 /// All facts extracted from one Python module.
 #[derive(Clone, Debug, Serialize)]
 pub struct FileIndex {
@@ -163,4 +174,5 @@ pub struct FileIndex {
     pub inputs: Vec<Input>,
     pub imports: Vec<ImportStmt>,
     pub effects: Vec<Effect>,
+    pub mocks: Vec<MockTarget>,
 }

@@ -605,6 +605,66 @@ fn effects_unknown_symbol_warns_and_exits_zero() {
         .any(|w| w.as_str().unwrap().contains("no function or class")));
 }
 
+// `mock-targets` resolves every `mock.patch("a.b.c")` string against the
+// project and flags the ones that no longer resolve. The win: a patch into a
+// real project module whose looked-up name is gone is *drifted* — it silently
+// no-ops, so the test passes while exercising the real code.
+#[test]
+fn mock_targets_flags_drifted_and_keeps_valid() {
+    let root = fixture("mock_targets");
+    let (env, ok) = run_json_in(&root, &["mock-targets"]);
+    assert!(ok);
+    assert_eq!(env["query"]["kind"], "mock-targets");
+
+    // status by target string
+    let status: std::collections::HashMap<&str, &str> = env["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|r| Some((r["target"].as_str()?, r["status"].as_str().unwrap())))
+        .collect();
+
+    // Patching an imported name resolves (patch-where-looked-up): client.py
+    // does `import requests`, so the binding exists.
+    assert_eq!(status.get("myapp.client.requests"), Some(&"valid"));
+    // An existing method resolves.
+    assert_eq!(status.get("myapp.client.Client.fetch"), Some(&"valid"));
+    assert_eq!(status.get("myapp.client.helper"), Some(&"valid"));
+
+    // The two drifted targets: module is ours, the name/member is gone.
+    assert_eq!(status.get("myapp.client.deleted_fn"), Some(&"drifted"));
+    assert_eq!(status.get("myapp.client.Client.gone"), Some(&"drifted"));
+
+    // Precision: third-party/stdlib and computed targets are NOT flagged broken.
+    assert_eq!(status.get("os.path.exists"), Some(&"external"));
+    // An attribute on an imported (non-project-class) object is unverifiable,
+    // never a false "drifted".
+    assert_eq!(status.get("myapp.client.requests.get"), Some(&"unverifiable"));
+}
+
+// The drifted targets are elevated to warnings (the actionable signal), and the
+// summary counts them; a clean run still exits 0.
+#[test]
+fn mock_targets_surfaces_drift_as_warnings() {
+    let root = fixture("mock_targets");
+    let (env, ok) = run_json_in(&root, &["mock-targets"]);
+    assert!(ok);
+    assert!(env["summary"].as_str().unwrap().contains("2 drifted"), "{env}");
+    let warnings = env["warnings"].as_array().unwrap();
+    assert_eq!(warnings.len(), 2, "one warning per drifted target: {env}");
+    assert!(warnings
+        .iter()
+        .any(|w| w.as_str().unwrap().contains("deleted_fn")));
+    // The dynamic (computed) target is reported but not a warning.
+    let dynamic = env["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["status"] == "dynamic")
+        .expect("the computed target is still reported");
+    assert!(dynamic["target"].is_null());
+}
+
 #[test]
 fn imports_lists_edges_and_marks_external() {
     let (env, ok) = run_json(&["imports"]);
