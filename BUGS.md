@@ -63,35 +63,6 @@ grep-replacement. Residual nicety: when `--syntactic` answers `refs`/`callers`
 for a name only ever used via attribute access, emit a warning rather than a
 bare 0, since the debug path itself has no over-approximation flag.
 
-## P1 — `refs` misses alias call sites that `callers` finds (verbs disagree)
-With an aliased import `from pkg.core import make_widget as mw` and two `mw()`
-calls:
-
-```
-callers make_widget  → 2   (app.py:2 mw(), app.py:3 mw() — alias resolved ✓)
-refs    make_widget  → 3   (app.py:1 import binding, pkg/__init__.py re-export,
-                            pkg/core.py def — NONE of the actual call sites)
-```
-
-`callers` resolves the alias back to the origin and finds the real uses; `refs`
-lists only the alias's *binding* line and misses every *call* through it. So for
-an aliased symbol the two verbs are nearly disjoint on usage, and `callers ⊄
-refs` — even though every call is a reference and `refs` is documented as "every
-reference (reads and calls)." An agent running `refs X` to see everything
-touching `X` sees the import line but concludes it's barely used when it's called
-twice; only `callers` reveals the truth. Either `refs` should follow the alias to
-its use sites (preferred — match `callers`), or the verbs' alias semantics need
-reconciling and documenting.
-
-(Re-export through `__init__.py` and `import as` aliasing otherwise work well —
-see Confirmed working. `callers` is the verb that gets aliases right.)
-
-Scope: this is **specific to `import as` renames**. With a plain
-`from lib import thing` + two `thing()` calls, `refs thing` = 4 *does* include
-both call sites (reads) — `callers ⊆ refs` holds. The defect is that `refs`
-matches the queried name (`make_widget`) and never crosses to uses under the
-renamed binding (`mw`), whereas `callers`/call_hierarchy follows the rename.
-
 ## P2 — `callers`/`refs` union over same-named defs with no way to target one
 Two unrelated classes each defining `process`:
 
@@ -181,8 +152,8 @@ Optimize for "an agent can act on this without double-checking."
 - `callers` is alias-aware: a call through `import as`/re-export resolves back to
   the origin (`make_widget()` and aliased `mw()` both attributed to
   `make_widget`). Re-export through `__init__.py` resolves correctly; `defs`
-  points to the single origin. (But `refs` does NOT follow the alias — see the
-  P1 above.)
+  points to the single origin. `refs` now folds these call sites in too
+  (`callers ⊆ refs`).
 - Decorators & `@property`: decorator application (`@my_decorator`) counts as a
   caller; property access (`c.value`) is a read; calls to a decorated method
   resolve to its def.

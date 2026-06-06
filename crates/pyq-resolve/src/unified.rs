@@ -57,10 +57,18 @@ impl UnifiedResolver {
 
 impl Resolver for UnifiedResolver {
     fn references(&self, symbol: &str) -> Result<Vec<Loc>> {
-        Ok(Self::union_prefer_ty(
-            self.ty.references(symbol)?,
-            self.syntactic.references(symbol)?,
-        ))
+        let mut ty = self.ty.references(symbol)?;
+        // Every call is a reference. ty's `call_hierarchy` follows `import as` /
+        // re-export renames that `find_references` misses, so fold the call
+        // sites in — otherwise `refs` under-reports an aliased symbol that
+        // `callers` finds, and `callers ⊄ refs` despite the docs. Relabel as a
+        // plain `call` reference (drop the enclosing-function name `callers`
+        // uses); de-dup by location drops any already found as a reference.
+        ty.extend(self.ty.callers(symbol)?.into_iter().map(|mut l| {
+            l.kind = "call".to_string();
+            l
+        }));
+        Ok(Self::union_prefer_ty(ty, self.syntactic.references(symbol)?))
     }
 
     fn callers(&self, symbol: &str) -> Result<Vec<Loc>> {

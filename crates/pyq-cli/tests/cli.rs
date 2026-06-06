@@ -194,6 +194,27 @@ fn refs_finds_function_local_via_syntactic_fallback() {
     );
 }
 
+// Regression: every call is a reference, so `callers ⊆ refs`. For an aliased
+// import (`from pkg.core import make_widget as mw; mw()`), find_references misses
+// the call sites under the rename but call_hierarchy follows it — refs must fold
+// those in, or an agent reading `refs` concludes an aliased symbol is unused.
+#[test]
+fn refs_includes_aliased_call_sites_that_callers_finds() {
+    let root = fixture("alias");
+    let (refs, ok) = run_json_in(&root, &["refs", "make_widget"]);
+    assert!(ok);
+    let (callers, ok) = run_json_in(&root, &["callers", "make_widget"]);
+    assert!(ok);
+
+    let ref_locs: std::collections::HashSet<_> = locs(&refs).into_iter().collect();
+    for call in locs(&callers) {
+        assert!(ref_locs.contains(&call), "callers ⊆ refs: {call} missing from refs");
+    }
+    // Both aliased `mw()` call sites are present as references.
+    assert!(ref_locs.iter().any(|l| l.starts_with("app.py:5:")));
+    assert!(ref_locs.iter().any(|l| l.starts_with("app.py:6:")));
+}
+
 #[test]
 fn callers_via_ty_finds_the_call_site() {
     let (env, ok) = run_json(&["callers", "make_user"]);
