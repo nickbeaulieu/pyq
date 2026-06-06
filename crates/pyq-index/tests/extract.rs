@@ -79,6 +79,44 @@ open("settings.ini")
 }
 
 #[test]
+fn captures_cli_args_and_settings_fields() {
+    let src = r#"
+import argparse, click
+from pydantic_settings import BaseSettings
+
+class Settings(BaseSettings):
+    db_url: str
+    port: int = 5432
+    debug = False
+
+p = argparse.ArgumentParser()
+p.add_argument("--verbose")
+
+@click.option("--count")
+def run(count):
+    pass
+"#;
+    let idx = extract("cli.py", src);
+
+    let args: Vec<&str> = idx
+        .inputs
+        .iter()
+        .filter(|i| i.kind == InputKind::Arg)
+        .map(|i| i.value.as_str())
+        .collect();
+    assert!(args.contains(&"--verbose"));
+    assert!(args.contains(&"--count"));
+
+    let settings: Vec<&str> = idx
+        .inputs
+        .iter()
+        .filter(|i| i.kind == InputKind::Setting)
+        .map(|i| i.value.as_str())
+        .collect();
+    assert_eq!(settings, vec!["db_url", "port"]); // `debug` is unannotated
+}
+
+#[test]
 fn parse_errors_are_non_fatal() {
     // A half-written file an agent is mid-edit on still answers.
     let idx = extract("broken.py", "def f(:\n    User(");

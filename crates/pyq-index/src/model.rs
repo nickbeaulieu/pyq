@@ -61,6 +61,10 @@ pub enum InputKind {
     Env,
     /// A literal filesystem path opened (`open("...")`).
     File,
+    /// A CLI argument (argparse `add_argument`, click `@option`/`@argument`).
+    Arg,
+    /// A settings field on a pydantic `BaseSettings` subclass.
+    Setting,
 }
 
 /// All facts extracted from one Python module.

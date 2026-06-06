@@ -170,6 +170,8 @@ fn query_inputs(files: &[FileIndex]) -> Envelope {
             let kind = match i.kind {
                 InputKind::Env => "env",
                 InputKind::File => "file",
+                InputKind::Arg => "arg",
+                InputKind::Setting => "setting",
             };
             results.push(json!({
                 "loc": format!("{}:{}:{}", f.path, i.pos.line, i.pos.col),

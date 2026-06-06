@@ -18,11 +18,13 @@ If yes, don't rebuild it — unless we can do it **deeper** (see below).
    `defs`. The grep-replacement: every use/def of a name as data. Pyright computes
    this but only hands it out one position at a time over LSP; there is no clean
    "all callers of X as JSON" CLI. Highest leverage.
-2. **Input / config surface** (`inputs`, first cut shipped) — env reads
-   (`os.getenv`/`os.environ[...]`/`.get`) and literal `open()` paths today;
-   computed keys/paths bucket to `<dynamic>` rather than guess. CLI args
-   (`argparse`/`click`) and settings fields are the next additions. Pure AST
-   walk on the syntactic path (no db). "What does this need to run."
+2. **Input / config surface** (`inputs`, shipped) — env reads
+   (`os.getenv`/`os.environ[...]`/`.get`), literal `open()` paths, CLI args
+   (argparse `add_argument`, click `@option`/`@argument`), and pydantic
+   `BaseSettings` fields. Computed keys/paths bucket to `<dynamic>` rather than
+   guess; arg detection is suffix-matched (`.add_argument`/`.option`/
+   `.argument`), so over-approximate by design. Pure AST walk on the syntactic
+   path (no db). "What does this need to run."
 3. **Import / dependency graph as data** — reverse deps + cycles, for blast-radius
    ("what breaks if I edit this file"). Cheap projection of the resolved graph
    built for #1.

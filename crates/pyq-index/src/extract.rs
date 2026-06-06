@@ -5,7 +5,7 @@
 //! agent is mid-edit on should still answer queries).
 
 use ruff_python_ast::visitor::{walk_expr, walk_stmt, Visitor};
-use ruff_python_ast::{Expr, ExprContext, Stmt};
+use ruff_python_ast::{Expr, ExprContext, Stmt, StmtClassDef};
 use ruff_text_size::{Ranged, TextSize};
 
 use crate::model::{Def, DefKind, FileIndex, Input, InputKind, Pos, Ref};
@@ -76,6 +76,16 @@ impl<'src> Collector<'src> {
                             self.push_input(InputKind::File, path, expr.range().start());
                         }
                     }
+                    // argparse `parser.add_argument("--flag")` and click
+                    // `@click.option("--flag")` / `@click.argument("name")`.
+                    _ if callee.ends_with(".add_argument")
+                        || callee.ends_with(".option")
+                        || callee.ends_with(".argument") =>
+                    {
+                        if let Some(name) = literal_str(first) {
+                            self.push_input(InputKind::Arg, name, expr.range().start());
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -112,6 +122,21 @@ impl<'src, 'ast> Visitor<'ast> for Collector<'src> {
             }
             Stmt::ClassDef(c) => {
                 self.push_def(c.name.as_str(), DefKind::Class, c.name.start());
+                // A pydantic BaseSettings subclass: its annotated class-level
+                // fields are configuration inputs.
+                if class_bases(c).any(|b| b.ends_with("BaseSettings")) {
+                    for member in &c.body {
+                        if let Stmt::AnnAssign(ann) = member {
+                            if let Expr::Name(target) = ann.target.as_ref() {
+                                self.push_input(
+                                    InputKind::Setting,
+                                    target.id.as_str().to_string(),
+                                    target.start(),
+                                );
+                            }
+                        }
+                    }
+                }
                 self.depth += 1;
                 walk_stmt(self, stmt);
                 self.depth -= 1;
@@ -183,6 +208,14 @@ fn dotted_name(expr: &Expr) -> Option<String> {
         Expr::Attribute(a) => Some(format!("{}.{}", dotted_name(&a.value)?, a.attr.as_str())),
         _ => None,
     }
+}
+
+/// Dotted names of a class's base classes.
+fn class_bases(c: &StmtClassDef) -> impl Iterator<Item = String> + '_ {
+    c.arguments
+        .iter()
+        .flat_map(|a| a.args.iter())
+        .filter_map(dotted_name)
 }
 
 /// The value of a string-literal argument, if the expr is one.
