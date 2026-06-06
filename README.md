@@ -29,6 +29,8 @@ pyq refs User                 # every reference to `User` across the tree
 pyq callers make_user         # every call site of `make_user`
 pyq defs User                 # every definition of `User`
 pyq inputs                    # the external input surface of the project
+pyq imports pkg.models --reverse   # who imports pkg.models (blast radius)
+pyq imports --cycles          # import cycles among project modules
 ```
 
 ### Verbs
@@ -39,6 +41,7 @@ pyq inputs                    # the external input surface of the project
 | `callers <symbol>` | Every call site of a symbol. | ty |
 | `defs <symbol>` | Every definition (function/class/variable/import binding). | ty |
 | `inputs` | What the code needs to run: env vars, literal files opened, CLI args (argparse/click), pydantic settings fields. | syntactic |
+| `imports [module]` | The import graph. No arg: every edge. With a module: what it imports; `--reverse`: who imports it (blast radius); `--cycles`: import cycles. Accepts a module name or a file path. | syntactic |
 
 ### Flags
 

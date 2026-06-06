@@ -8,7 +8,7 @@ use ruff_python_ast::visitor::{walk_expr, walk_stmt, Visitor};
 use ruff_python_ast::{Expr, ExprContext, Stmt, StmtClassDef};
 use ruff_text_size::{Ranged, TextSize};
 
-use crate::model::{Def, DefKind, FileIndex, Input, InputKind, Pos, Ref};
+use crate::model::{Def, DefKind, FileIndex, ImportStmt, Input, InputKind, Pos, Ref};
 
 /// Parse `source` and extract its facts. `path` is recorded verbatim for output.
 pub fn extract(path: &str, source: &str) -> FileIndex {
@@ -21,6 +21,7 @@ pub fn extract(path: &str, source: &str) -> FileIndex {
         defs: Vec::new(),
         refs: Vec::new(),
         inputs: Vec::new(),
+        imports: Vec::new(),
     };
     if let Ok(parsed) = parsed {
         for stmt in &parsed.syntax().body {
@@ -32,6 +33,7 @@ pub fn extract(path: &str, source: &str) -> FileIndex {
         defs: collector.defs,
         refs: collector.refs,
         inputs: collector.inputs,
+        imports: collector.imports,
     }
 }
 
@@ -42,6 +44,7 @@ struct Collector<'src> {
     defs: Vec<Def>,
     refs: Vec<Ref>,
     inputs: Vec<Input>,
+    imports: Vec<ImportStmt>,
 }
 
 impl<'src> Collector<'src> {
@@ -153,6 +156,13 @@ impl<'src, 'ast> Visitor<'ast> for Collector<'src> {
                 for alias in &i.names {
                     let bound = alias.asname.as_ref().unwrap_or(&alias.name);
                     self.push_def(bound.as_str(), DefKind::Import, bound.start());
+                    // `import a.b` is an edge to the module `a.b` (level 0).
+                    self.imports.push(ImportStmt {
+                        module: alias.name.as_str().to_string(),
+                        level: 0,
+                        names: Vec::new(),
+                        pos: self.pos(i.start()),
+                    });
                 }
             }
             Stmt::ImportFrom(i) => {
@@ -160,6 +170,14 @@ impl<'src, 'ast> Visitor<'ast> for Collector<'src> {
                     let bound = alias.asname.as_ref().unwrap_or(&alias.name);
                     self.push_def(bound.as_str(), DefKind::Import, bound.start());
                 }
+                // `from <module> import a, b` is one edge to `<module>`; `names`
+                // lets the graph resolve `from . import sub` into submodule edges.
+                self.imports.push(ImportStmt {
+                    module: i.module.as_ref().map(|m| m.as_str().to_string()).unwrap_or_default(),
+                    level: i.level,
+                    names: i.names.iter().map(|a| a.name.as_str().to_string()).collect(),
+                    pos: self.pos(i.start()),
+                });
             }
             _ => {}
         }

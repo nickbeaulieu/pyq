@@ -67,6 +67,22 @@ pub enum InputKind {
     Setting,
 }
 
+/// An import statement's module target — an edge in the dependency graph.
+/// Captures the written module and relative-import depth; name binding is
+/// already recorded separately as an [`Import`](DefKind::Import) def.
+#[derive(Clone, Debug, Serialize)]
+pub struct ImportStmt {
+    /// The dotted module as written (`pkg.models`). Empty for `from . import x`,
+    /// where the targets are the imported `names` under the resolved package.
+    pub module: String,
+    /// Leading-dot count for a relative import (`0` = absolute).
+    pub level: u32,
+    /// The imported names, used only to resolve `from <pkg> import <name>` into
+    /// submodule edges; empty for plain `import x`.
+    pub names: Vec<String>,
+    pub pos: Pos,
+}
+
 /// All facts extracted from one Python module.
 #[derive(Clone, Debug, Serialize)]
 pub struct FileIndex {
@@ -74,4 +90,5 @@ pub struct FileIndex {
     pub defs: Vec<Def>,
     pub refs: Vec<Ref>,
     pub inputs: Vec<Input>,
+    pub imports: Vec<ImportStmt>,
 }

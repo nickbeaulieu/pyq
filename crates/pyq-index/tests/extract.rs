@@ -117,6 +117,35 @@ def run(count):
 }
 
 #[test]
+fn captures_import_edges_with_module_level_and_names() {
+    let src = r#"
+import os
+import os.path
+from pkg.models import User, make_user
+from . import sibling
+from ..pkg import thing
+"#;
+    let idx = extract("pkg/app.py", src);
+    let by_module = |m: &str| idx.imports.iter().find(|i| i.module == m).unwrap();
+
+    assert_eq!(by_module("os").level, 0);
+    assert_eq!(by_module("os.path").level, 0);
+
+    let models = by_module("pkg.models");
+    assert_eq!(models.level, 0);
+    assert_eq!(models.names, vec!["User", "make_user"]);
+
+    // `from . import sibling` — empty module, level 1, the name carried through.
+    let dot = idx.imports.iter().find(|i| i.module.is_empty()).unwrap();
+    assert_eq!(dot.level, 1);
+    assert_eq!(dot.names, vec!["sibling"]);
+
+    // `from ..pkg import thing` — module `pkg`, level 2.
+    let up = by_module("pkg");
+    assert_eq!(up.level, 2);
+}
+
+#[test]
 fn parse_errors_are_non_fatal() {
     // A half-written file an agent is mid-edit on still answers.
     let idx = extract("broken.py", "def f(:\n    User(");

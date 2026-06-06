@@ -25,9 +25,12 @@ If yes, don't rebuild it — unless we can do it **deeper** (see below).
    guess; arg detection is suffix-matched (`.add_argument`/`.option`/
    `.argument`), so over-approximate by design. Pure AST walk on the syntactic
    path (no db). "What does this need to run."
-3. **Import / dependency graph as data** — reverse deps + cycles, for blast-radius
-   ("what breaks if I edit this file"). Cheap projection of the resolved graph
-   built for #1.
+3. **Import / dependency graph as data** (`imports`, shipped) — forward deps,
+   reverse deps (who imports X, the blast-radius question), and cycles (the
+   non-trivial SCCs over internal edges). Syntactic today: files map to dotted
+   modules, relative imports resolve against the importer's package, and
+   `from pkg import sub` becomes a precise `pkg.sub` edge when that submodule
+   exists. Will ride the resolved graph from #1 for accuracy later.
 
 ## Worth building *deeper* than the existing tools (the exception to the filter)
 These exist elsewhere but a pyq-native version is better because it rides the

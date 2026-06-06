@@ -5,6 +5,7 @@
 //! about code-as-graph. This is the first slice — symbol/reference queries over
 //! a directory of Python files, single-file name resolution.
 
+mod graph;
 mod walk;
 
 use clap::{Parser, Subcommand};
@@ -49,6 +50,19 @@ enum Command {
     /// The external input surface — env vars, literal files opened, CLI args,
     /// and pydantic settings fields. "What does this need to run."
     Inputs,
+    /// The project import graph. With no module: every import edge. With a
+    /// module (`pkg.models` or `pkg/models.py`): what it imports, or — with
+    /// `--reverse` — who imports it (blast radius). `--cycles`: import cycles.
+    Imports {
+        /// Module or file to query. Omit to list every edge.
+        module: Option<String>,
+        /// Show who imports the module (reverse deps) instead of what it imports.
+        #[arg(long)]
+        reverse: bool,
+        /// Report import cycles among project modules.
+        #[arg(long)]
+        cycles: bool,
+    },
 }
 
 fn main() -> ExitCode {
@@ -81,6 +95,14 @@ fn dispatch(cli: &Cli) -> anyhow::Result<Envelope> {
         Command::Inputs => {
             let files = walk::index_tree(&cli.root)?;
             Ok(query_inputs(&files))
+        }
+        Command::Imports {
+            module,
+            reverse,
+            cycles,
+        } => {
+            let files = walk::index_tree(&cli.root)?;
+            Ok(query_imports(&files, module.as_deref(), *reverse, *cycles))
         }
         Command::Refs { symbol } if cli.syntactic => {
             let files = walk::index_tree(&cli.root)?;
@@ -183,6 +205,79 @@ fn query_inputs(files: &[FileIndex]) -> Envelope {
     }
     let summary = format!("{} inputs", results.len());
     Envelope::new(json!({ "kind": "inputs" }), results).with_summary(summary)
+}
+
+/// The project import graph. Modes: cycles, reverse deps, forward deps, or —
+/// with no module — every edge.
+fn query_imports(
+    files: &[FileIndex],
+    module: Option<&str>,
+    reverse: bool,
+    cycles: bool,
+) -> Envelope {
+    let g = graph::Graph::build(files);
+
+    if cycles {
+        let mut results = Vec::new();
+        for cycle in g.cycles() {
+            let loc = g
+                .file_of(&cycle[0])
+                .map(|f| format!("{f}:1:1"))
+                .unwrap_or_else(|| cycle[0].clone());
+            results.push(json!({
+                "loc": loc,
+                "label": format!("cycle: {}", cycle.join(" ↔ ")),
+            }));
+        }
+        let summary = format!("{} import {}", results.len(), plural(results.len(), "cycle"));
+        return Envelope::new(json!({ "kind": "imports", "mode": "cycles" }), results)
+            .with_summary(summary);
+    }
+
+    let mut rows: Vec<(String, serde_json::Value)> = Vec::new();
+    let (mode, summary): (&str, String) = match module {
+        Some(arg) => {
+            let m = graph::normalize_query(arg);
+            if reverse {
+                for e in g.edges.iter().filter(|e| e.target == m) {
+                    let loc = loc_str(&e.importer_file, e.pos);
+                    rows.push((loc.clone(), json!({ "loc": loc, "label": format!("imported by {}", e.importer) })));
+                }
+                ("reverse", format!("{} {} of `{}`", rows.len(), plural(rows.len(), "importer"), m))
+            } else {
+                for e in g.edges.iter().filter(|e| e.importer == m) {
+                    let loc = loc_str(&e.importer_file, e.pos);
+                    let tag = if e.internal { "" } else { " (ext)" };
+                    rows.push((format!("{}{}", e.target, loc), json!({ "loc": loc, "label": format!("imports {}{}", e.target, tag) })));
+                }
+                ("forward", format!("`{}` imports {} {}", m, rows.len(), plural(rows.len(), "module")))
+            }
+        }
+        None => {
+            for e in &g.edges {
+                let loc = loc_str(&e.importer_file, e.pos);
+                let tag = if e.internal { "" } else { " (ext)" };
+                rows.push((loc.clone(), json!({ "loc": loc, "label": format!("{} → {}{}", e.importer, e.target, tag) })));
+            }
+            ("all", format!("{} import {}", rows.len(), plural(rows.len(), "edge")))
+        }
+    };
+
+    rows.sort_by(|a, b| a.0.cmp(&b.0));
+    let results = rows.into_iter().map(|(_, v)| v).collect::<Vec<_>>();
+    Envelope::new(json!({ "kind": "imports", "mode": mode }), results).with_summary(summary)
+}
+
+fn loc_str(file: &str, pos: pyq_index::Pos) -> String {
+    format!("{}:{}:{}", file, pos.line, pos.col)
+}
+
+fn plural(n: usize, word: &str) -> String {
+    if n == 1 {
+        word.to_string()
+    } else {
+        format!("{word}s")
+    }
 }
 
 fn def_kind_str(kind: DefKind) -> &'static str {

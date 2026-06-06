@@ -14,13 +14,27 @@ fn sample_root() -> PathBuf {
         .expect("examples/sample should exist")
 }
 
+/// Absolute path to a named fixture under `tests/fixtures/`.
+fn fixture(name: &str) -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures")
+        .join(name)
+        .canonicalize()
+        .unwrap_or_else(|_| panic!("fixture {name} should exist"))
+}
+
 /// Run `pyq <args> --root examples/sample --json` and return (parsed envelope,
 /// success flag).
 fn run_json(args: &[&str]) -> (Value, bool) {
+    run_json_in(&sample_root(), args)
+}
+
+/// Like [`run_json`] but against an arbitrary project root.
+fn run_json_in(root: &std::path::Path, args: &[&str]) -> (Value, bool) {
     let out = Command::new(env!("CARGO_BIN_EXE_pyq"))
         .args(args)
         .arg("--root")
-        .arg(sample_root())
+        .arg(root)
         .arg("--json")
         .output()
         .expect("pyq should run");
@@ -127,6 +141,50 @@ fn callers_via_ty_finds_the_call_site() {
 fn unknown_symbol_is_zero_results_not_an_error() {
     let (env, ok) = run_json(&["defs", "NoSuchSymbolAnywhere", "--syntactic"]);
     assert!(ok, "an unknown symbol should exit 0");
+    assert_eq!(env["count"].as_u64().unwrap(), 0);
+}
+
+#[test]
+fn imports_lists_edges_and_marks_external() {
+    let (env, ok) = run_json(&["imports"]);
+    assert!(ok);
+    assert_eq!(env["query"]["mode"], "all");
+    let labels = labels(&env);
+    // internal edge has no marker; stdlib/third-party is tagged (ext).
+    assert!(labels.iter().any(|l| l == "app → pkg.models"));
+    assert!(labels.iter().any(|l| l == "config → os (ext)"));
+}
+
+#[test]
+fn imports_forward_and_reverse_are_inverse_views() {
+    let (fwd, ok) = run_json(&["imports", "app"]);
+    assert!(ok);
+    assert_eq!(fwd["query"]["mode"], "forward");
+    assert!(labels(&fwd).iter().any(|l| l == "imports pkg.models"));
+
+    // Reverse accepts a file path too, and points back at the importer.
+    let (rev, ok) = run_json(&["imports", "pkg/models.py", "--reverse"]);
+    assert!(ok);
+    assert_eq!(rev["query"]["mode"], "reverse");
+    assert!(labels(&rev).iter().any(|l| l == "imported by app"));
+    assert!(locs(&rev).iter().any(|l| l.starts_with("app.py")));
+}
+
+#[test]
+fn cycles_detects_the_mutual_import() {
+    let (env, ok) = run_json_in(&fixture("cycle"), &["imports", "--cycles"]);
+    assert!(ok);
+    assert_eq!(env["count"].as_u64().unwrap(), 1);
+    let label = env["results"][0]["label"].as_str().unwrap();
+    assert!(label.starts_with("cycle:"));
+    assert!(label.contains("pkg.a"));
+    assert!(label.contains("pkg.b"));
+}
+
+#[test]
+fn sample_has_no_cycles() {
+    let (env, ok) = run_json(&["imports", "--cycles"]);
+    assert!(ok);
     assert_eq!(env["count"].as_u64().unwrap(), 0);
 }
 
