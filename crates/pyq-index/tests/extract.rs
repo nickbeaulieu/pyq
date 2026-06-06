@@ -157,6 +157,38 @@ def run(count):
 }
 
 #[test]
+fn multi_alias_option_records_the_canonical_long_form() {
+    let src = r#"
+import argparse, click
+
+p = argparse.ArgumentParser()
+p.add_argument("-v", "--verbose")
+p.add_argument("path")
+
+@click.option("-c", "--count")
+@click.argument("name")
+def run(count, name):
+    pass
+"#;
+    let idx = extract("cli.py", src);
+    let args: Vec<&str> = idx
+        .inputs
+        .iter()
+        .filter(|i| i.kind == InputKind::Arg)
+        .map(|i| i.value.as_str())
+        .collect();
+
+    // long form wins over the short alias…
+    assert!(args.contains(&"--verbose"), "{args:?}");
+    assert!(args.contains(&"--count"), "{args:?}");
+    // …and the short alias is not separately recorded
+    assert!(!args.contains(&"-v"), "{args:?}");
+    // positionals (no `--`) keep their bare name
+    assert!(args.contains(&"path"), "{args:?}");
+    assert!(args.contains(&"name"), "{args:?}");
+}
+
+#[test]
 fn captures_import_edges_with_module_level_and_names() {
     let src = r#"
 import os

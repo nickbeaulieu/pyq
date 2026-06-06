@@ -15,13 +15,6 @@ or matching the qualified form.
 ## P3 — Empty symbol silently succeeds
 `pyq defs ""` → "0 defs of ``", exit 0. Probably should be a usage error.
 
-## P3 — `inputs` keeps only the first string of a multi-alias CLI option
-`@click.option("-v", "--verbose", is_flag=True)` is reported as `arg -v`, dropping
-the canonical `--verbose`. argparse `add_argument("-v","--verbose")` would hit the
-same path. Agents/humans search by the long name; capture the long form (or both).
-Coverage is otherwise good: click `--option`/`argument`, argparse positional/opt,
-and **subparser** args (`sub.add_parser(...).add_argument(...)`) are all found.
-
 ## P3 — JSON envelope `query` block isn't uniform across verbs
 ```
 refs/callers/defs : query = {engine, kind, symbol}

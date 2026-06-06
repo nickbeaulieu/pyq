@@ -107,13 +107,15 @@ impl<'src> Collector<'src> {
                             self.push_input(InputKind::File, path, expr.range().start());
                         }
                     }
-                    // argparse `parser.add_argument("--flag")` and click
-                    // `@click.option("--flag")` / `@click.argument("name")`.
+                    // argparse `parser.add_argument("-v", "--verbose")` and click
+                    // `@click.option("-v", "--verbose")` / `@click.argument("name")`.
+                    // Multiple alias strings can be passed; record the canonical
+                    // long form (`--verbose`) agents search by, not just the first.
                     _ if callee.ends_with(".add_argument")
                         || callee.ends_with(".option")
                         || callee.ends_with(".argument") =>
                     {
-                        if let Some(name) = literal_str(first) {
+                        if let Some(name) = canonical_option(&call.arguments.args) {
                             self.push_input(InputKind::Arg, name, expr.range().start());
                         }
                     }
@@ -341,6 +343,19 @@ fn literal_str(expr: Option<&Expr>) -> Option<String> {
         Expr::StringLiteral(s) => Some(s.value.to_str().to_string()),
         _ => None,
     }
+}
+
+/// The canonical name of a CLI option/argument from its positional strings:
+/// the longest `--long` flag if any (what callers search by), else the first
+/// string literal (a short flag or a positional name like `path`).
+fn canonical_option(args: &[Expr]) -> Option<String> {
+    let names: Vec<String> = args.iter().filter_map(|a| literal_str(Some(a))).collect();
+    names
+        .iter()
+        .filter(|n| n.starts_with("--"))
+        .max_by_key(|n| n.len())
+        .or_else(|| names.first())
+        .cloned()
 }
 
 /// Precomputed line-start byte offsets → 1-based line/char-column conversion.
