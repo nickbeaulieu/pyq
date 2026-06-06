@@ -129,7 +129,7 @@ fn resolved(
     kind: &str,
     query: fn(&TyResolver, &str) -> anyhow::Result<Vec<Loc>>,
 ) -> anyhow::Result<Envelope> {
-    let resolver = TyResolver::new(root)?;
+    let resolver = TyResolver::new(root, walk::walked_py_files(root))?;
     let locs = query(&resolver, symbol)?;
     let results = locs.iter().map(loc_to_json).collect::<Vec<_>>();
     let summary = format!("{} {} of `{}` (ty, cross-file)", results.len(), kind, symbol);

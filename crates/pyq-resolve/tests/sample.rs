@@ -9,7 +9,10 @@ fn sample_root() -> String {
 }
 
 fn resolver() -> TyResolver {
-    TyResolver::new(&sample_root()).expect("build resolver over examples/sample")
+    // Empty scope = no result filtering; this crate's tests exercise resolution
+    // directly, and the file discipline is applied by the CLI walk.
+    TyResolver::new(&sample_root(), Default::default())
+        .expect("build resolver over examples/sample")
 }
 
 #[test]

@@ -3,8 +3,10 @@
 use anyhow::{anyhow, Context, Result};
 use ruff_db::files::{File, FilePath};
 use ruff_db::source::source_text;
-use ruff_db::system::{OsSystem, SystemPath, SystemPathBuf};
+use ruff_db::system::{OsSystem, SystemPathBuf};
 use ruff_text_size::TextSize;
+use std::collections::HashSet;
+use std::path::PathBuf;
 use ty_ide::{find_references, incoming_calls, workspace_symbols};
 use ty_project::{ProjectDatabase, ProjectMetadata};
 
@@ -12,13 +14,22 @@ use crate::{Loc, Resolver};
 
 pub struct TyResolver {
     db: ProjectDatabase,
-    root: SystemPathBuf,
+    /// Canonical absolute project root; every emitted path is relative to it.
+    root_canon: PathBuf,
+    /// The files the CLI walk includes. ty resolves against the whole project
+    /// for correctness, but only results in this set are *reported* — so the
+    /// output honors `--root` and `.gitignore`/hidden filtering, and a nested
+    /// worktree copy can't double-count. Empty = report everything (no filter).
+    scope: HashSet<PathBuf>,
 }
 
 impl TyResolver {
-    /// Build a project database rooted at `root` (a path on disk).
-    pub fn new(root: &str) -> Result<Self> {
+    /// Build a project database rooted at `root` (a path on disk). `scope` is
+    /// the set of canonical absolute file paths to report (see [`Self::scope`]);
+    /// pass an empty set to disable filtering.
+    pub fn new(root: &str, scope: HashSet<PathBuf>) -> Result<Self> {
         let abs = std::path::absolute(root).with_context(|| format!("resolving {root}"))?;
+        let root_canon = std::fs::canonicalize(&abs).unwrap_or(abs.clone());
         let root = SystemPathBuf::from_path_buf(abs)
             .map_err(|p| anyhow!("non-UTF-8 project path: {}", p.display()))?;
         let system = OsSystem::new(&root);
@@ -26,7 +37,11 @@ impl TyResolver {
             .context("discovering project metadata")?;
         let db = ProjectDatabase::fallible(metadata, system)
             .context("initializing project database")?;
-        Ok(TyResolver { db, root })
+        Ok(TyResolver {
+            db,
+            root_canon,
+            scope,
+        })
     }
 
     /// Files + offsets of every definition whose name is exactly `symbol`.
@@ -39,27 +54,34 @@ impl TyResolver {
             .collect()
     }
 
-    /// Map a (file, byte offset) to a project-relative `Loc`.
-    fn loc(&self, file: File, offset: TextSize, kind: &str) -> Loc {
+    /// Map a (file, byte offset) to a project-relative `Loc`, or `None` if the
+    /// file is outside the reporting scope (see [`Self::scope`]).
+    fn loc(&self, file: File, offset: TextSize, kind: &str) -> Option<Loc> {
+        let path = self.rel_path(file)?;
         let text = source_text(&self.db, file);
         let (line, col) = line_col(text.as_str(), offset.to_usize());
-        Loc {
-            path: self.rel_path(file),
+        Some(Loc {
+            path,
             line,
             col,
             kind: kind.to_string(),
-        }
+        })
     }
 
-    fn rel_path(&self, file: File) -> String {
-        match file.path(&self.db) {
-            FilePath::System(p) => p
-                .strip_prefix(&self.root)
-                .map(SystemPath::as_str)
-                .unwrap_or_else(|_| p.as_str())
-                .to_string(),
-            other => other.to_string(),
+    /// The file's path relative to the canonical root, or `None` if it is not
+    /// in scope. A non-system path (typeshed/vendored stdlib stub) is never in
+    /// scope. When `scope` is empty, filtering is disabled.
+    fn rel_path(&self, file: File) -> Option<String> {
+        let FilePath::System(p) = file.path(&self.db) else {
+            return None;
+        };
+        let abs = PathBuf::from(p.as_str());
+        let canon = std::fs::canonicalize(&abs).unwrap_or(abs);
+        if !self.scope.is_empty() && !self.scope.contains(&canon) {
+            return None;
         }
+        let rel = canon.strip_prefix(&self.root_canon).unwrap_or(&canon);
+        Some(rel.to_string_lossy().into_owned())
     }
 }
 
@@ -71,7 +93,9 @@ impl Resolver for TyResolver {
                 continue;
             };
             for t in targets {
-                out.push(self.loc(t.file(), t.range().start(), reference_kind(t.kind())));
+                if let Some(loc) = self.loc(t.file(), t.range().start(), reference_kind(t.kind())) {
+                    out.push(loc);
+                }
             }
         }
         dedupe(&mut out);
@@ -84,7 +108,9 @@ impl Resolver for TyResolver {
             for call in incoming_calls(&self.db, file, offset) {
                 let caller = call.from.name.as_str().to_string();
                 for range in call.from_ranges {
-                    out.push(self.loc(call.from.file, range.start(), &caller));
+                    if let Some(loc) = self.loc(call.from.file, range.start(), &caller) {
+                        out.push(loc);
+                    }
                 }
             }
         }
@@ -96,7 +122,7 @@ impl Resolver for TyResolver {
         let mut out: Vec<Loc> = self
             .exact_symbols(symbol)
             .into_iter()
-            .map(|(file, offset)| self.loc(file, offset, "def"))
+            .filter_map(|(file, offset)| self.loc(file, offset, "def"))
             .collect();
         dedupe(&mut out);
         Ok(out)
