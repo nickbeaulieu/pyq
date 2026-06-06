@@ -88,6 +88,18 @@ fn main() -> ExitCode {
 }
 
 fn dispatch(cli: &Cli) -> anyhow::Result<Envelope> {
+    // A blank symbol is a usage error, not a 0-result success that reads as
+    // "this name is unused."
+    let symbol = match &cli.command {
+        Command::Refs { symbol } | Command::Callers { symbol } | Command::Defs { symbol } => {
+            Some(symbol.as_str())
+        }
+        _ => None,
+    };
+    if matches!(symbol, Some(s) if s.trim().is_empty()) {
+        anyhow::bail!("symbol must not be empty");
+    }
+
     // `inputs` and any verb under `--syntactic` use the single-file extractor;
     // `refs`/`callers`/`defs` otherwise route through ty's cross-file engine
     // behind the Resolver trait.

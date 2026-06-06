@@ -137,6 +137,30 @@ fn callers_via_ty_finds_the_call_site() {
     assert!(locs(&env).iter().any(|l| l.starts_with("app.py")));
 }
 
+// Regression: a blank symbol is a usage error (exit 1), not a 0-result success
+// that an agent would read as "this name is unused."
+#[test]
+fn empty_symbol_is_a_usage_error() {
+    for args in [
+        vec!["defs", ""],
+        vec!["refs", "   ", "--syntactic"],
+        vec!["callers", ""],
+    ] {
+        let out = Command::new(env!("CARGO_BIN_EXE_pyq"))
+            .args(&args)
+            .arg("--root")
+            .arg(sample_root())
+            .output()
+            .expect("pyq should run");
+        assert!(
+            !out.status.success(),
+            "blank symbol should exit non-zero: {args:?}"
+        );
+        let stderr = String::from_utf8(out.stderr).unwrap();
+        assert!(stderr.contains("symbol must not be empty"), "stderr: {stderr}");
+    }
+}
+
 #[test]
 fn unknown_symbol_is_zero_results_not_an_error() {
     let (env, ok) = run_json(&["defs", "NoSuchSymbolAnywhere", "--syntactic"]);

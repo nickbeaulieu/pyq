@@ -12,9 +12,6 @@ Severity: **P1** correctness, **P2** misleading output, **P3** UX/minor.
 naturally reach for the dotted path. Consider stripping to the last component
 or matching the qualified form.
 
-## P3 — Empty symbol silently succeeds
-`pyq defs ""` → "0 defs of ``", exit 0. Probably should be a usage error.
-
 ## P3 — JSON envelope `query` block isn't uniform across verbs
 ```
 refs/callers/defs : query = {engine, kind, symbol}
