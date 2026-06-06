@@ -97,6 +97,17 @@ fn query_block_is_uniform_across_verbs() {
     }
 }
 
+// Determinism: the resolved (canonical, absolute) root is echoed in the query,
+// so an agent gets the same anchored answer regardless of the working dir.
+#[test]
+fn query_echoes_the_resolved_absolute_root() {
+    let (env, ok) = run_json(&["defs", "User"]);
+    assert!(ok);
+    let root = env["query"]["root"].as_str().expect("root in query");
+    assert!(root.starts_with('/'), "root should be absolute: {root}");
+    assert!(root.ends_with("examples/sample"), "root: {root}");
+}
+
 // The --syntactic debug path can't see attribute-access calls, so it flags that
 // a count may be incomplete rather than letting a bare 0 read as ground truth.
 #[test]

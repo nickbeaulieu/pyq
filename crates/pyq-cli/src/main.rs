@@ -104,10 +104,10 @@ fn dispatch(cli: &Cli) -> anyhow::Result<Envelope> {
     // One query path. `inputs`/`imports` are pure syntactic facts; for
     // `refs`/`callers`/`defs` the Resolver trait merges ty (authoritative,
     // cross-file) with the syntactic scan (ty's blind spots) into one answer.
-    match &cli.command {
+    let mut envelope = match &cli.command {
         Command::Inputs => {
             let files = walk::index_tree(&cli.root)?;
-            Ok(query_inputs(&files))
+            query_inputs(&files)
         }
         Command::Imports {
             module,
@@ -115,12 +115,23 @@ fn dispatch(cli: &Cli) -> anyhow::Result<Envelope> {
             cycles,
         } => {
             let files = walk::index_tree(&cli.root)?;
-            Ok(query_imports(&files, module.as_deref(), *reverse, *cycles))
+            query_imports(&files, module.as_deref(), *reverse, *cycles)
         }
-        Command::Refs { symbol } => resolve(cli, symbol, "refs", |r, s| r.references(s)),
-        Command::Callers { symbol } => resolve(cli, symbol, "callers", |r, s| r.callers(s)),
-        Command::Defs { symbol } => resolve(cli, symbol, "defs", |r, s| r.definitions(s)),
+        Command::Refs { symbol } => resolve(cli, symbol, "refs", |r, s| r.references(s))?,
+        Command::Callers { symbol } => resolve(cli, symbol, "callers", |r, s| r.callers(s))?,
+        Command::Defs { symbol } => resolve(cli, symbol, "defs", |r, s| r.definitions(s))?,
+    };
+
+    // Anchor every result to one resolved root, echoed in the query — so the
+    // same logical query gives the same answer (and the same paths) from any
+    // working directory.
+    if let Some(obj) = envelope.query.as_object_mut() {
+        let root = std::fs::canonicalize(&cli.root)
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|_| cli.root.clone());
+        obj.insert("root".to_string(), json!(root));
     }
+    Ok(envelope)
 }
 
 /// Run one symbol query through the resolver and build the uniform envelope.

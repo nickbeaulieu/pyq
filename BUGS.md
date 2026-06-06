@@ -83,30 +83,26 @@ Optimize for "an agent can act on this without double-checking."
    variables (ty's blind spot) are filled from the syntactic scan and flagged
    via a `warnings` entry, so a `0` is no longer silently wrong.
 
-2. **Determinism independent of cwd.** Same logical query → same answer from any
-   directory. Discover the project once, anchor everything to that root, and put
-   the resolved root in the envelope:
-   `"query":{...,"root":"/abs/scoring","engine":"ty"}`.
+2. ✅ **Done — determinism independent of cwd.** Every result path is anchored
+   to the canonical project root, and that resolved absolute root is echoed in
+   the envelope (`"query":{...,"root":"/abs/scoring","engine":"unified"}`), so
+   the same logical query gives the same answer and the same paths from any
+   working directory.
 
-3. **`--root` always means scope.** If scoping can't be done cheaply for ty,
-   **fail loud** (`error: --root unsupported with ty engine`) rather than
-   silently ignore it. Silent ignore is the worst option — I'll believe the
-   scope held. Honor the ignore-walk (skip hidden/worktree copies) for both
-   engines.
+3. ✅ **Done — `--root` always means scope.** ty inherits the CLI walk's
+   discipline: emitted results are filtered to the walked file set under
+   `--root`, honoring `.gitignore`/hidden filtering (no nested-worktree
+   double-counts) and anchoring paths to the resolved root.
 
-4. **Surface what you couldn't do** via a structured `warnings`/`notes` array:
-   `"scanned 2 project roots; .claude/worktrees/… looks like a nested copy"`,
-   `"3 references unresolved (dynamic import)"`, `"env key computed → <dynamic>"`.
-   `inputs`'s `<dynamic>` bucketing is exactly the right instinct — surface it
-   everywhere as structured warnings, not just inline. Over-approximate-and-flag
-   beats silently-precise-and-wrong: the flag tells me when to fall back to
-   reading the file myself.
+4. ✅ **Done (mechanism) — structured `warnings` array.** The envelope carries a
+   `warnings` list; syntactic-only unified results and the `--syntactic`
+   attribute blind spot are flagged today. More producers (unresolved dynamic
+   imports, nested-worktree notes) can append to the same channel — the
+   `inputs` `<dynamic>` bucketing instinct, surfaced everywhere.
 
-5. **Counts I can branch on.** The headline value over grep is "0 callers → safe
-   to delete" / "47 callers → big blast radius." I act on the integer before
-   reading the list, so it must be de-duplicated and scoped. A doubled worktree
-   count silently turns a safe refactor into wasted re-reading, or makes dead
-   code look used.
+5. ✅ **Done — counts you can branch on.** Results are de-duplicated by location
+   and scoped to `--root`, and ty's nested-worktree double-counting is gone, so
+   the headline integer ("0 callers → safe to delete") is trustworthy.
 
 ---
 
