@@ -46,7 +46,8 @@ enum Command {
     Callers { symbol: String },
     /// Every definition of a symbol (function/class/variable/import binding).
     Defs { symbol: String },
-    /// The external input surface — env vars read and literal files opened.
+    /// The external input surface — env vars, literal files opened, CLI args,
+    /// and pydantic settings fields. "What does this need to run."
     Inputs,
 }
 
