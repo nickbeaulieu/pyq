@@ -238,22 +238,40 @@ fn query_imports(
     }
 
     let mut rows: Vec<(String, serde_json::Value)> = Vec::new();
+    // `target`/`found` are set only when a module is queried — `found` lets an
+    // agent tell a typo'd module (not in the graph) from a real leaf with no
+    // edges, so "0 importers" of a misspelling never reads as "safe to delete."
+    let mut target: Option<String> = None;
+    let mut found: Option<bool> = None;
     let (mode, summary): (&str, String) = match module {
         Some(arg) => {
             let m = graph::normalize_query(arg);
+            let known = g.knows(&m);
+            found = Some(known);
+            target = Some(m.clone());
             if reverse {
                 for e in g.edges.iter().filter(|e| e.target == m) {
                     let loc = loc_str(&e.importer_file, e.pos);
                     rows.push((loc.clone(), json!({ "loc": loc, "label": format!("imported by {}", e.importer) })));
                 }
-                ("reverse", format!("{} {} of `{}`", rows.len(), plural(rows.len(), "importer"), m))
+                let summary = if !known {
+                    format!("module `{m}` not found in project")
+                } else {
+                    format!("{} {} of `{}`", rows.len(), plural(rows.len(), "importer"), m)
+                };
+                ("reverse", summary)
             } else {
                 for e in g.edges.iter().filter(|e| e.importer == m) {
                     let loc = loc_str(&e.importer_file, e.pos);
                     let tag = if e.internal { "" } else { " (ext)" };
                     rows.push((format!("{}{}", e.target, loc), json!({ "loc": loc, "label": format!("imports {}{}", e.target, tag) })));
                 }
-                ("forward", format!("`{}` imports {} {}", m, rows.len(), plural(rows.len(), "module")))
+                let summary = if !known {
+                    format!("module `{m}` not found in project")
+                } else {
+                    format!("`{}` imports {} {}", m, rows.len(), plural(rows.len(), "module"))
+                };
+                ("forward", summary)
             }
         }
         None => {
@@ -268,7 +286,12 @@ fn query_imports(
 
     rows.sort_by(|a, b| a.0.cmp(&b.0));
     let results = rows.into_iter().map(|(_, v)| v).collect::<Vec<_>>();
-    Envelope::new(json!({ "kind": "imports", "mode": mode }), results).with_summary(summary)
+    let mut query = json!({ "kind": "imports", "mode": mode });
+    if let Some(t) = target {
+        query["target"] = json!(t);
+        query["found"] = json!(found);
+    }
+    Envelope::new(query, results).with_summary(summary)
 }
 
 fn loc_str(file: &str, pos: pyq_index::Pos) -> String {

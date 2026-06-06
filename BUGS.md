@@ -75,21 +75,6 @@ Note the *good* side: ty's 62 vs grep's 469 is correct precision — ty resolves
 which `save` (the in-repo model overrides) and doesn't conflate unrelated
 `.save()` on other types. That disambiguation is the real value; don't lose it.
 
-## P2 — `imports <module>` can't distinguish "not found" from "found, no edges"
-A typo'd module and a real leaf module are indistinguishable, even in JSON:
-
-```
-imports scoring.modelz --reverse  → 0 importers of `scoring.modelz`   (typo)
-imports scoring.apps   --reverse  → 0 importers of `scoring.apps`     (real, unused)
-{"tool":"pyq","query":{"kind":"imports","mode":"reverse"},"summary":"0 importers …","count":0,"results":[]}
-```
-
-`--reverse` is sold as blast-radius ("who imports this"); "0 importers" reads as
-"safe to delete." A typo silently produces that safe-looking answer. Need a
-`module_found`/`resolved` signal (or a non-zero exit / error) when the queried
-module isn't in the graph. (Minor: the JSON `query` block omits the queried
-module name that `refs`/`defs` echo as `symbol` — add it for parity.)
-
 ## P1 — `refs` misses alias call sites that `callers` finds (verbs disagree)
 With an aliased import `from pkg.core import make_widget as mw` and two `mw()`
 calls:

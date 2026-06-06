@@ -198,6 +198,25 @@ fn type_checking_and_deferred_imports_are_not_cycles() {
     );
 }
 
+// Regression: a typo'd module (found:false) must be distinguishable from a real
+// leaf with no importers (found:true) — otherwise "0 importers" of a misspelling
+// reads as "safe to delete."
+#[test]
+fn imports_reverse_distinguishes_typo_from_real_leaf() {
+    // `config.py` is a real module imported by nobody in the sample.
+    let (real, ok) = run_json(&["imports", "config", "--reverse"]);
+    assert!(ok);
+    assert_eq!(real["query"]["found"], true);
+    assert_eq!(real["query"]["target"], "config");
+    assert_eq!(real["count"].as_u64().unwrap(), 0);
+
+    // A misspelling is not in the graph at all.
+    let (typo, ok) = run_json(&["imports", "config_typo", "--reverse"]);
+    assert!(ok);
+    assert_eq!(typo["query"]["found"], false);
+    assert!(typo["summary"].as_str().unwrap().contains("not found"));
+}
+
 #[test]
 fn sample_has_no_cycles() {
     let (env, ok) = run_json(&["imports", "--cycles"]);

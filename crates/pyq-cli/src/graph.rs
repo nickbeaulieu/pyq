@@ -79,6 +79,17 @@ impl Graph {
         self.module_file.get(module).map(String::as_str)
     }
 
+    /// Whether `module` exists in the graph at all — a project module file, or a
+    /// package/module that appears as an importer or target. Lets a query
+    /// distinguish "found, no edges" (real leaf) from "not found" (typo).
+    pub fn knows(&self, module: &str) -> bool {
+        self.module_file.contains_key(module)
+            || self
+                .edges
+                .iter()
+                .any(|e| e.importer == module || e.target == module)
+    }
+
     /// Internal modules forming the nodes of the dependency graph. Only
     /// `TopLevel` edges (run at import time) count — `TYPE_CHECKING` and
     /// deferred/function-local imports are exactly how code *breaks* runtime
