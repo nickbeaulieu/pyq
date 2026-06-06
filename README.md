@@ -28,6 +28,9 @@ One verb per invocation: `pyq <verb> [args] [flags]`.
 pyq refs User                 # every reference to `User` across the tree
 pyq callers make_user         # every call site of `make_user`
 pyq defs User                 # every definition of `User`
+pyq graph main                # everything `main` transitively calls
+pyq graph User --reverse      # everything that transitively reaches `User`
+pyq effects handle_request    # side effects it transitively performs (io/net/db/…)
 pyq inputs                    # the external input surface of the project
 pyq imports pkg.models --reverse   # who imports pkg.models (blast radius)
 pyq imports --cycles          # import cycles among project modules
@@ -40,6 +43,8 @@ pyq imports --cycles          # import cycles among project modules
 | `refs <symbol>` | Every reference (reads, writes, calls) to a symbol, cross-file. |
 | `callers <symbol>` | Every call site of a symbol. |
 | `defs <symbol>` | Every definition (function/class/variable/import binding), each tagged `role` (`definition`/`binding`); a `binding` points at its canonical def via `resolves_to`. |
+| `graph <symbol>` | The transitive call graph: everything the symbol calls (forward closure), or — with `--reverse` — everything that calls it. Nodes are stable fully-qualified IDs (`pkg.models.User.__init__`) re-queryable after edits; `--depth N` caps the hops. |
+| `effects <symbol>` | The transitive effect surface: which side effects (`fs`, `network`, `subprocess`, `env`, `db`, `random`, `clock`, `global`) the symbol and everything it transitively calls statically perform, plus import-time effects of the modules involved. "Is this pure / safe in a test." |
 | `inputs` | What the code needs to run: env vars, literal files opened, CLI args (argparse/click), pydantic settings fields. |
 | `imports [module]` | The import graph. No arg: every edge. With a module: what it imports; `--reverse`: who imports it (blast radius); `--cycles`: import cycles. Accepts a module name or a file path. |
 
@@ -74,6 +79,60 @@ A qualified query scopes to the named def: `Alpha.process` is that class's metho
 of the def's scope path (module components + enclosing classes/functions), so
 `models.User` works too. A bare name (`process`) still unions all defs, each
 tagged with `resolves_to` so you can filter.
+
+## Call graph
+
+`graph` is the transitive call/reference primitive the heavier verbs build on. It
+walks ty's resolved call hierarchy from the queried symbol — forward (callees) by
+default, `--reverse` for callers — and returns the reachable set as a closure,
+deduped and cycle-safe. Each node is a **stable fully-qualified ID**
+(`pkg.models.User.__init__`) derived from the module path and enclosing scopes,
+not a line number — so an agent can hold a node id across edits and re-query it
+without re-grepping. The resolved root FQN(s) are echoed in `query.roots`; every
+node carries its `depth` from the root and the `via` (the FQN it was first reached
+through), enough to reconstruct a path back. `--depth N` caps the walk.
+
+The reverse closure follows bare-name and imported-name call sites
+(`from m import f; f()`). Calls through an attribute (`obj.method()`) and other
+dynamic dispatch are not resolved as reverse edges — the same boundary the
+`callers` verb has — so a method reached only via `self.x.method()` may show
+fewer callers than exist. The forward closure has no such gap (it reads each
+def's own body).
+
+```console
+$ pyq graph main --root examples/sample
+2 nodes reachable from `main`
+pkg/models.py:1:7  class pkg.models.User (depth 1, via app.main)
+pkg/models.py:5:5  function pkg.models.make_user (depth 1, via app.main)
+```
+
+## Effects
+
+`effects` is the first projection of the call graph: it walks the forward
+closure of a symbol and, for every reachable callable, scans its body for
+side-effecting calls — `open`/`shutil` (`fs`), `requests`/`httpx`/`socket`
+(`network`), `subprocess`/`os.system` (`subprocess`), `os.getenv`/`os.environ`
+(`env`), `*.execute`/`sqlite3.connect` (`db`), `random`/`secrets`/`uuid`
+(`random`), `time`/`datetime.now` (`clock`), and `global` declarations
+(`global`). Each hit is attributed to the FQN that actually performs it, so a
+"pure-looking" entry point reveals the network call three hops down.
+
+```console
+$ pyq effects run --root path/to/project
+effects of `run`: db, network, random — 4 sites
+io_ops.py:6:12   network requests.get     in io_ops.fetch
+io_ops.py:9:12   db      sqlite3.connect   in io_ops.save
+io_ops.py:10:5   db      conn.execute      in io_ops.save
+io_ops.py:14:12  random  random.random     in io_ops.jitter
+! static over-approximation: effects behind dynamic/attribute-dispatched calls are not followed
+```
+
+Module- and class-body effects are flagged `import-time` (they run on import,
+not on call) and reported for every module that contributes a reachable
+callable. Detection is syntactic and over-approximate by design: a hit means the
+code *appears* to perform the effect, and — as with `callers` — effects behind
+calls that resolve through attribute/dynamic dispatch aren't followed, so "pure"
+means "no effect found," not a proof of purity.
 
 ## Output envelope
 
@@ -117,8 +176,8 @@ cli.py:14:5     arg --verbose
 | Crate | Role |
 |-------|------|
 | `pyq-cli` | clap front end; verb-per-invocation; `.gitignore`-respecting tree walk. |
-| `pyq-index` | One parse per file → `FileIndex` of defs/refs/inputs. Backs the syntactic path. |
-| `pyq-resolve` | Cross-file resolution behind a `Resolver` trait, backed by ty. All ty contact lives here. |
+| `pyq-index` | One parse per file → `FileIndex` of defs/refs/inputs/effects. Backs the syntactic path. |
+| `pyq-resolve` | Cross-file resolution behind a `Resolver` trait, plus the transitive `CallGraph`, backed by ty. All ty contact lives here. |
 | `pyq-output` | The shared envelope and its human / `--json` / `--pretty` renderers. |
 
 See [DESIGN.md](DESIGN.md) for the thesis, the roadmap, and the

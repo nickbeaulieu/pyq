@@ -9,9 +9,10 @@ mod graph;
 mod walk;
 
 use clap::{Parser, Subcommand};
-use pyq_index::{extract, FileIndex, InputKind};
+use pyq_index::{extract, EffectKind, FileIndex, InputKind};
 use pyq_output::{Channel, Envelope};
-use pyq_resolve::{Loc, Resolver, UnifiedResolver};
+use pyq_resolve::{scope_fqn, CallGraph, Direction, GraphNode, Loc, Resolver, UnifiedResolver};
+use std::collections::{BTreeSet, HashSet};
 use serde_json::json;
 use std::process::ExitCode;
 
@@ -42,6 +43,24 @@ enum Command {
     Callers { symbol: String },
     /// Every definition of a symbol (function/class/variable/import binding).
     Defs { symbol: String },
+    /// The transitive call graph of a symbol, over stable fully-qualified IDs.
+    /// Default: the forward closure (everything it transitively calls). With
+    /// `--reverse`: everything that transitively calls it. `--depth N` caps the
+    /// hops. Accepts a bare name, a qualified name, or a full FQN.
+    Graph {
+        symbol: String,
+        /// Walk callers (who reaches this) instead of callees (what it reaches).
+        #[arg(long)]
+        reverse: bool,
+        /// Maximum transitive depth (default: unbounded).
+        #[arg(long)]
+        depth: Option<usize>,
+    },
+    /// The transitive effect surface of a symbol: which side effects (files,
+    /// network, subprocess, env, db, randomness, clock, global mutation) it and
+    /// everything it transitively calls statically touch — plus import-time
+    /// effects of the modules involved. "Is this pure / safe in a test."
+    Effects { symbol: String },
     /// The external input surface — env vars, literal files opened, CLI args,
     /// and pydantic settings fields. "What does this need to run."
     Inputs,
@@ -86,9 +105,11 @@ fn dispatch(cli: &Cli) -> anyhow::Result<Envelope> {
     // A blank symbol is a usage error, not a 0-result success that reads as
     // "this name is unused."
     let symbol = match &cli.command {
-        Command::Refs { symbol } | Command::Callers { symbol } | Command::Defs { symbol } => {
-            Some(symbol.as_str())
-        }
+        Command::Refs { symbol }
+        | Command::Callers { symbol }
+        | Command::Defs { symbol }
+        | Command::Graph { symbol, .. }
+        | Command::Effects { symbol } => Some(symbol.as_str()),
         _ => None,
     };
     if matches!(symbol, Some(s) if s.trim().is_empty()) {
@@ -114,6 +135,12 @@ fn dispatch(cli: &Cli) -> anyhow::Result<Envelope> {
         Command::Refs { symbol } => resolve(cli, symbol, "refs", |r, s| r.references(s))?,
         Command::Callers { symbol } => resolve(cli, symbol, "callers", |r, s| r.callers(s))?,
         Command::Defs { symbol } => resolve(cli, symbol, "defs", |r, s| r.definitions(s))?,
+        Command::Graph {
+            symbol,
+            reverse,
+            depth,
+        } => query_graph(cli, symbol, *reverse, *depth)?,
+        Command::Effects { symbol } => query_effects(cli, symbol)?,
     };
 
     // Anchor every result to one resolved root, echoed in the query — so the
@@ -155,6 +182,191 @@ fn loc_to_json(loc: &Loc) -> serde_json::Value {
         v["resolves_to"] = json!(target);
     }
     v
+}
+
+/// The transitive call graph of a symbol — forward (callees) or, with
+/// `--reverse`, backward (callers) closure over stable fully-qualified IDs.
+fn query_graph(
+    cli: &Cli,
+    symbol: &str,
+    reverse: bool,
+    depth: Option<usize>,
+) -> anyhow::Result<Envelope> {
+    let files = walk::index_tree(&cli.root)?;
+    let scope = walk::walked_py_files(&cli.root);
+    let graph = CallGraph::new(&cli.root, files, scope)?;
+    let dir = if reverse {
+        Direction::Reverse
+    } else {
+        Direction::Forward
+    };
+    let closure = graph.closure(symbol, dir, depth);
+
+    let results = closure.nodes.iter().map(node_to_json).collect::<Vec<_>>();
+    let n = results.len();
+    let summary = if reverse {
+        format!("{n} {} transitively reach `{symbol}`", plural(n, "node"))
+    } else {
+        format!("{n} {} reachable from `{symbol}`", plural(n, "node"))
+    };
+    // Echo the resolved FQN roots: the durable handle(s) the symbol mapped to,
+    // re-queryable after edits even when line numbers move.
+    let query = json!({
+        "kind": "graph",
+        "mode": if reverse { "reverse" } else { "forward" },
+        "target": symbol,
+        "roots": closure.roots,
+    });
+    let mut envelope = Envelope::new(query, results).with_summary(summary);
+    // No root means the symbol named no function or class — a 0-result graph
+    // that must not read as "found, but isolated."
+    if closure.roots.is_empty() {
+        envelope = envelope
+            .with_warnings(vec![format!("no function or class named `{symbol}` found")]);
+    }
+    Ok(envelope)
+}
+
+fn node_to_json(node: &GraphNode) -> serde_json::Value {
+    json!({
+        "loc": format!("{}:{}:{}", node.path, node.line, node.col),
+        "label": format!("{} {} (depth {}, via {})", node.kind, node.fqn, node.depth, node.via),
+        "fqn": node.fqn,
+        "node_kind": node.kind,
+        "depth": node.depth,
+        "via": node.via,
+    })
+}
+
+/// The transitive effect surface of a symbol: the side effects performed by the
+/// symbol and everything it transitively calls (forward call closure), plus the
+/// import-time effects of every module that contributes a reachable callable.
+fn query_effects(cli: &Cli, symbol: &str) -> anyhow::Result<Envelope> {
+    let files = walk::index_tree(&cli.root)?;
+    let scope = walk::walked_py_files(&cli.root);
+    let graph = CallGraph::new(&cli.root, files.clone(), scope)?;
+    let closure = graph.closure(symbol, Direction::Forward, None);
+
+    // Everything reachable from the symbol, the roots included.
+    let reachable: HashSet<String> = closure
+        .roots
+        .iter()
+        .cloned()
+        .chain(closure.nodes.iter().map(|n| n.fqn.clone()))
+        .collect();
+    // A file is "in play" if it defines a reachable callable — importing such a
+    // module runs its import-time effects, so we surface those too.
+    let in_play: HashSet<&str> = files
+        .iter()
+        .filter(|f| {
+            f.defs.iter().any(|d| {
+                matches!(d.kind, pyq_index::DefKind::Function | pyq_index::DefKind::Class)
+                    && reachable.contains(&owner_fqn(&f.path, &d.container, &d.name))
+            })
+        })
+        .map(|f| f.path.as_str())
+        .collect();
+
+    let mut rows: Vec<(String, serde_json::Value, &'static str)> = Vec::new();
+    let mut categories: BTreeSet<&'static str> = BTreeSet::new();
+    for f in &files {
+        for e in &f.effects {
+            let owner = scope_fqn(&f.path, &e.scope);
+            let keep = if e.import_time {
+                in_play.contains(f.path.as_str())
+            } else {
+                reachable.contains(&owner)
+            };
+            if !keep {
+                continue;
+            }
+            let cat = effect_kind_str(e.kind);
+            categories.insert(cat);
+            let loc = format!("{}:{}:{}", f.path, e.pos.line, e.pos.col);
+            let in_label = if e.import_time {
+                format!("{} (import-time)", module_label(&f.path))
+            } else {
+                owner.clone()
+            };
+            let label = format!("{cat} {}  in {in_label}", e.detail);
+            rows.push((
+                loc.clone(),
+                json!({
+                    "loc": loc,
+                    "label": label,
+                    "effect": cat,
+                    "api": e.detail,
+                    "owner": owner,
+                    "import_time": e.import_time,
+                }),
+                cat,
+            ));
+        }
+    }
+
+    rows.sort_by(|a, b| (a.2, &a.0).cmp(&(b.2, &b.0)));
+    rows.dedup_by(|a, b| a.0 == b.0 && a.1["api"] == b.1["api"]);
+    let results: Vec<serde_json::Value> = rows.iter().map(|(_, v, _)| v.clone()).collect();
+
+    let cats: Vec<&str> = categories.iter().copied().collect();
+    let summary = if closure.roots.is_empty() {
+        format!("no function or class named `{symbol}` found")
+    } else if results.is_empty() {
+        format!(
+            "`{symbol}` is pure — no static effects across {} reachable {}",
+            reachable.len(),
+            plural(reachable.len(), "callable")
+        )
+    } else {
+        format!(
+            "effects of `{symbol}`: {} — {} {}",
+            cats.join(", "),
+            results.len(),
+            plural(results.len(), "site")
+        )
+    };
+    let query = json!({ "kind": "effects", "target": symbol, "categories": cats });
+    let mut envelope = Envelope::new(query, results).with_summary(summary);
+
+    let mut warnings = Vec::new();
+    if closure.roots.is_empty() {
+        warnings.push(format!("no function or class named `{symbol}` found"));
+    } else {
+        // Honest about the boundary: detection is syntactic/over-approximate, and
+        // effects behind calls ty couldn't resolve (attribute/dynamic dispatch)
+        // aren't reached — so "pure" means "no effect found", not "proven pure."
+        warnings.push(
+            "static over-approximation: effects behind dynamic/attribute-dispatched calls are not followed".to_string(),
+        );
+    }
+    envelope = envelope.with_warnings(warnings);
+    Ok(envelope)
+}
+
+/// The owner FQN of a def (`module + container + name`) — the call-graph node id.
+fn owner_fqn(path: &str, container: &[String], name: &str) -> String {
+    let mut scope = container.to_vec();
+    scope.push(name.to_string());
+    scope_fqn(path, &scope)
+}
+
+/// The module id of a file, for labelling import-time effects (`pkg/models.py`
+/// → `pkg.models`).
+fn module_label(path: &str) -> String {
+    scope_fqn(path, &[])
+}
+
+fn effect_kind_str(kind: EffectKind) -> &'static str {
+    match kind {
+        EffectKind::Fs => "fs",
+        EffectKind::Network => "network",
+        EffectKind::Subprocess => "subprocess",
+        EffectKind::Env => "env",
+        EffectKind::Db => "db",
+        EffectKind::Random => "random",
+        EffectKind::Clock => "clock",
+        EffectKind::GlobalState => "global",
+    }
 }
 
 /// The external input surface across the tree (syntactic).

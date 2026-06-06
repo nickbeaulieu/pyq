@@ -13,9 +13,11 @@
 //! Because ty is early (`0.0.x`), *all* contact with it lives in [`ty_backed`];
 //! if its API moves, only that module changes.
 
+mod graph;
 mod ty_backed;
 mod unified;
 
+pub use graph::{scope_fqn, CallGraph, Closure, Direction, GraphNode};
 pub use ty_backed::TyResolver;
 pub use unified::UnifiedResolver;
 
@@ -44,6 +46,26 @@ impl Loc {
     pub fn key(&self) -> String {
         format!("{}:{}:{}", self.path, self.line, self.col)
     }
+}
+
+/// A callable that ty resolved as a call-graph neighbor (a callee, or a caller).
+///
+/// Unlike [`Loc`], it carries the callable's *name byte offset* — the precise,
+/// durable anchor the graph traversal re-feeds to ty to recurse, and the same
+/// offset the syntactic index records for the def, so a neighbor maps straight
+/// back to its stable fully-qualified id.
+#[derive(Clone, Debug)]
+pub struct Neighbor {
+    /// Path relative to the project root.
+    pub path: String,
+    /// Byte offset of the callable's name (its `selection_range` start).
+    pub offset: u32,
+    pub line: usize,
+    pub col: usize,
+    /// The callable's short name (`make_user`, `__init__`).
+    pub name: String,
+    /// ty's symbol kind, lowercased (`"function"`, `"method"`, `"class"`, …).
+    pub kind: &'static str,
 }
 
 /// The query contract. [`UnifiedResolver`] is the shipping impl; [`TyResolver`]

@@ -10,7 +10,8 @@ use ruff_python_parser::parse_unchecked_source;
 use ruff_text_size::{Ranged, TextSize};
 
 use crate::model::{
-    Def, DefKind, FileIndex, ImportContext, ImportStmt, Input, InputKind, Pos, Ref,
+    Def, DefKind, Effect, EffectKind, FileIndex, ImportContext, ImportStmt, Input, InputKind, Pos,
+    Ref,
 };
 
 /// Parse `source` and extract its facts. `path` is recorded verbatim for output.
@@ -38,6 +39,7 @@ pub fn extract(path: &str, source: &str) -> FileIndex {
         refs: Vec::new(),
         inputs: Vec::new(),
         imports: Vec::new(),
+        effects: Vec::new(),
     };
     for stmt in &parsed.syntax().body {
         collector.visit_stmt(stmt);
@@ -48,6 +50,7 @@ pub fn extract(path: &str, source: &str) -> FileIndex {
         refs: collector.refs,
         inputs: collector.inputs,
         imports: collector.imports,
+        effects: collector.effects,
     }
 }
 
@@ -66,6 +69,7 @@ struct Collector<'src> {
     refs: Vec<Ref>,
     inputs: Vec<Input>,
     imports: Vec<ImportStmt>,
+    effects: Vec<Effect>,
 }
 
 impl<'src> Collector<'src> {
@@ -79,6 +83,41 @@ impl<'src> Collector<'src> {
             value,
             pos: self.pos(offset),
         });
+    }
+
+    fn push_effect(&mut self, kind: EffectKind, detail: String, offset: TextSize) {
+        self.effects.push(Effect {
+            kind,
+            detail,
+            pos: self.pos(offset),
+            scope: self.scope.clone(),
+            // Anything not inside a function body runs when the module is
+            // imported (module scope, or a class body being defined).
+            import_time: self.func_depth == 0,
+        });
+    }
+
+    /// Detect a side effect at a call site, attributed to the enclosing scope.
+    /// Matching is on the dotted callee and suffix-based, so it follows the
+    /// usual aliases (`import os as o; o.system(...)`, `from subprocess import
+    /// run; run(...)`). Over-approximate by design: a syntactic hit means the
+    /// code *appears* to perform the effect.
+    fn collect_effect(&mut self, expr: &Expr) {
+        match expr {
+            Expr::Call(call) => {
+                if let Some(callee) = dotted_name(&call.func) {
+                    if let Some(kind) = classify_effect(&callee) {
+                        self.push_effect(kind, callee, expr.range().start());
+                    }
+                }
+            }
+            // `os.environ["KEY"]` is an env read even though it isn't a call.
+            Expr::Subscript(sub) if is_environ(dotted_name(&sub.value).as_deref()) => {
+                let detail = dotted_name(&sub.value).unwrap_or_else(|| "environ".into());
+                self.push_effect(EffectKind::Env, detail, expr.range().start());
+            }
+            _ => {}
+        }
     }
 
     /// Detect env-var reads and literal file opens. Syntactic and
@@ -273,6 +312,13 @@ impl<'src, 'ast> Visitor<'ast> for Collector<'src> {
                     pos: self.pos(i.start()),
                 });
             }
+            // `global x` inside a function declares intent to rebind a
+            // module-level name — a global-state mutation effect. (At module
+            // scope it's a no-op, so only count it inside a function.)
+            Stmt::Global(g) if self.func_depth > 0 => {
+                let names = g.names.iter().map(|n| n.as_str()).collect::<Vec<_>>().join(", ");
+                self.push_effect(EffectKind::GlobalState, names, g.start());
+            }
             _ => {}
         }
         walk_stmt(self, stmt);
@@ -280,6 +326,7 @@ impl<'src, 'ast> Visitor<'ast> for Collector<'src> {
 
     fn visit_expr(&mut self, expr: &'ast Expr) {
         self.collect_input(expr);
+        self.collect_effect(expr);
 
         // A call's callee, when a bare name, is recorded as a call reference and
         // we skip re-walking it as a plain load (so `f` in `f()` is one ref).
@@ -312,6 +359,74 @@ impl<'src, 'ast> Visitor<'ast> for Collector<'src> {
         }
         walk_expr(self, expr);
     }
+}
+
+/// Classify a dotted callee into the side effect it performs, if any. Suffix-
+/// based so it follows aliases (`o.system` for `import os as o`, bare `run` for
+/// `from subprocess import run`). Checked in priority order so a callee that
+/// could match two buckets lands in the more specific one. Over-approximate:
+/// generic method names (`.execute`, `.now`) can hit unrelated code — the
+/// `effects` verb flags the surface as static/over-approximate accordingly.
+fn classify_effect(callee: &str) -> Option<EffectKind> {
+    let ends = |s: &str| callee == s.trim_start_matches('.') || callee.ends_with(s);
+    let any = |sigs: &[&str]| sigs.iter().any(|s| ends(s));
+    let contains = |s: &str| callee.contains(s);
+
+    // Environment — including the `.get`/`.setdefault` reads on `os.environ`.
+    if is_getenv(callee) || ends(".environ.get") || ends(".environ.setdefault") || any(&[".putenv", ".setenv", ".unsetenv"]) {
+        return Some(EffectKind::Env);
+    }
+    // Subprocess / shell.
+    if contains("subprocess.") || any(&[".system", ".popen", ".execv", ".execve", ".execvp", ".spawnl", ".spawnv"]) {
+        return Some(EffectKind::Subprocess);
+    }
+    // Network.
+    if contains("requests.")
+        || contains("httpx.")
+        || contains("aiohttp.")
+        || contains("urllib.request")
+        || ends(".urlopen")
+        || contains("socket.")
+        || ends(".socket")
+        || contains("http.client")
+    {
+        return Some(EffectKind::Network);
+    }
+    // Filesystem. `os.*` mutators are matched as written (the common spelling);
+    // `read_text`/`write_text`/`…_bytes` catch `Path`/handle methods.
+    if callee == "open"
+        || ends("io.open")
+        || any(&[".read_text", ".write_text", ".read_bytes", ".write_bytes"])
+        || any(&[
+            "os.remove", "os.unlink", "os.mkdir", "os.makedirs", "os.rmdir",
+            "os.rename", "os.replace",
+        ])
+        || contains("shutil.")
+    {
+        return Some(EffectKind::Fs);
+    }
+    // Database (over-approximate — generic execute/cursor names).
+    if any(&[".execute", ".executemany", ".executescript", ".fetchone", ".fetchall"])
+        || ends("sqlite3.connect")
+        || ends("psycopg2.connect")
+        || ends("pymysql.connect")
+        || contains("sqlalchemy.")
+    {
+        return Some(EffectKind::Db);
+    }
+    // Randomness / non-determinism.
+    if contains("random.") || contains("secrets.") || ends("os.urandom") || contains("uuid.") || any(&[".uuid4", ".uuid1"]) {
+        return Some(EffectKind::Random);
+    }
+    // Wall clock.
+    if any(&[
+        "time.time", "time.monotonic", "time.perf_counter", "time.process_time",
+        "time.sleep", "time.gmtime", "time.localtime",
+    ]) || any(&[".now", ".utcnow", ".today", ".fromtimestamp"])
+    {
+        return Some(EffectKind::Clock);
+    }
+    None
 }
 
 /// Whether an `if` test is `TYPE_CHECKING` (bare or `typing.TYPE_CHECKING`).

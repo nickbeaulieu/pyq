@@ -7,39 +7,29 @@ completed work is logged at the bottom. `→ blocked by #N` marks a dependency.
 
 ## Open
 
-### P1 — foundation
-- **#10 · Resolved call/reference graph primitive (stable FQN node IDs).**
-  A transitive, cross-file call/reference graph keyed by durable fully-qualified
-  IDs (handles an agent can re-query after edits without re-grepping line
-  numbers). Forward + reverse closure. Most verbs below are projections of it.
-  *Note: the shipped locate-then-resolve `UnifiedResolver` already resolves
-  per-binding precisely; this task is the transitive/cached graph layer on top.*
-
 ### P2 — highest leverage
-- **#11 · `effects` verb — static effect surface.** Does a symbol transitively
-  touch I/O (files, network, subprocess, env, DB, randomness, clock, global
-  mutation)? Plus import-time side effects. "Is this pure / safe in a test / will
-  it hit the network." → blocked by #10
 - **#12 · `hierarchy` verb — class tree + override map.** Subclasses / supers /
   MRO, abstract methods left unimplemented, and for a base method every override
   (and vice-versa). The high-frequency OO-refactor footgun.
 - **#13 · `tests` verb — test↔code map + fixture graph.** Which tests statically
   reach which symbols; pytest fixtures, scopes, deps, conftest resolution.
-  Foundation for static change-coverage. → blocked by #10
+  Foundation for static change-coverage. (now unblocked: `CallGraph` reverse closure)
 
 ### P3 — deeper projections / differential
 - **#3 · `deadcode` verb — graph reachability.** Functions/classes reachable from
   no entrypoint or test, over-approximate and flagged (dynamic dispatch, `__all__`,
-  framework hooks). → blocked by #10
+  framework hooks). (now unblocked: `CallGraph` reachability from entrypoints)
 - **#4 · `--baseline` differential in `pyq-output`.** Capture a baseline result
   set; on re-run show added/removed ("did my edit add dead code / new effects").
   The question an iterating agent actually asks.
 - **#14 · `blast` verb — symbol-level blast radius.** Transitive reverse-dep
   closure: everything that must change / be re-tested if a symbol's signature
-  changes (reverse call graph + import graph + reaching tests). → blocked by #10
+  changes (reverse call graph + import graph + reaching tests). (now unblocked:
+  `CallGraph` reverse closure + the import graph)
 - **#15 · `card` verb — symbol signature + neighborhood.** One compact context
   pack: signature, decorators, docstring line, def line-range, immediate callers
-  + callees + reaching tests. The token-frugal "tell me about X". → blocked by #10
+  + callees + reaching tests. The token-frugal "tell me about X". (now unblocked:
+  `CallGraph` depth-1 neighbours)
 
 ### P4 — resolution surface & convenience
 - **#16 · resolution-surface verbs — `resolve` / re-exports / `imports-from`.**
@@ -54,7 +44,8 @@ completed work is logged at the bottom. `→ blocked by #N` marks a dependency.
 - **#18 · `mock-targets` verb.** Every `mock.patch("a.b.c")` string resolved
   against the graph to flag drifted/invalid patch paths. → blocked by #16
 - **#19 · `raises` verb — static exception surface.** What a function transitively
-  `raise`s and where it's caught. "What can blow up if I call this." → blocked by #10
+  `raise`s and where it's caught. "What can blow up if I call this." (now
+  unblocked: `CallGraph` forward closure)
 - **#20 · `canonical` verb — blessed-helper frequency + untested public.** Rank
   internal symbols by use to surface the repo's blessed helpers; plus public
   surface ∩ no reaching test; plus a test inventory with markers.
@@ -81,6 +72,19 @@ completed work is logged at the bottom. `→ blocked by #N` marks a dependency.
 ## Completed
 
 ### Verbs & infrastructure
+- **#11 · `effects` verb — static effect surface.** Transitive effect surface as
+  a projection of `CallGraph`'s forward closure: `fs`/`network`/`subprocess`/
+  `env`/`db`/`random`/`clock`/`global` per reachable callable, each attributed to
+  the FQN that performs it; plus import-time effects of in-play modules. Syntactic
+  call-site matching (suffix-based, alias-following) in `pyq-index`; over-approximate
+  and flagged (dynamic/attribute dispatch not followed, so "pure" = "no effect found").
+- **#10 · Resolved call/reference graph primitive (`graph` verb).** Transitive
+  cross-file call graph keyed by stable fully-qualified node IDs (`pkg.models.User.__init__`),
+  durable across edits. Forward (callees) + reverse (callers) breadth-first
+  closure, `--depth` cap, cycle-safe; `query.roots` echoes the resolved FQN
+  handle, each node carries `depth`/`via`. `CallGraph` in `pyq-resolve` rides the
+  locate-then-resolve seam (syntactic FQN + offset, ty call hierarchy for edges).
+  The foundation #11/#13/#3/#14/#15/#19 project from.
 - **#1 · `inputs` verb** — env / files / CLI args / pydantic settings (DESIGN #2).
 - **#2 · `imports`/`deps` verb** — import graph: forward/reverse deps + cycles (DESIGN #3).
 - **#5 · CLI integration tests** over `examples/sample`.

@@ -85,6 +85,8 @@ fn query_block_is_uniform_across_verbs() {
     for args in [
         vec!["refs", "User"],
         vec!["defs", "User"],
+        vec!["graph", "User"],
+        vec!["effects", "User"],
         vec!["inputs"],
         vec!["imports"],
     ] {
@@ -335,6 +337,272 @@ fn unknown_symbol_is_zero_results_not_an_error() {
     let (env, ok) = run_json(&["defs", "NoSuchSymbolAnywhere"]);
     assert!(ok, "an unknown symbol should exit 0");
     assert_eq!(env["count"].as_u64().unwrap(), 0);
+}
+
+// `graph` is the transitive call-graph primitive (#10): nodes keyed by stable
+// FQNs, forward (callees) and reverse (callers) closure. The chain a→b→c proves
+// transitivity — `c` is reached from `a` at depth 2, through `b`.
+#[test]
+fn graph_forward_closure_is_transitive() {
+    let root = fixture("callgraph");
+    let (env, ok) = run_json_in(&root, &["graph", "a"]);
+    assert!(ok);
+    assert_eq!(env["query"]["kind"], "graph");
+    assert_eq!(env["query"]["mode"], "forward");
+    // The symbol resolved to one durable FQN root, echoed in the query.
+    assert_eq!(env["query"]["roots"][0], "chain.a");
+
+    let by_fqn: std::collections::HashMap<&str, u64> = env["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| (r["fqn"].as_str().unwrap(), r["depth"].as_u64().unwrap()))
+        .collect();
+    assert_eq!(by_fqn.get("chain.b"), Some(&1), "direct callee: {env}");
+    assert_eq!(by_fqn.get("chain.c"), Some(&2), "transitive callee: {env}");
+    // The transitive node names the tree edge it was reached through.
+    let c = env["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["fqn"] == "chain.c")
+        .unwrap();
+    assert_eq!(c["via"], "chain.b");
+}
+
+// Reverse closure is the mirror: everything that transitively *calls* `c`.
+#[test]
+fn graph_reverse_closure_is_transitive() {
+    let root = fixture("callgraph");
+    let (env, ok) = run_json_in(&root, &["graph", "c", "--reverse"]);
+    assert!(ok);
+    assert_eq!(env["query"]["mode"], "reverse");
+    let by_fqn: std::collections::HashMap<&str, u64> = env["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| (r["fqn"].as_str().unwrap(), r["depth"].as_u64().unwrap()))
+        .collect();
+    assert_eq!(by_fqn.get("chain.b"), Some(&1), "direct caller: {env}");
+    assert_eq!(by_fqn.get("chain.a"), Some(&2), "transitive caller: {env}");
+}
+
+// `--depth N` caps the closure at N hops — the depth-2 node drops out.
+#[test]
+fn graph_depth_caps_the_closure() {
+    let root = fixture("callgraph");
+    let (env, ok) = run_json_in(&root, &["graph", "a", "--depth", "1"]);
+    assert!(ok);
+    let fqns: std::collections::HashSet<&str> = env["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["fqn"].as_str().unwrap())
+        .collect();
+    assert!(fqns.contains("chain.b"), "depth-1 node kept: {env}");
+    assert!(!fqns.contains("chain.c"), "depth-2 node dropped at --depth 1: {env}");
+}
+
+// A direct self-recursive function must not hang and reports no *other* reachable
+// node (its only callee is itself, already the root).
+#[test]
+fn graph_handles_recursion_without_looping() {
+    let root = fixture("callgraph");
+    let (env, ok) = run_json_in(&root, &["graph", "recur"]);
+    assert!(ok);
+    assert_eq!(env["query"]["roots"][0], "chain.recur");
+    assert_eq!(env["count"].as_u64().unwrap(), 0, "{env}");
+}
+
+// A full FQN is a durable handle: passing the resolved id back resolves the same
+// node (so an agent can re-query after edits without re-grepping line numbers).
+#[test]
+fn graph_accepts_a_full_fqn_as_a_durable_handle() {
+    let (env, ok) = run_json(&["graph", "pkg.models.make_user"]);
+    assert!(ok);
+    assert_eq!(env["query"]["roots"][0], "pkg.models.make_user");
+    // make_user calls the class `User` — one reachable node, fully qualified.
+    let fqns: Vec<&str> = env["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["fqn"].as_str().unwrap())
+        .collect();
+    assert_eq!(fqns, vec!["pkg.models.User"], "{env}");
+}
+
+// Cross-file: a forward closure walks through imports. `main` (app.py) reaches
+// `make_user` and `User` in pkg/models.py.
+#[test]
+fn graph_forward_closure_spans_files() {
+    let (env, ok) = run_json(&["graph", "main"]);
+    assert!(ok);
+    let fqns: std::collections::HashSet<&str> = env["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["fqn"].as_str().unwrap())
+        .collect();
+    assert!(fqns.contains("pkg.models.make_user"), "{env}");
+    assert!(fqns.contains("pkg.models.User"), "{env}");
+}
+
+// Regression: a function called through an import (`from lib import helper;
+// helper()`) must appear in the callee's *reverse* closure. ty's call hierarchy
+// from a definition alone misses these cross-module callers — so the reverse
+// walk sweeps every occurrence that resolves to the node. Missing them would
+// read as "nothing calls this → safe to delete." The disambiguation half: a
+// second, unrelated `helper` of the same name in another module must NOT bleed
+// its caller into this closure.
+#[test]
+fn graph_reverse_crosses_imports_without_merging_same_named() {
+    let root = fixture("callgraph_import");
+    let (env, ok) = run_json_in(&root, &["graph", "lib.helper", "--reverse"]);
+    assert!(ok);
+    assert_eq!(env["query"]["roots"][0], "lib.helper");
+    let fqns: std::collections::HashSet<&str> = env["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["fqn"].as_str().unwrap())
+        .collect();
+    // The cross-import caller is found …
+    assert!(fqns.contains("main.use_lib"), "cross-import caller missing: {env}");
+    // … and the same-named `other.helper`'s caller is NOT merged in.
+    assert!(
+        !fqns.contains("other.use_other"),
+        "same-named symbol's caller must not merge: {env}"
+    );
+    assert_eq!(env["count"].as_u64().unwrap(), 1, "{env}");
+}
+
+// A symbol that names no callable is roots-empty with a warning — distinct from
+// a real callable that simply reaches nothing (roots-present, count 0). The
+// query still exits 0.
+#[test]
+fn graph_unknown_symbol_warns_and_exits_zero() {
+    let (env, ok) = run_json(&["graph", "NoSuchCallable"]);
+    assert!(ok, "unknown symbol should exit 0");
+    assert_eq!(env["count"].as_u64().unwrap(), 0);
+    assert!(env["query"]["roots"].as_array().unwrap().is_empty());
+    let warnings = env["warnings"].as_array().expect("a warning");
+    assert!(
+        warnings.iter().any(|w| w.as_str().unwrap().contains("no function or class")),
+        "{env}"
+    );
+}
+
+// `graph` joins the symbol verbs in rejecting a blank symbol (usage error, not a
+// 0-result success that reads as "isolated").
+#[test]
+fn graph_blank_symbol_is_a_usage_error() {
+    let out = Command::new(env!("CARGO_BIN_EXE_pyq"))
+        .args(["graph", ""])
+        .arg("--root")
+        .arg(sample_root())
+        .output()
+        .expect("pyq should run");
+    assert!(!out.status.success());
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(stderr.contains("symbol must not be empty"), "stderr: {stderr}");
+}
+
+// `effects` is the transitive effect surface (#11), a projection of the forward
+// call closure. `run` itself touches nothing, but transitively (across files,
+// through imports) it hits network, db, and randomness — each site attributed
+// to the function that actually performs it.
+#[test]
+fn effects_aggregates_transitively_across_the_call_closure() {
+    let root = fixture("effects");
+    let (env, ok) = run_json_in(&root, &["effects", "run"]);
+    assert!(ok);
+    assert_eq!(env["query"]["kind"], "effects");
+
+    let cats: std::collections::HashSet<&str> = env["query"]["categories"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c.as_str().unwrap())
+        .collect();
+    assert!(cats.contains("network"), "{env}");
+    assert!(cats.contains("db"), "{env}");
+    assert!(cats.contains("random"), "{env}");
+
+    // The network effect is attributed to io_ops.fetch — the transitive callee
+    // that performs it, not to `run`.
+    let net = env["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["effect"] == "network")
+        .unwrap();
+    assert_eq!(net["owner"], "io_ops.fetch");
+    assert_eq!(net["api"], "requests.get");
+    assert_eq!(net["import_time"], false);
+}
+
+// A genuinely pure function reports no effects, with a clear summary and the
+// over-approximation caveat (so "pure" is read as "no effect found", not proof).
+#[test]
+fn effects_reports_purity_with_a_caveat() {
+    let root = fixture("effects");
+    let (env, ok) = run_json_in(&root, &["effects", "pure_add"]);
+    assert!(ok);
+    assert_eq!(env["count"].as_u64().unwrap(), 0);
+    assert!(env["summary"].as_str().unwrap().contains("pure"), "{env}");
+    assert!(
+        env["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|w| w.as_str().unwrap().contains("over-approximation")),
+        "{env}"
+    );
+}
+
+// Module-level effectful code is surfaced as import-time: `TOKEN = os.getenv(...)`
+// runs when boot.py is imported, and `init` (defined there) is reachable.
+#[test]
+fn effects_surfaces_import_time_effects() {
+    let root = fixture("effects");
+    let (env, ok) = run_json_in(&root, &["effects", "init"]);
+    assert!(ok);
+    let imp = env["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["import_time"] == true)
+        .expect("an import-time effect");
+    assert_eq!(imp["effect"], "env");
+    assert_eq!(imp["api"], "os.getenv");
+}
+
+// A `global` declaration inside a function is a global-state mutation effect.
+#[test]
+fn effects_flags_global_mutation() {
+    let root = fixture("effects");
+    let (env, ok) = run_json_in(&root, &["effects", "remember"]);
+    assert!(ok);
+    let g = env["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["effect"] == "global")
+        .expect("a global-state effect");
+    assert_eq!(g["owner"], "io_ops.remember");
+}
+
+// `effects` joins the symbol verbs: unknown name → 0 results, warned, exit 0.
+#[test]
+fn effects_unknown_symbol_warns_and_exits_zero() {
+    let (env, ok) = run_json(&["effects", "NoSuchThing"]);
+    assert!(ok);
+    assert_eq!(env["count"].as_u64().unwrap(), 0);
+    assert!(env["warnings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|w| w.as_str().unwrap().contains("no function or class")));
 }
 
 #[test]

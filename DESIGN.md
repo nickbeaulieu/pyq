@@ -34,6 +34,19 @@ If yes, don't rebuild it — unless we can do it **deeper** (see below).
    edges only — `TYPE_CHECKING`-guarded and deferred/function-local imports (the
    patterns that *break* runtime cycles) are excluded — and each is reported as
    an ordered `a → b → … → a` path. Will ride the resolved graph from #1 later.
+4. **Call/reference graph** (`graph`, shipped) — the transitive, cross-file call
+   graph keyed by stable fully-qualified node ids (durable across edits).
+   Forward (callees) and reverse (callers) closure, `--depth` capped, cycle-safe.
+   The foundation the projections below are built on; rides ty's call hierarchy
+   anchored on the syntactic index's offsets (see Architecture).
+5. **Effect surface** (`effects`, shipped) — the first projection of `graph`:
+   does a symbol, or anything it transitively calls, touch the filesystem,
+   network, a subprocess, the environment, a database, randomness, the clock, or
+   module-global state — plus import-time effects of the modules involved.
+   Syntactic and over-approximate: each call site is matched on its dotted callee
+   (suffix-based, alias-following, like `inputs`), so a hit means "appears to,"
+   and effects behind dynamically/attribute-dispatched calls are not followed.
+   "Is this pure / safe in a test / will it hit the network."
 
 ## Worth building *deeper* than the existing tools (the exception to the filter)
 These exist elsewhere but a pyq-native version is better because it rides the
@@ -55,6 +68,15 @@ index we already build:
   and same-named bindings resolve separately — each tagged with the def it
   resolves to. No over-approximate tier, nothing to disclose. Results carry a
   `role`; bindings/ambiguous uses carry `resolves_to`.
+  - **The transitive call graph (`CallGraph`)** rides the same seam: the
+    syntactic index assigns each callable a stable fully-qualified id (module
+    path + enclosing scopes + name) and records its name offset; ty's call
+    hierarchy supplies the edges, anchored at that same offset, so a neighbour
+    maps straight back to its FQN and the walk recurses by re-feeding the offset.
+    A breadth-first closure (forward = callees, reverse = callers) is the
+    foundation primitive the heavier verbs — blast radius, dead code, the symbol
+    card — are projections of. Nodes are durable ids, not line numbers, so an
+    agent holds them across edits.
   - **All ty contact is confined to `ty_backed`.** ty is `0.0.x`, so this
     insulation is load-bearing: pin to a ruff tag (churn becomes a scheduled
     upgrade, not runtime flake), depend only on the LSP-shaped entry points

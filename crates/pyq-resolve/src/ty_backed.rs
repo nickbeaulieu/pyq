@@ -7,12 +7,15 @@ use ruff_db::system::{OsSystem, SystemPath, SystemPathBuf};
 use ruff_text_size::{TextRange, TextSize};
 use std::collections::HashSet;
 use std::path::PathBuf;
-use ty_ide::{find_references, incoming_calls, workspace_symbols};
+use ty_ide::{
+    find_references, goto_definition, incoming_calls, outgoing_calls, workspace_symbols,
+    CallHierarchyItem, SymbolKind,
+};
 use ty_project::metadata::options::{EnvironmentOptions, Options, ProjectOptionsOverrides};
 use ty_project::metadata::value::RelativePathBuf;
 use ty_project::{ProjectDatabase, ProjectMetadata};
 
-use crate::{Loc, Resolver};
+use crate::{Loc, Neighbor, Resolver};
 
 pub struct TyResolver {
     db: ProjectDatabase,
@@ -171,6 +174,79 @@ impl TyResolver {
         out
     }
 
+    /// The callables directly *called by* whatever sits at `offset` in
+    /// `rel_path` — its outgoing call-graph edges. Each [`Neighbor`] carries the
+    /// callee's own name offset, so the graph traversal recurses into it without
+    /// re-grepping. Out-of-scope callees (stdlib, third-party) are dropped, so
+    /// the graph stays project-internal. ty folds repeat call sites to one
+    /// callee into a single entry.
+    pub fn outgoing_at(&self, rel_path: &str, offset: TextSize) -> Vec<Neighbor> {
+        let Some(file) = self.file_at(rel_path) else {
+            return Vec::new();
+        };
+        outgoing_calls(&self.db, file, offset)
+            .into_iter()
+            .filter_map(|c| self.neighbor(&c.to))
+            .collect()
+    }
+
+    /// The callables that directly *call* whatever sits at `offset` in
+    /// `rel_path` — its incoming call-graph edges (one [`Neighbor`] per caller,
+    /// not per call site). Counterpart of [`Self::outgoing_at`] for the reverse
+    /// closure; out-of-scope callers are dropped.
+    ///
+    /// Anchored at a single offset. ty's `incoming_calls` from a *definition*
+    /// misses callers that reach the symbol through an import (`from m import f`),
+    /// so the graph layer anchors this at every occurrence that resolves to the
+    /// node — see `CallGraph`.
+    pub fn incoming_at(&self, rel_path: &str, offset: TextSize) -> Vec<Neighbor> {
+        let Some(file) = self.file_at(rel_path) else {
+            return Vec::new();
+        };
+        let mut seen: HashSet<(String, u32)> = HashSet::new();
+        let mut out = Vec::new();
+        for call in incoming_calls(&self.db, file, offset) {
+            if let Some(nb) = self.neighbor(&call.from) {
+                if seen.insert((nb.path.clone(), nb.offset)) {
+                    out.push(nb);
+                }
+            }
+        }
+        out
+    }
+
+    /// Resolve the binding referenced at `offset` in `rel_path` to its
+    /// definition's `(path, name offset)` — the durable anchor a use site points
+    /// at. Used to attribute a syntactic occurrence to a specific graph node
+    /// (so two same-named symbols don't merge). `None` if it resolves out of
+    /// scope or doesn't resolve. Follows import aliases.
+    pub fn resolve_def_at(&self, rel_path: &str, offset: TextSize) -> Option<(String, u32)> {
+        let file = self.file_at(rel_path)?;
+        let targets = goto_definition(&self.db, file, offset)?;
+        let target = targets.into_iter().next()?;
+        let path = self.rel_path(target.file())?;
+        Some((path, target.focus_range().start().to_u32()))
+    }
+
+    /// Turn a call-hierarchy item into a [`Neighbor`], or `None` if it is out of
+    /// the reporting scope (typeshed, third-party, a `--root`-excluded file).
+    /// Anchors on the item's `selection_range` — the symbol *name* range, the
+    /// same offset the syntactic index records for the def, so the two line up.
+    fn neighbor(&self, item: &CallHierarchyItem) -> Option<Neighbor> {
+        let path = self.rel_path(item.file)?;
+        let offset = item.selection_range.start();
+        let text = source_text(&self.db, item.file);
+        let (line, col) = line_col(text.as_str(), offset.to_usize());
+        Some(Neighbor {
+            path,
+            offset: offset.to_u32(),
+            line,
+            col,
+            name: item.name.as_str().to_string(),
+            kind: symbol_kind(item.kind),
+        })
+    }
+
     /// Map a (file, byte offset) to a project-relative `Loc`, or `None` if the
     /// file is outside the reporting scope (see [`Self::scope`]).
     fn loc(&self, file: File, offset: TextSize, kind: &str, role: &'static str) -> Option<Loc> {
@@ -300,6 +376,21 @@ fn pytest_pythonpath(project_root: &str) -> Vec<String> {
     }
     out.retain(|p| p != "." && p != "./" && !p.is_empty());
     out
+}
+
+/// Lowercased tag for a call-graph node's symbol kind. Constructors read as
+/// methods (a method on a class); anything non-callable shouldn't reach here.
+fn symbol_kind(kind: SymbolKind) -> &'static str {
+    match kind {
+        SymbolKind::Class => "class",
+        SymbolKind::Method | SymbolKind::Constructor => "method",
+        SymbolKind::Function => "function",
+        SymbolKind::Property => "property",
+        // A module appears as a caller for code that runs at module scope
+        // (`if __name__ == "__main__": main()`).
+        SymbolKind::Module => "module",
+        _ => "callable",
+    }
 }
 
 fn reference_kind(kind: ty_ide::ReferenceKind) -> &'static str {

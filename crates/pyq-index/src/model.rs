@@ -79,6 +79,49 @@ pub enum InputKind {
     Setting,
 }
 
+/// A category of observable side effect a piece of code performs. Syntactic and
+/// over-approximate by design (matched on call-site shape, alias-following), so
+/// a hit means "statically appears to" — the basis for "is this pure / safe in
+/// a test / will it hit the network."
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum EffectKind {
+    /// Filesystem: `open`, `Path.read_text`/`write_text`, `os.remove`, `shutil.*`.
+    Fs,
+    /// Network: `requests`/`httpx`/`urllib`/`socket`/`aiohttp`.
+    Network,
+    /// Subprocess / shell: `subprocess.*`, `os.system`, `os.popen`.
+    Subprocess,
+    /// Environment: `os.getenv`, `os.environ[...]`, `os.putenv`.
+    Env,
+    /// Database: `*.execute`/`executemany`, `sqlite3`/`psycopg2`/`pymysql.connect`.
+    Db,
+    /// Non-determinism: `random.*`, `secrets.*`, `os.urandom`, `uuid.uuid4`.
+    Random,
+    /// Wall clock: `time.time`/`sleep`/`monotonic`, `datetime.now`/`utcnow`.
+    Clock,
+    /// Module-global mutation: a `global` declaration inside a function.
+    #[serde(rename = "global")]
+    GlobalState,
+}
+
+/// One side effect a piece of code statically appears to perform.
+#[derive(Clone, Debug, Serialize)]
+pub struct Effect {
+    pub kind: EffectKind,
+    /// The matched API or signal (`requests.get`, `os.environ`, `global x`).
+    pub detail: String,
+    pub pos: Pos,
+    /// Enclosing class/function names (outermost first) — the owner whose body
+    /// performs the effect. Combined with the module path this is the owner's
+    /// fully-qualified id, so an effect maps onto a call-graph node.
+    pub scope: Vec<String>,
+    /// `true` when the effect runs at *import time* — it sits at module or
+    /// class-body scope (not inside a function), so merely importing the module
+    /// triggers it.
+    pub import_time: bool,
+}
+
 /// When an import executes — distinguishes the module-load-time edges that form
 /// real import cycles from the ones good code uses to *break* them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -119,4 +162,5 @@ pub struct FileIndex {
     pub refs: Vec<Ref>,
     pub inputs: Vec<Input>,
     pub imports: Vec<ImportStmt>,
+    pub effects: Vec<Effect>,
 }

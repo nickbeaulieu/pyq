@@ -1,4 +1,4 @@
-use pyq_index::{extract, DefKind, ImportContext, InputKind};
+use pyq_index::{extract, DefKind, EffectKind, ImportContext, InputKind};
 
 const SRC: &str = r#"
 from pkg.models import User, make_user
@@ -270,5 +270,88 @@ class Broken(
         idx.inputs.iter().any(|i| i.value == "EARLY_KEY"),
         "env read before the error should survive: {:?}",
         idx.inputs
+    );
+}
+
+const EFFECTFUL: &str = r#"
+import os
+import requests
+import subprocess
+import random
+import time
+
+TOKEN = os.getenv("TOKEN")
+
+def work(url):
+    requests.get(url)
+    subprocess.run(["ls"])
+    data = open("f.txt").read()
+    random.random()
+    time.time()
+    return data
+
+class C:
+    def m(self):
+        return os.environ["K"]
+
+CACHE = {}
+def remember(v):
+    global CACHE
+    CACHE = v
+
+def pure(a, b):
+    return a + b
+"#;
+
+#[test]
+fn classifies_effects_by_category_and_owner_scope() {
+    let idx = extract("m.py", EFFECTFUL);
+    let kind = |api: &str| {
+        idx.effects
+            .iter()
+            .find(|e| e.detail == api)
+            .unwrap_or_else(|| panic!("effect {api} not found in {:?}", idx.effects))
+    };
+
+    assert_eq!(kind("requests.get").kind, EffectKind::Network);
+    assert_eq!(kind("subprocess.run").kind, EffectKind::Subprocess);
+    assert_eq!(kind("open").kind, EffectKind::Fs);
+    assert_eq!(kind("random.random").kind, EffectKind::Random);
+    assert_eq!(kind("time.time").kind, EffectKind::Clock);
+
+    // Inside a function — not import-time — and owned by the enclosing scope.
+    let net = kind("requests.get");
+    assert!(!net.import_time);
+    assert_eq!(net.scope, vec!["work".to_string()]);
+
+    // A method effect carries its class + method scope.
+    let env = idx.effects.iter().find(|e| e.kind == EffectKind::Env && !e.import_time).unwrap();
+    assert_eq!(env.scope, vec!["C".to_string(), "m".to_string()]);
+}
+
+#[test]
+fn module_level_effect_is_import_time() {
+    let idx = extract("m.py", EFFECTFUL);
+    // `TOKEN = os.getenv("TOKEN")` runs when the module is imported.
+    let tok = idx.effects.iter().find(|e| e.kind == EffectKind::Env && e.import_time).unwrap();
+    assert!(tok.scope.is_empty(), "module scope: {:?}", tok);
+}
+
+#[test]
+fn global_declaration_is_a_mutation_effect() {
+    let idx = extract("m.py", EFFECTFUL);
+    let g = idx.effects.iter().find(|e| e.kind == EffectKind::GlobalState).unwrap();
+    assert_eq!(g.detail, "CACHE");
+    assert_eq!(g.scope, vec!["remember".to_string()]);
+    assert!(!g.import_time);
+}
+
+#[test]
+fn a_pure_function_records_no_effects_for_its_scope() {
+    let idx = extract("m.py", EFFECTFUL);
+    assert!(
+        !idx.effects.iter().any(|e| e.scope == vec!["pure".to_string()]),
+        "pure() should have no effects: {:?}",
+        idx.effects
     );
 }

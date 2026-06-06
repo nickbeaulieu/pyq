@@ -43,14 +43,14 @@ struct Anchor {
 
 /// Split a possibly-qualified symbol into its leaf and the qualifier before it:
 /// `Alpha.process` → (`process`, `["Alpha"]`); `process` → (`process`, `[]`).
-fn parse_query(symbol: &str) -> (&str, Vec<&str>) {
+pub(crate) fn parse_query(symbol: &str) -> (&str, Vec<&str>) {
     let mut parts: Vec<&str> = symbol.split('.').filter(|s| !s.is_empty()).collect();
     let leaf = parts.pop().unwrap_or(symbol);
     (leaf, parts)
 }
 
 /// Module path components of a file: `pkg/models.py` → `["pkg", "models"]`.
-fn module_components(path: &str) -> Vec<&str> {
+pub(crate) fn module_components(path: &str) -> Vec<&str> {
     let stem = path
         .strip_suffix(".pyi")
         .or_else(|| path.strip_suffix(".py"))
@@ -65,7 +65,7 @@ fn module_components(path: &str) -> Vec<&str> {
 /// class/function names). `Alpha.process` matches `process` inside class
 /// `Alpha`; `models.Call` matches a top-level `Call` in `…/models.py`. An empty
 /// qualifier matches any def of that leaf.
-fn scoped_by(qualifier: &[&str], file: &str, container: &[String]) -> bool {
+pub(crate) fn scoped_by(qualifier: &[&str], file: &str, container: &[String]) -> bool {
     if qualifier.is_empty() {
         return true;
     }
