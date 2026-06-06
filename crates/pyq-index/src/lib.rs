@@ -8,4 +8,6 @@ pub mod extract;
 pub mod model;
 
 pub use extract::extract;
-pub use model::{Def, DefKind, FileIndex, ImportStmt, Input, InputKind, Pos, Ref};
+pub use model::{
+    Def, DefKind, FileIndex, ImportContext, ImportStmt, Input, InputKind, Pos, Ref,
+};

@@ -6,7 +6,7 @@
 //! prefix — are *internal*; everything else (`os`, `click`, …) is *external*.
 //! Cycles are the non-trivial strongly-connected components over internal edges.
 
-use pyq_index::{FileIndex, Pos};
+use pyq_index::{FileIndex, ImportContext, Pos};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// One importer → target edge.
@@ -16,6 +16,8 @@ pub struct Edge {
     pub target: String,
     pub pos: Pos,
     pub internal: bool,
+    /// When the import runs — only `TopLevel` edges count toward cycles.
+    pub context: ImportContext,
 }
 
 pub struct Graph {
@@ -50,6 +52,7 @@ impl Graph {
                         target,
                         pos: stmt.pos,
                         internal,
+                        context: stmt.context,
                     });
                 }
                 // `from M import name` where `M.name` is itself a project module
@@ -63,6 +66,7 @@ impl Graph {
                             target: sub,
                             pos: stmt.pos,
                             internal: true,
+                            context: stmt.context,
                         });
                     }
                 }
@@ -75,15 +79,18 @@ impl Graph {
         self.module_file.get(module).map(String::as_str)
     }
 
-    /// Internal modules forming the nodes of the dependency graph.
+    /// Internal modules forming the nodes of the dependency graph. Only
+    /// `TopLevel` edges (run at import time) count — `TYPE_CHECKING` and
+    /// deferred/function-local imports are exactly how code *breaks* runtime
+    /// cycles, so they must not be reported as cycles.
     fn internal_adjacency(&self) -> BTreeMap<&str, BTreeSet<&str>> {
         let mut adj: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
         for m in self.module_file.keys() {
             adj.entry(m).or_default();
         }
         for e in &self.edges {
-            // Only edges between actual module nodes count for cycles.
-            if self.module_file.contains_key(&e.target) {
+            // Only import-time edges between actual module nodes count.
+            if e.context == ImportContext::TopLevel && self.module_file.contains_key(&e.target) {
                 adj.entry(e.importer.as_str())
                     .or_default()
                     .insert(e.target.as_str());
@@ -92,19 +99,61 @@ impl Graph {
         adj
     }
 
-    /// Non-trivial strongly-connected components — the import cycles.
+    /// Import cycles, each as an ordered path (not repeating the closing node),
+    /// computed as the non-trivial strongly-connected components over
+    /// import-time edges, with one concrete cycle extracted per SCC so the
+    /// output names an edge to cut.
     pub fn cycles(&self) -> Vec<Vec<String>> {
         let adj = self.internal_adjacency();
         tarjan_scc(&adj)
             .into_iter()
             .filter(|scc| scc.len() > 1 || self_loop(&adj, scc))
-            .map(|scc| scc.into_iter().map(str::to_string).collect())
+            .filter_map(|scc| {
+                let set: BTreeSet<&str> = scc.iter().copied().collect();
+                extract_cycle(&adj, &set).map(|c| c.into_iter().map(str::to_string).collect())
+            })
             .collect()
     }
 }
 
 fn self_loop(adj: &BTreeMap<&str, BTreeSet<&str>>, scc: &[&str]) -> bool {
     scc.len() == 1 && adj.get(scc[0]).is_some_and(|t| t.contains(scc[0]))
+}
+
+/// Extract one concrete cycle (ordered, not repeating the closing node) from a
+/// strongly-connected node set — a DFS following intra-SCC edges until it
+/// revisits a node already on the current path.
+fn extract_cycle<'a>(
+    adj: &BTreeMap<&'a str, BTreeSet<&'a str>>,
+    scc: &BTreeSet<&'a str>,
+) -> Option<Vec<&'a str>> {
+    let start = *scc.iter().next()?;
+    if scc.len() == 1 {
+        return Some(vec![start]); // self-loop
+    }
+    let mut path: Vec<&str> = Vec::new();
+    let mut on_path: BTreeSet<&str> = BTreeSet::new();
+    let mut stack = vec![(start, false)];
+    while let Some((node, backtrack)) = stack.pop() {
+        if backtrack {
+            on_path.remove(node);
+            path.pop();
+            continue;
+        }
+        path.push(node);
+        on_path.insert(node);
+        stack.push((node, true));
+        if let Some(succs) = adj.get(node) {
+            for &w in succs.iter().filter(|w| scc.contains(*w)) {
+                if on_path.contains(w) {
+                    let pos = path.iter().position(|&n| n == w).unwrap();
+                    return Some(path[pos..].to_vec());
+                }
+                stack.push((w, false));
+            }
+        }
+    }
+    None
 }
 
 /// A target is internal if it names a project module exactly, or is a package

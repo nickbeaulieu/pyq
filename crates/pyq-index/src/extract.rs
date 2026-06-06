@@ -9,7 +9,9 @@ use ruff_python_ast::{CmpOp, Expr, ExprContext, PySourceType, Stmt, StmtClassDef
 use ruff_python_parser::parse_unchecked_source;
 use ruff_text_size::{Ranged, TextSize};
 
-use crate::model::{Def, DefKind, FileIndex, ImportStmt, Input, InputKind, Pos, Ref};
+use crate::model::{
+    Def, DefKind, FileIndex, ImportContext, ImportStmt, Input, InputKind, Pos, Ref,
+};
 
 /// Parse `source` and extract its facts. `path` is recorded verbatim for output.
 ///
@@ -29,6 +31,8 @@ pub fn extract(path: &str, source: &str) -> FileIndex {
         source,
         lines: &lines,
         depth: 0,
+        func_depth: 0,
+        type_checking: false,
         defs: Vec::new(),
         refs: Vec::new(),
         inputs: Vec::new(),
@@ -49,7 +53,12 @@ pub fn extract(path: &str, source: &str) -> FileIndex {
 struct Collector<'src> {
     source: &'src str,
     lines: &'src Lines,
+    /// Function + class nesting (for `Def::nested`).
     depth: usize,
+    /// Function-body nesting only — a non-zero depth means an import is deferred.
+    func_depth: usize,
+    /// Inside an `if TYPE_CHECKING:` block — its imports are type-only.
+    type_checking: bool,
     defs: Vec<Def>,
     refs: Vec<Ref>,
     inputs: Vec<Input>,
@@ -133,6 +142,17 @@ impl<'src> Collector<'src> {
         }
     }
 
+    /// When the import currently being visited executes.
+    fn import_context(&self) -> ImportContext {
+        if self.type_checking {
+            ImportContext::TypeChecking
+        } else if self.func_depth > 0 {
+            ImportContext::Deferred
+        } else {
+            ImportContext::TopLevel
+        }
+    }
+
     fn push_def(&mut self, name: &str, kind: DefKind, offset: TextSize) {
         self.defs.push(Def {
             name: name.to_string(),
@@ -149,8 +169,31 @@ impl<'src, 'ast> Visitor<'ast> for Collector<'src> {
             Stmt::FunctionDef(f) => {
                 self.push_def(f.name.as_str(), DefKind::Function, f.name.start());
                 self.depth += 1;
+                self.func_depth += 1;
                 walk_stmt(self, stmt);
+                self.func_depth -= 1;
                 self.depth -= 1;
+                return;
+            }
+            // `if TYPE_CHECKING:` — its body's imports are type-only and never
+            // run at import time, so they must not count as cycle edges. The
+            // elif/else branches are runtime and visited normally.
+            Stmt::If(if_stmt) if is_type_checking(&if_stmt.test) => {
+                self.visit_expr(&if_stmt.test);
+                let prev = self.type_checking;
+                self.type_checking = true;
+                for s in &if_stmt.body {
+                    self.visit_stmt(s);
+                }
+                self.type_checking = prev;
+                for clause in &if_stmt.elif_else_clauses {
+                    if let Some(test) = &clause.test {
+                        self.visit_expr(test);
+                    }
+                    for s in &clause.body {
+                        self.visit_stmt(s);
+                    }
+                }
                 return;
             }
             Stmt::ClassDef(c) => {
@@ -198,6 +241,7 @@ impl<'src, 'ast> Visitor<'ast> for Collector<'src> {
                         module: alias.name.as_str().to_string(),
                         level: 0,
                         names: Vec::new(),
+                        context: self.import_context(),
                         pos: self.pos(i.start()),
                     });
                 }
@@ -213,6 +257,7 @@ impl<'src, 'ast> Visitor<'ast> for Collector<'src> {
                     module: i.module.as_ref().map(|m| m.as_str().to_string()).unwrap_or_default(),
                     level: i.level,
                     names: i.names.iter().map(|a| a.name.as_str().to_string()).collect(),
+                    context: self.import_context(),
                     pos: self.pos(i.start()),
                 });
             }
@@ -253,6 +298,11 @@ impl<'src, 'ast> Visitor<'ast> for Collector<'src> {
         }
         walk_expr(self, expr);
     }
+}
+
+/// Whether an `if` test is `TYPE_CHECKING` (bare or `typing.TYPE_CHECKING`).
+fn is_type_checking(test: &Expr) -> bool {
+    matches!(dotted_name(test).as_deref(), Some(d) if d == "TYPE_CHECKING" || d.ends_with(".TYPE_CHECKING"))
 }
 
 /// A `getenv` callee, following the `import os as o` / `from os import getenv`

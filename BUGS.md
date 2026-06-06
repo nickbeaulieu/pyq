@@ -15,6 +15,25 @@ or matching the qualified form.
 ## P3 — Empty symbol silently succeeds
 `pyq defs ""` → "0 defs of ``", exit 0. Probably should be a usage error.
 
+## P3 — `inputs` keeps only the first string of a multi-alias CLI option
+`@click.option("-v", "--verbose", is_flag=True)` is reported as `arg -v`, dropping
+the canonical `--verbose`. argparse `add_argument("-v","--verbose")` would hit the
+same path. Agents/humans search by the long name; capture the long form (or both).
+Coverage is otherwise good: click `--option`/`argument`, argparse positional/opt,
+and **subparser** args (`sub.add_parser(...).add_argument(...)`) are all found.
+
+## P3 — JSON envelope `query` block isn't uniform across verbs
+```
+refs/callers/defs : query = {engine, kind, symbol}
+imports <module>  : query = {kind, mode}          # no symbol/module, no engine
+inputs            : query = {kind}
+```
+`results` items are consistently `{label, loc}` (good), but the `query` block
+varies: `engine` appears only for ty verbs, and the queried target is echoed as
+`symbol` for refs/callers/defs yet omitted entirely for `imports <module>`. An
+agent keying off `query.symbol` / `query.engine` can't rely on either. Echo the
+queried target uniformly (e.g. `target`) and include `engine` everywhere.
+
 ---
 
 ## P2 — `defs` means different things in each engine (contract violation)
@@ -55,32 +74,6 @@ attribute-style queries loudly instead of answering 0.
 Note the *good* side: ty's 62 vs grep's 469 is correct precision — ty resolves
 which `save` (the in-repo model overrides) and doesn't conflate unrelated
 `.save()` on other types. That disambiguation is the real value; don't lose it.
-
-## P2 — `imports --cycles` false-positives on TYPE_CHECKING / deferred imports
-The cycle detector counts `if TYPE_CHECKING:` imports (never execute at runtime)
-and function-local/deferred imports (lazy, by design) as load-time cycle edges.
-Reported cycle:
-
-```
-sara/utils.py:1:1  cycle: sara.utils ↔ sara.models ↔ call_log.models
-```
-
-Tracing the edges:
-- `sara/utils.py:12  from sara.models import Appointment` — under `if
-  TYPE_CHECKING:` (sara/utils.py:11). Never runs at runtime.
-- `call_log/models.py:18  from sara.models import Appointment` — function-local
-  (indented, deferred).
-
-Both are exactly the patterns devs use to *break* runtime import cycles. pyq
-flags the cycles that good code has already defused — a false positive that would
-push an agent to "fix" non-problems. An import cycle that matters is a
-*module-load-time* cycle; TYPE_CHECKING edges should be excluded outright (or
-tagged `type-only`), and deferred/local imports separated from top-level ones.
-
-Secondary: the `↔` notation implies each adjacent pair mutually imports, but
-these are *directed* edges around a cycle (and the 16-module case is really a
-strongly-connected component, not a single cycle). Use `→` and, ideally, report
-the minimal cycle / the edge to cut, since that's the actionable output.
 
 ## P2 — `imports <module>` can't distinguish "not found" from "found, no edges"
 A typo'd module and a real leaf module are indistinguishable, even in JSON:

@@ -1,4 +1,4 @@
-use pyq_index::{extract, DefKind, InputKind};
+use pyq_index::{extract, DefKind, ImportContext, InputKind};
 
 const SRC: &str = r#"
 from pkg.models import User, make_user
@@ -183,6 +183,26 @@ from ..pkg import thing
     // `from ..pkg import thing` — module `pkg`, level 2.
     let up = by_module("pkg");
     assert_eq!(up.level, 2);
+}
+
+#[test]
+fn classifies_import_context_toplevel_typechecking_deferred() {
+    let src = r#"
+from typing import TYPE_CHECKING
+import top_level
+
+if TYPE_CHECKING:
+    import only_for_types
+
+def loader():
+    import lazy_dep
+"#;
+    let idx = extract("m.py", src);
+    let ctx = |m: &str| idx.imports.iter().find(|i| i.module == m).unwrap().context;
+
+    assert_eq!(ctx("top_level"), ImportContext::TopLevel);
+    assert_eq!(ctx("only_for_types"), ImportContext::TypeChecking);
+    assert_eq!(ctx("lazy_dep"), ImportContext::Deferred);
 }
 
 #[test]

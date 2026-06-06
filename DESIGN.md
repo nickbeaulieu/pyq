@@ -27,11 +27,13 @@ If yes, don't rebuild it — unless we can do it **deeper** (see below).
    to `<dynamic>` rather than guess. Over-approximate by design. Pure AST walk on
    the syntactic path (no db). "What does this need to run."
 3. **Import / dependency graph as data** (`imports`, shipped) — forward deps,
-   reverse deps (who imports X, the blast-radius question), and cycles (the
-   non-trivial SCCs over internal edges). Syntactic today: files map to dotted
-   modules, relative imports resolve against the importer's package, and
-   `from pkg import sub` becomes a precise `pkg.sub` edge when that submodule
-   exists. Will ride the resolved graph from #1 for accuracy later.
+   reverse deps (who imports X, the blast-radius question), and cycles. Syntactic
+   today: files map to dotted modules, relative imports resolve against the
+   importer's package, and `from pkg import sub` becomes a precise `pkg.sub` edge
+   when that submodule exists. Cycles are the non-trivial SCCs over *import-time*
+   edges only — `TYPE_CHECKING`-guarded and deferred/function-local imports (the
+   patterns that *break* runtime cycles) are excluded — and each is reported as
+   an ordered `a → b → … → a` path. Will ride the resolved graph from #1 later.
 
 ## Worth building *deeper* than the existing tools (the exception to the filter)
 These exist elsewhere but a pyq-native version is better because it rides the

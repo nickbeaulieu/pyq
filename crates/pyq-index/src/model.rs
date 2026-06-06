@@ -67,6 +67,19 @@ pub enum InputKind {
     Setting,
 }
 
+/// When an import executes — distinguishes the module-load-time edges that form
+/// real import cycles from the ones good code uses to *break* them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ImportContext {
+    /// Module scope, not under a `TYPE_CHECKING` guard — runs at import time.
+    TopLevel,
+    /// Under `if TYPE_CHECKING:` — never executes at runtime (type-only).
+    TypeChecking,
+    /// Inside a function body — lazy, runs only when that function is called.
+    Deferred,
+}
+
 /// An import statement's module target — an edge in the dependency graph.
 /// Captures the written module and relative-import depth; name binding is
 /// already recorded separately as an [`Import`](DefKind::Import) def.
@@ -80,6 +93,9 @@ pub struct ImportStmt {
     /// The imported names, used only to resolve `from <pkg> import <name>` into
     /// submodule edges; empty for plain `import x`.
     pub names: Vec<String>,
+    /// When this import runs — only [`TopLevel`](ImportContext::TopLevel) edges
+    /// count toward import cycles.
+    pub context: ImportContext,
     pub pos: Pos,
 }
 

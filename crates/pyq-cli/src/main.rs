@@ -224,9 +224,12 @@ fn query_imports(
                 .file_of(&cycle[0])
                 .map(|f| format!("{f}:1:1"))
                 .unwrap_or_else(|| cycle[0].clone());
+            // Ordered, closed path (a → b → … → a) so the edge to cut is visible.
+            let mut path = cycle.clone();
+            path.push(cycle[0].clone());
             results.push(json!({
                 "loc": loc,
-                "label": format!("cycle: {}", cycle.join(" ↔ ")),
+                "label": format!("cycle: {}", path.join(" → ")),
             }));
         }
         let summary = format!("{} import {}", results.len(), plural(results.len(), "cycle"));

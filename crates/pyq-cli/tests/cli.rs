@@ -179,6 +179,23 @@ fn cycles_detects_the_mutual_import() {
     assert!(label.starts_with("cycle:"));
     assert!(label.contains("pkg.a"));
     assert!(label.contains("pkg.b"));
+    // Directed, closed path notation (not the misleading ↔).
+    assert!(label.contains('→'), "cycle should use directed arrows: {label}");
+    assert!(!label.contains('↔'));
+}
+
+// Regression: imports under `if TYPE_CHECKING:` and inside function bodies are
+// not import-time edges, so a mutual import defused that way is NOT a cycle —
+// exactly the patterns devs use to break runtime cycles.
+#[test]
+fn type_checking_and_deferred_imports_are_not_cycles() {
+    let (env, ok) = run_json_in(&fixture("typed_cycle"), &["imports", "--cycles"]);
+    assert!(ok);
+    assert_eq!(
+        env["count"].as_u64().unwrap(),
+        0,
+        "guarded/deferred imports must not count as a cycle: {env}"
+    );
 }
 
 #[test]
