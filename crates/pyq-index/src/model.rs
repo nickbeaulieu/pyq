@@ -34,6 +34,10 @@ pub struct Def {
     /// semantic engine resolves from (so even a function-local, invisible to
     /// name-level symbol tables, can be resolved exactly).
     pub offset: u32,
+    /// Dotted names of the enclosing scopes (classes/functions), outermost
+    /// first — `Alpha` for `Alpha.process`, empty at module scope. Lets a
+    /// qualified query (`Alpha.process`) scope to the right def.
+    pub container: Vec<String>,
     /// `true` for a binding nested inside a function/class (not module scope).
     pub nested: bool,
 }

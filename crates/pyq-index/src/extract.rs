@@ -33,6 +33,7 @@ pub fn extract(path: &str, source: &str) -> FileIndex {
         depth: 0,
         func_depth: 0,
         type_checking: false,
+        scope: Vec::new(),
         defs: Vec::new(),
         refs: Vec::new(),
         inputs: Vec::new(),
@@ -59,6 +60,8 @@ struct Collector<'src> {
     func_depth: usize,
     /// Inside an `if TYPE_CHECKING:` block — its imports are type-only.
     type_checking: bool,
+    /// Enclosing class/function names, outermost first — a def's `container`.
+    scope: Vec<String>,
     defs: Vec<Def>,
     refs: Vec<Ref>,
     inputs: Vec<Input>,
@@ -161,6 +164,7 @@ impl<'src> Collector<'src> {
             kind,
             pos: self.pos(offset),
             offset: offset.to_u32(),
+            container: self.scope.clone(),
             nested: self.depth > 0,
         });
     }
@@ -173,7 +177,9 @@ impl<'src, 'ast> Visitor<'ast> for Collector<'src> {
                 self.push_def(f.name.as_str(), DefKind::Function, f.name.start());
                 self.depth += 1;
                 self.func_depth += 1;
+                self.scope.push(f.name.to_string());
                 walk_stmt(self, stmt);
+                self.scope.pop();
                 self.func_depth -= 1;
                 self.depth -= 1;
                 return;
@@ -200,6 +206,7 @@ impl<'src, 'ast> Visitor<'ast> for Collector<'src> {
                 return;
             }
             Stmt::ClassDef(c) => {
+                let class_name = c.name.to_string();
                 self.push_def(c.name.as_str(), DefKind::Class, c.name.start());
                 // A pydantic BaseSettings subclass: its annotated class-level
                 // fields are configuration inputs.
@@ -217,7 +224,9 @@ impl<'src, 'ast> Visitor<'ast> for Collector<'src> {
                     }
                 }
                 self.depth += 1;
+                self.scope.push(class_name);
                 walk_stmt(self, stmt);
+                self.scope.pop();
                 self.depth -= 1;
                 return;
             }

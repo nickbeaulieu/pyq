@@ -41,9 +41,37 @@ struct Anchor {
     is_def: bool,
 }
 
-/// The bare identifier of a possibly-qualified symbol: `pkg.mod.User` → `User`.
-fn leaf(symbol: &str) -> &str {
-    symbol.rsplit('.').next().unwrap_or(symbol)
+/// Split a possibly-qualified symbol into its leaf and the qualifier before it:
+/// `Alpha.process` → (`process`, `["Alpha"]`); `process` → (`process`, `[]`).
+fn parse_query(symbol: &str) -> (&str, Vec<&str>) {
+    let mut parts: Vec<&str> = symbol.split('.').filter(|s| !s.is_empty()).collect();
+    let leaf = parts.pop().unwrap_or(symbol);
+    (leaf, parts)
+}
+
+/// Module path components of a file: `pkg/models.py` → `["pkg", "models"]`.
+fn module_components(path: &str) -> Vec<&str> {
+    let stem = path
+        .strip_suffix(".pyi")
+        .or_else(|| path.strip_suffix(".py"))
+        .unwrap_or(path);
+    stem.split(['/', '\\'])
+        .filter(|p| !p.is_empty() && *p != "__init__")
+        .collect()
+}
+
+/// Whether a def in `file`/`container` is scoped by `qualifier` — the qualifier
+/// must be a suffix of the def's scope path (module components + enclosing
+/// class/function names). `Alpha.process` matches `process` inside class
+/// `Alpha`; `models.Call` matches a top-level `Call` in `…/models.py`. An empty
+/// qualifier matches any def of that leaf.
+fn scoped_by(qualifier: &[&str], file: &str, container: &[String]) -> bool {
+    if qualifier.is_empty() {
+        return true;
+    }
+    let mut scope: Vec<&str> = module_components(file);
+    scope.extend(container.iter().map(String::as_str));
+    scope.len() >= qualifier.len() && scope[scope.len() - qualifier.len()..] == *qualifier
 }
 
 impl UnifiedResolver {
@@ -61,13 +89,14 @@ impl UnifiedResolver {
     /// Only canonical definitions are `is_def`: an import binding re-binds the
     /// name but isn't a distinct definition, so it must not inflate the "is this
     /// name ambiguous?" count or be mistaken for what a use resolves to.
-    fn occurrences(&self, name: &str) -> Vec<Anchor> {
-        let name = leaf(name);
+    fn occurrences(&self, symbol: &str) -> Vec<Anchor> {
+        let (leaf, qualifier) = parse_query(symbol);
+        let qualified = !qualifier.is_empty();
         let mut defs = Vec::new();
         let mut uses = Vec::new();
         for f in &self.files {
             for d in &f.defs {
-                if d.name == name {
+                if d.name == leaf && scoped_by(&qualifier, &f.path, &d.container) {
                     let is_def = !matches!(d.kind, DefKind::Import);
                     let anchor = Anchor {
                         path: f.path.clone(),
@@ -82,14 +111,19 @@ impl UnifiedResolver {
                     }
                 }
             }
-            for r in &f.refs {
-                if r.name == name {
-                    uses.push(Anchor {
-                        path: f.path.clone(),
-                        offset: r.offset,
-                        key: format!("{}:{}:{}", f.path, r.pos.line, r.pos.col),
-                        is_def: false,
-                    });
+            // A bare query falls back to use-anchors (params/locals with no
+            // captured def). A qualified query names a specific def, so anchor
+            // only on the matching def(s) — never on every same-leaf use.
+            if !qualified {
+                for r in &f.refs {
+                    if r.name == leaf {
+                        uses.push(Anchor {
+                            path: f.path.clone(),
+                            offset: r.offset,
+                            key: format!("{}:{}:{}", f.path, r.pos.line, r.pos.col),
+                            is_def: false,
+                        });
+                    }
                 }
             }
         }
@@ -146,11 +180,11 @@ impl Resolver for UnifiedResolver {
     }
 
     fn definitions(&self, symbol: &str) -> Result<Vec<Loc>> {
-        let name = leaf(symbol);
+        let (name, qualifier) = parse_query(symbol);
         let mut defs: Vec<Loc> = Vec::new();
         for f in &self.files {
             for d in &f.defs {
-                if d.name != name {
+                if d.name != name || !scoped_by(&qualifier, &f.path, &d.container) {
                     continue;
                 }
                 let (kind, role) = match d.kind {

@@ -146,18 +146,24 @@ fn defs_finds_function_and_import_binding() {
     assert!(labels.iter().any(|l| l == "import"));
 }
 
-// Regression: an agent reaching for a qualified path (pkg.models.User) should
-// resolve by the last component instead of returning a misleading 0.
+// A qualified path scopes to the def in that module/scope — `pkg.models.User`
+// is the class in pkg/models.py, NOT app.py's `import` binding of the same name.
+// (A suffix of the scope path matches, so `models.User` works too.)
 #[test]
-fn dotted_symbol_resolves_by_last_component() {
+fn qualified_symbol_scopes_to_the_named_def() {
     let (dotted, ok) = run_json(&["defs", "pkg.models.User"]);
     assert!(ok);
-    let (bare, ok) = run_json(&["defs", "User"]);
-    assert!(ok);
-    assert_eq!(dotted["count"], bare["count"]);
-    assert!(dotted["count"].as_u64().unwrap() >= 1);
+    let locs = locs(&dotted);
+    assert_eq!(dotted["count"].as_u64().unwrap(), 1, "{dotted}");
+    assert!(locs[0].starts_with("pkg/models.py"));
     // The original qualified input is echoed back in the summary.
     assert!(dotted["summary"].as_str().unwrap().contains("pkg.models.User"));
+
+    // A suffix qualifier resolves the same def; a bogus one resolves nothing.
+    let (suffix, _) = run_json(&["defs", "models.User"]);
+    assert_eq!(suffix["count"].as_u64().unwrap(), 1);
+    let (bogus, _) = run_json(&["defs", "Nope.User"]);
+    assert_eq!(bogus["count"].as_u64().unwrap(), 0);
 }
 
 // Regression: on a source-rooted layout (pyproject `pythonpath = ["src"]`, so
@@ -270,6 +276,29 @@ fn callers_disambiguate_same_named_defs_via_resolves_to() {
     assert_eq!(targets.len(), 2, "each call should resolve to its own def: {env}");
     // And both point at a real `process` definition in the file.
     assert!(targets.iter().all(|t| t.starts_with("m.py:")));
+}
+
+// Qualified targeting: `Alpha.process` scopes to that class's method, so its
+// callers are only Alpha's call sites — not Beta's. Bare `process` still unions
+// both (each tagged by resolves_to).
+#[test]
+fn qualified_callers_scope_to_one_def() {
+    let root = fixture("same_name");
+    let (alpha, ok) = run_json_in(&root, &["callers", "Alpha.process"]);
+    assert!(ok);
+    assert_eq!(alpha["count"].as_u64().unwrap(), 1, "{alpha}");
+
+    let (beta, ok) = run_json_in(&root, &["callers", "Beta.process"]);
+    assert!(ok);
+    assert_eq!(beta["count"].as_u64().unwrap(), 1, "{beta}");
+
+    // The two qualified queries resolve to disjoint call sites.
+    assert_ne!(locs(&alpha)[0], locs(&beta)[0]);
+
+    // Bare query still unions both methods' callers.
+    let (bare, ok) = run_json_in(&root, &["callers", "process"]);
+    assert!(ok);
+    assert_eq!(bare["count"].as_u64().unwrap(), 2);
 }
 
 #[test]

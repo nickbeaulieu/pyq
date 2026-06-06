@@ -68,8 +68,12 @@ and any use of an ambiguous (same-named) symbol, points at its canonical def via
 `resolves_to`. `inputs`/`imports` are pure syntactic facts, over-approximate by
 design: computed env keys or paths bucket to `<dynamic>` rather than guess.
 
-A qualified query (`pkg.mod.User`) resolves by its leaf today (every `User`, each
-tagged with its def); scoping the qualifier to one def is a planned addition.
+A qualified query scopes to the named def: `Alpha.process` is that class's method
+(its callers exclude `Beta.process`'s), and `pkg.models.User` is the class in
+`pkg/models.py`, not another module's `User`. The qualifier matches as a suffix
+of the def's scope path (module components + enclosing classes/functions), so
+`models.User` works too. A bare name (`process`) still unions all defs, each
+tagged with `resolves_to` so you can filter.
 
 ## Output envelope
 
