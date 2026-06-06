@@ -294,6 +294,9 @@ class C:
     def m(self):
         return os.environ["K"]
 
+def query(uid):
+    return User.objects.filter(id=uid).first()
+
 CACHE = {}
 def remember(v):
     global CACHE
@@ -318,6 +321,8 @@ fn classifies_effects_by_category_and_owner_scope() {
     assert_eq!(kind("open").kind, EffectKind::Fs);
     assert_eq!(kind("random.random").kind, EffectKind::Random);
     assert_eq!(kind("time.time").kind, EffectKind::Clock);
+    // Django ORM manager access classifies as a DB effect.
+    assert_eq!(kind("User.objects.filter").kind, EffectKind::Db);
 
     // Inside a function — not import-time — and owned by the enclosing scope.
     let net = kind("requests.get");
@@ -388,4 +393,25 @@ fn captures_string_target_patch_calls_only() {
     // … and `patch.object`/`patch.dict` are NOT (their target isn't a dotted string).
     assert!(!targets.contains(&Some("os.environ")), "patch.dict must be excluded: {targets:?}");
     assert_eq!(idx.mocks.len(), 3, "exactly the three patch(...) calls: {targets:?}");
+}
+
+#[test]
+fn captures_class_base_classes() {
+    let src = r#"
+class Plain:
+    pass
+
+class Sub(Base, mixins.Loggable):
+    pass
+
+class JustObject(object):
+    pass
+"#;
+    let idx = extract("m.py", src);
+    let class = |name: &str| idx.defs.iter().find(|d| d.name == name && d.kind == DefKind::Class).unwrap();
+
+    assert!(class("Plain").bases.is_empty(), "no bases");
+    assert_eq!(class("Sub").bases, vec!["Base".to_string(), "mixins.Loggable".to_string()]);
+    // `object` is recorded verbatim; the mock-target resolver treats it as no base.
+    assert_eq!(class("JustObject").bases, vec!["object".to_string()]);
 }

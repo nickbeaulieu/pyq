@@ -640,6 +640,15 @@ fn mock_targets_flags_drifted_and_keeps_valid() {
     // An attribute on an imported (non-project-class) object is unverifiable,
     // never a false "drifted".
     assert_eq!(status.get("myapp.client.requests.get"), Some(&"unverifiable"));
+
+    // Precision regressions (false positives found on a real Django repo):
+    // a builtin patched through the module namespace (`patch("m.open")`) is
+    // valid even though `open` is neither defined nor imported there …
+    assert_eq!(status.get("myapp.client.open"), Some(&"valid"));
+    // … and a missing member on a class that extends a base may be inherited
+    // or framework-injected (Django's `objects`/`_save_table`), so it's
+    // unverifiable, not a false drift.
+    assert_eq!(status.get("myapp.client.Account.injected"), Some(&"unverifiable"));
 }
 
 // The drifted targets are elevated to warnings (the actionable signal), and the

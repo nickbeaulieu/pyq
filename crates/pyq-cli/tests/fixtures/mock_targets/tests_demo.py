@@ -24,3 +24,10 @@ def test_c():
     target = "myapp.client." + "helper"
     with patch(target):
         ...
+
+
+def test_d():
+    with patch("myapp.client.open"):              # builtin via module namespace
+        ...
+    with patch("myapp.client.Account.injected"):  # subclass: may be inherited
+        ...

@@ -161,11 +161,15 @@ tests_demo.py:22:10  dynamic <dynamic>
 ```
 
 Precision over recall: a target is `drifted` only when its prefix is a *project*
-module and the looked-up name is provably absent. Targets into third-party /
-stdlib modules (`external`) and computed, non-literal targets (`dynamic`) are
-reported but never flagged broken, and an attribute on a non-class binding is
-`unverifiable` — so a flagged drift is a real one. (`patch.object` /
-`patch.dict`, whose target isn't a dotted string, are out of scope.)
+module and the looked-up name is provably absent. Everything that can't be
+proven absent is reported but never flagged broken — targets into third-party /
+stdlib modules (`external`), computed non-literal targets (`dynamic`), an
+attribute on a non-class binding (`unverifiable`), a builtin reached through the
+module namespace (`patch("mod.open")` → `valid`), and a missing member on a
+class that extends a base, which may be inherited or framework-injected
+(Django's `objects` manager, `Model._save_table` → `unverifiable`). So a flagged
+drift is a real one. (`patch.object` / `patch.dict`, whose target isn't a dotted
+string, are out of scope.)
 
 ## Output envelope
 

@@ -40,6 +40,11 @@ pub struct Def {
     pub container: Vec<String>,
     /// `true` for a binding nested inside a function/class (not module scope).
     pub nested: bool,
+    /// For a [`Class`](DefKind::Class), the dotted names of its base classes
+    /// (`["AbstractUser"]`, `["models.Model"]`); empty for non-classes and for a
+    /// class with no bases. Lets a consumer know a class may inherit members it
+    /// can't see (so a missing attribute isn't necessarily absent).
+    pub bases: Vec<String>,
 }
 
 /// A use of a name in this file.

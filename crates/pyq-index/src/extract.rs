@@ -232,6 +232,7 @@ impl<'src> Collector<'src> {
             offset: offset.to_u32(),
             container: self.scope.clone(),
             nested: self.depth > 0,
+            bases: Vec::new(),
         });
     }
 }
@@ -274,6 +275,13 @@ impl<'src, 'ast> Visitor<'ast> for Collector<'src> {
             Stmt::ClassDef(c) => {
                 let class_name = c.name.to_string();
                 self.push_def(c.name.as_str(), DefKind::Class, c.name.start());
+                // Record the base classes on the class def: a subclass may
+                // inherit members we can't see (`User._save_table` from Django's
+                // `Model`), so a missing attribute on a class with bases is not
+                // provably absent.
+                if let Some(last) = self.defs.last_mut() {
+                    last.bases = class_bases(c).collect();
+                }
                 // A pydantic BaseSettings subclass: its annotated class-level
                 // fields are configuration inputs.
                 if class_bases(c).any(|b| b.ends_with("BaseSettings")) {
@@ -433,8 +441,13 @@ fn classify_effect(callee: &str) -> Option<EffectKind> {
     {
         return Some(EffectKind::Fs);
     }
-    // Database (over-approximate — generic execute/cursor names).
+    // Database (over-approximate — generic execute/cursor names). `.objects.` is
+    // the Django manager fingerprint (`User.objects.filter/get/create/...`); it
+    // anchors on the manager so it dodges the false positives a bare `.filter`
+    // would draw. Variable-bound querysets and custom (non-`objects`) managers
+    // still slip through — covered by the static over-approximation caveat.
     if any(&[".execute", ".executemany", ".executescript", ".fetchone", ".fetchall"])
+        || contains(".objects.")
         || ends("sqlite3.connect")
         || ends("psycopg2.connect")
         || ends("pymysql.connect")

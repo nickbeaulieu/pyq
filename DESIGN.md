@@ -53,8 +53,11 @@ If yes, don't rebuild it — unless we can do it **deeper** (see below).
    looked up*, not where it's defined, so the index recording import bindings as
    defs is exactly what makes this resolvable. High-precision by construction —
    `drifted` only when the prefix is a project module and the name is provably
-   absent; third-party (`external`), computed (`dynamic`), and
-   non-class-attribute (`unverifiable`) targets are reported but never flagged.
+   absent; third-party (`external`), computed (`dynamic`), non-class-attribute,
+   builtins reached via the module namespace, and missing members on a class
+   that extends a base (possibly inherited / framework-injected) are reported
+   but never flagged. The last two were false positives found running it against
+   a real Django repo — the index records class bases so they can be suppressed.
 
 ## Worth building *deeper* than the existing tools (the exception to the filter)
 These exist elsewhere but a pyq-native version is better because it rides the

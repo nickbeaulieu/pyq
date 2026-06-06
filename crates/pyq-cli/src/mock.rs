@@ -50,6 +50,16 @@ impl Status {
     }
 }
 
+/// Common builtins reachable as a module attribute. `patch("mod.input")`
+/// resolves through the module namespace even though `input` is never defined or
+/// imported there, so these must not read as drifted. (Patching a builtin is a
+/// standard idiom — `input`, `open`, `print`.)
+const BUILTINS: &[&str] = &[
+    "input", "open", "print", "len", "range", "exit", "quit", "vars", "eval",
+    "exec", "compile", "id", "hash", "repr", "format", "isinstance", "getattr",
+    "setattr", "hasattr", "delattr", "next", "iter", "super", "type", "object",
+];
+
 /// The project's module + symbol structure, indexed for patch-target resolution.
 pub struct PatchResolver {
     modules: HashSet<String>,
@@ -59,6 +69,10 @@ pub struct PatchResolver {
     module_classes: HashMap<String, HashSet<String>>,
     /// (module id, class name) → that class's direct member names.
     class_members: HashMap<(String, String), HashSet<String>>,
+    /// (module id, class name) of classes that extend a base (beyond `object`).
+    /// A missing attribute on such a class may be inherited or framework-injected
+    /// (Django's `objects` manager, `Model._save_table`), so it isn't drift.
+    subclasses: HashSet<(String, String)>,
 }
 
 impl PatchResolver {
@@ -67,6 +81,7 @@ impl PatchResolver {
         let mut module_names: HashMap<String, HashSet<String>> = HashMap::new();
         let mut module_classes: HashMap<String, HashSet<String>> = HashMap::new();
         let mut class_members: HashMap<(String, String), HashSet<String>> = HashMap::new();
+        let mut subclasses = HashSet::new();
 
         for f in files {
             let module = scope_fqn(&f.path, &[]);
@@ -82,6 +97,11 @@ impl PatchResolver {
                                 .entry(module.clone())
                                 .or_default()
                                 .insert(d.name.clone());
+                            // A base other than `object` means inherited /
+                            // framework-injected members are possible.
+                            if d.bases.iter().any(|b| b != "object") {
+                                subclasses.insert((module.clone(), d.name.clone()));
+                            }
                         }
                     }
                     // Direct member of a top-level container (class method/attr,
@@ -101,6 +121,7 @@ impl PatchResolver {
             module_names,
             module_classes,
             class_members,
+            subclasses,
         }
     }
 
@@ -134,6 +155,11 @@ impl PatchResolver {
             .get(module)
             .is_some_and(|n| n.contains(*first));
         if !bound {
+            // A builtin reachable through the module namespace (`patch("m.input")`)
+            // is valid even though it's neither defined nor imported there.
+            if BUILTINS.contains(first) {
+                return Status::Valid;
+            }
             return Status::Drifted(format!("`{first}` is not bound in module `{module}`"));
         }
         if chain.len() == 1 {
@@ -157,6 +183,14 @@ impl PatchResolver {
             .get(&(module.to_string(), first.to_string()))
             .is_some_and(|m| m.contains(member));
         if !known {
+            // If the class extends a base we can't see into, the member may be
+            // inherited or framework-injected (Django `objects`, `_save_table`),
+            // so it isn't provably absent — don't flag it as drift.
+            if self.subclasses.contains(&(module.to_string(), first.to_string())) {
+                return Status::Unverifiable(format!(
+                    "`{member}` not declared on `{module}.{first}`, but it extends a base — may be inherited"
+                ));
+            }
             return Status::Drifted(format!(
                 "`{member}` is not a member of `{module}.{first}`"
             ));
