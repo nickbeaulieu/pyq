@@ -74,8 +74,9 @@ fn main() -> ExitCode {
 }
 
 fn dispatch(cli: &Cli) -> anyhow::Result<Envelope> {
-    // `callers` and `--syntactic` use the single-file extractor; everything else
-    // routes through ty's cross-file engine behind the Resolver trait.
+    // `inputs` and any verb under `--syntactic` use the single-file extractor;
+    // `refs`/`callers`/`defs` otherwise route through ty's cross-file engine
+    // behind the Resolver trait.
     match &cli.command {
         Command::Inputs => {
             let files = walk::index_tree(&cli.root)?;
