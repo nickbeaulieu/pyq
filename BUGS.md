@@ -39,31 +39,7 @@ targets canonicalize to the file-derived module id, so `main.models` and
 ---
 
 
-## P2 — `callers`/`refs` union over same-named defs with no way to target one
-Two unrelated classes each defining `process`:
-
-```python
-class Alpha:
-    def process(self): ...
-class Beta:
-    def process(self): ...
-a.process(); b.process()
-```
-```
-defs    process  → 2   (Alpha.process, Beta.process)
-callers process  → 2   (a.process(), b.process())  — merged, both labeled scope `m`
-```
-
-A bare-name query collapses all defs of that name: `callers process` returns
-Alpha's *and* Beta's call sites with no indication of which `process` each site
-resolves to. For the core refactor use case ("who calls `Alpha.process` so I can
-rename it") this conflates unrelated methods — an agent would wrongly think
-`b.process()` also needs updating. ty's `call_hierarchy` is anchored per-def and
-*knows* which target each call resolves to; pyq unions the results and discards
-that. Two fixes, ideally both: (a) label each caller/ref with the def it resolves
-to (`→ Alpha.process`), and (b) allow targeting a single def (qualified name
-`Alpha.process`, or a `path:line` anchor) — note dotted names currently return 0
-(see P3), so there's *no* precise-targeting path today.
+## Design preferences (agent POV)
 What I'd want as the actual consumer. Principle: **pyq output is treated as
 ground truth, so every divergence from reality costs more than slowness would.**
 Optimize for "an agent can act on this without double-checking."

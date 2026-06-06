@@ -259,6 +259,28 @@ fn refs_includes_aliased_call_sites_that_callers_finds() {
     assert!(ref_locs.iter().any(|l| l.starts_with("app.py:6:")));
 }
 
+// Regression: when a bare name has several defs (two classes' `process`), a
+// caller query must say which def each site resolves to instead of unioning
+// them indistinguishably — otherwise "who calls Alpha.process" wrongly includes
+// Beta's callers. Each result carries `resolves_to` the specific def, giving
+// per-def targeting by filter.
+#[test]
+fn callers_disambiguate_same_named_defs_via_resolves_to() {
+    let (env, ok) = run_json_in(&fixture("same_name"), &["callers", "process"]);
+    assert!(ok);
+    let results = env["results"].as_array().unwrap();
+    assert_eq!(results.len(), 2);
+
+    let targets: std::collections::HashSet<_> = results
+        .iter()
+        .map(|r| r["resolves_to"].as_str().expect("each call tagged with its def"))
+        .collect();
+    // The two call sites resolve to two *different* defs (Alpha vs Beta).
+    assert_eq!(targets.len(), 2, "each call should resolve to its own def: {env}");
+    // And both point at a real `process` definition in the file.
+    assert!(targets.iter().all(|t| t.starts_with("m.py:")));
+}
+
 #[test]
 fn callers_via_ty_finds_the_call_site() {
     let (env, ok) = run_json(&["callers", "make_user"]);

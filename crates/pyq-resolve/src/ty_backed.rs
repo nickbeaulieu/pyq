@@ -72,6 +72,16 @@ impl TyResolver {
         })
     }
 
+    /// The `file:line:col` of a def, used to tag the uses that resolve to it —
+    /// but only when the name is `ambiguous` (multiple defs), so single-def
+    /// queries stay uncluttered.
+    fn owner_key(&self, ambiguous: bool, file: File, offset: TextSize) -> Option<String> {
+        if !ambiguous {
+            return None;
+        }
+        self.loc(file, offset, "def", "definition").map(|l| l.key())
+    }
+
     /// The file's path relative to the canonical root, or `None` if it is not
     /// in scope. A non-system path (typeshed/vendored stdlib stub) is never in
     /// scope. When `scope` is empty, filtering is disabled.
@@ -91,15 +101,22 @@ impl TyResolver {
 
 impl Resolver for TyResolver {
     fn references(&self, symbol: &str) -> Result<Vec<Loc>> {
+        let defs = self.exact_symbols(symbol);
+        // When a bare name has several defs (two classes' `process`), ty
+        // resolves each use to a *specific* one — so attribute every result to
+        // the def it resolves to, instead of unioning them indistinguishably.
+        let ambiguous = defs.len() > 1;
         let mut out = Vec::new();
-        for (file, offset) in self.exact_symbols(symbol) {
+        for (file, offset) in defs {
+            let owner = self.owner_key(ambiguous, file, offset);
             let Some(targets) = find_references(&self.db, file, offset, true) else {
                 continue;
             };
             for t in targets {
-                if let Some(loc) =
+                if let Some(mut loc) =
                     self.loc(t.file(), t.range().start(), reference_kind(t.kind()), "reference")
                 {
+                    loc.resolves_to = owner.clone();
                     out.push(loc);
                 }
             }
@@ -109,12 +126,16 @@ impl Resolver for TyResolver {
     }
 
     fn callers(&self, symbol: &str) -> Result<Vec<Loc>> {
+        let defs = self.exact_symbols(symbol);
+        let ambiguous = defs.len() > 1;
         let mut out = Vec::new();
-        for (file, offset) in self.exact_symbols(symbol) {
+        for (file, offset) in defs {
+            let owner = self.owner_key(ambiguous, file, offset);
             for call in incoming_calls(&self.db, file, offset) {
                 let caller = call.from.name.as_str().to_string();
                 for range in call.from_ranges {
-                    if let Some(loc) = self.loc(call.from.file, range.start(), &caller, "call") {
+                    if let Some(mut loc) = self.loc(call.from.file, range.start(), &caller, "call") {
+                        loc.resolves_to = owner.clone();
                         out.push(loc);
                     }
                 }
