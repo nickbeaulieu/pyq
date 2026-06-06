@@ -45,6 +45,12 @@ impl Graph {
             for stmt in &f.imports {
                 let (primary, submodules) = resolve_targets(&importer, pkg, stmt);
                 for target in primary {
+                    // The literal import string (`main.models`) may differ from
+                    // the file-derived module id (`alice.main.models`) when the
+                    // project is rooted below the repo (Django/src/pythonpath).
+                    // Canonicalize to the file-derived id so forward and reverse
+                    // deps key on the *same* identity and actually compose.
+                    let target = canonicalize_target(&target, &module_file);
                     let internal = is_internal(&target, &modules);
                     edges.push(Edge {
                         importer: importer.clone(),
@@ -77,6 +83,13 @@ impl Graph {
 
     pub fn file_of(&self, module: &str) -> Option<&str> {
         self.module_file.get(module).map(String::as_str)
+    }
+
+    /// Map a queried module name (any accepted spelling) to its canonical
+    /// file-derived identity — so `imports main.models` and the printed
+    /// `alice.main.models` resolve to the same node.
+    pub fn resolve_module(&self, name: &str) -> String {
+        canonicalize_target(name, &self.module_file)
     }
 
     /// Whether `module` exists in the graph at all — a project module file, or a
@@ -165,6 +178,22 @@ fn extract_cycle<'a>(
         }
     }
     None
+}
+
+/// Map an import target to the canonical file-derived module id: the exact
+/// match if one exists, else the *unique* project module whose name ends with
+/// `.<target>` (the source-root case, where code imports `main.models` but the
+/// file is `alice/main/models.py`). Ambiguous or unmatched → unchanged.
+fn canonicalize_target(target: &str, module_file: &BTreeMap<String, String>) -> String {
+    if module_file.contains_key(target) {
+        return target.to_string();
+    }
+    let suffix = format!(".{target}");
+    let mut matches = module_file.keys().filter(|m| m.ends_with(suffix.as_str()));
+    match (matches.next(), matches.next()) {
+        (Some(only), None) => only.clone(),
+        _ => target.to_string(),
+    }
 }
 
 /// A target is internal if it names a project module exactly, or is a package

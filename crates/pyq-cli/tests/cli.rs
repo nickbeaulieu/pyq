@@ -307,6 +307,27 @@ fn imports_reverse_distinguishes_typo_from_real_leaf() {
     assert!(typo["summary"].as_str().unwrap().contains("not found"));
 }
 
+// Regression: on a source-rooted layout (code imports app-relative `from
+// main.models import X` while the file is alice/main/models.py), forward and
+// reverse deps must key on ONE identity. Both the literal import spelling and
+// the file-derived id must resolve to the same node — otherwise blast radius
+// reads near-zero ("safe to change") when it isn't.
+#[test]
+fn imports_compose_across_source_root_spellings() {
+    let root = fixture("src_root");
+    let (literal, ok) = run_json_in(&root, &["imports", "main.models", "--reverse"]);
+    assert!(ok);
+    let (derived, ok) = run_json_in(&root, &["imports", "alice.main.models", "--reverse"]);
+    assert!(ok);
+
+    // Both spellings resolve to the same canonical module and the same importer.
+    assert_eq!(literal["query"]["target"], "alice.main.models");
+    assert_eq!(derived["query"]["target"], "alice.main.models");
+    assert_eq!(literal["count"], derived["count"]);
+    assert_eq!(literal["count"].as_u64().unwrap(), 1);
+    assert!(locs(&literal).iter().any(|l| l.starts_with("alice/other/views.py")));
+}
+
 #[test]
 fn sample_has_no_cycles() {
     let (env, ok) = run_json(&["imports", "--cycles"]);

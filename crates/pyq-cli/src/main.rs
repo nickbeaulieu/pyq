@@ -240,7 +240,7 @@ fn query_imports(
     let mut found: Option<bool> = None;
     let (mode, summary): (&str, String) = match module {
         Some(arg) => {
-            let m = graph::normalize_query(arg);
+            let m = g.resolve_module(&graph::normalize_query(arg));
             let known = g.knows(&m);
             found = Some(known);
             target = Some(m.clone());

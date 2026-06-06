@@ -32,38 +32,9 @@ true resolution), and `settings` vs `helpers.validators` resolving inconsistentl
 in ty is still a smell. Honoring a real source root (`[tool.pytest.ini_options]
 pythonpath`, `[tool.ty] extra-paths`/`src.root`, `src`-layout auto-detect, or a
 `--src-root` flag) would let ty resolve these natively and restore precision.
-**Note the `imports` graph does NOT benefit from unified** — see the forward/
-reverse identity P1 below, which is still open.
-
----
-
-## P1 — `imports` forward vs reverse use different module identities → blast-radius wrong
-On `alice` (Django; apps import each other app-relative, e.g. `from main.models
-import X`), for the *same* module `alice/main/models.py`:
-
-```
-imports alice.main.models            → 28 modules     # forward keys on FILE-DERIVED path
-imports main.models                  → 0 modules      # the spelling the code ACTUALLY uses
-imports alice.main.models --reverse  → 1 importer      # reverse keys on LITERAL import string
-imports main.models      --reverse   → 137 importers   # the real blast radius
-```
-
-Ground truth: `alice.main.models` is written **0** times in the code;
-`main.models` appears **414** times (137 import statements). So forward-deps key
-on the module's file-path-derived name (`alice.main.models`, which nobody
-imports) while reverse-deps key on the literal import string (`main.models`).
-The two halves don't compose, and each returns ~nothing for the other's natural
-input.
-
-Worst path: an agent takes the name pyq prints in the edge list
-(`alice.main.models`) and runs `--reverse` to gauge blast radius → **1** → "safe
-to change," when 137 modules actually import it. Same root cause as the
-source-root P1: pyq derives module names relative to the repo root, but the
-project's import namespace is rooted at `alice/`. Any Django/src-root/pythonpath
-repo (i.e. most non-trivial ones) hits this. Fix: resolve both directions to one
-canonical module identity (honor the source root so file-derived names match the
-import strings), and make `imports <name>` accept whichever spelling and map it
-to that identity.
+(The related `imports`-graph forward/reverse identity mismatch is now fixed:
+targets canonicalize to the file-derived module id, so `main.models` and
+`alice.main.models` — and both directions — resolve to one node.)
 
 ---
 
