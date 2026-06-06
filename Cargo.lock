@@ -1265,6 +1265,7 @@ dependencies = [
  "pyq-output",
  "pyq-resolve",
  "serde_json",
+ "toml",
 ]
 
 [[package]]

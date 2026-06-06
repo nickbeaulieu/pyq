@@ -415,3 +415,46 @@ class JustObject(object):
     // `object` is recorded verbatim; the mock-target resolver treats it as no base.
     assert_eq!(class("JustObject").bases, vec!["object".to_string()]);
 }
+
+const ENTRYPOINTS: &str = r#"
+__all__ = ["public", "Widget"]
+
+import click
+
+@click.command()
+def cli_entry():
+    pass
+
+def public():
+    helper()
+
+def helper():
+    pass
+
+class Widget:
+    def method(self):
+        pass
+
+main()
+"#;
+
+#[test]
+fn captures_decorated_dunder_all_and_module_scope_refs() {
+    let idx = extract("m.py", ENTRYPOINTS);
+
+    // __all__ entries
+    assert_eq!(idx.dunder_all, vec!["public".to_string(), "Widget".to_string()]);
+
+    // decorated flag
+    let cli_entry = idx.defs.iter().find(|d| d.name == "cli_entry").unwrap();
+    assert!(cli_entry.decorated, "decorated function");
+    let helper = idx.defs.iter().find(|d| d.name == "helper").unwrap();
+    assert!(!helper.decorated, "plain function not decorated");
+
+    // module-scope call `main()` is flagged module_scope; `helper()` inside
+    // `public` is not.
+    let main_ref = idx.refs.iter().find(|r| r.name == "main" && r.is_call).unwrap();
+    assert!(main_ref.module_scope, "module-scope call");
+    let helper_ref = idx.refs.iter().find(|r| r.name == "helper" && r.is_call).unwrap();
+    assert!(!helper_ref.module_scope, "call inside a function is not module scope");
+}

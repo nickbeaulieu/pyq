@@ -17,9 +17,6 @@ completed work is logged at the bottom. `→ blocked by #N` marks a dependency.
   decorator extraction in `pyq-index`. (test↔code map shipped as #13a)
 
 ### P3 — deeper projections / differential
-- **#3 · `deadcode` verb — graph reachability.** Functions/classes reachable from
-  no entrypoint or test, over-approximate and flagged (dynamic dispatch, `__all__`,
-  framework hooks). (now unblocked: `CallGraph` reachability from entrypoints)
 - **#4 · `--baseline` differential in `pyq-output`.** Capture a baseline result
   set; on re-run show added/removed ("did my edit add dead code / new effects").
   The question an iterating agent actually asks.
@@ -71,14 +68,35 @@ completed work is logged at the bottom. `→ blocked by #N` marks a dependency.
 ## Completed
 
 ### Verbs & infrastructure
-- **#13a · `tests` verb — test↔code map.** Which pytest-collected tests
-  statically reach a symbol, as a projection of `CallGraph`'s reverse closure
-  filtered to test nodes (`test_*` functions in `test_*.py`/`*_test.py`, `test_*`
-  methods on `Test*` classes). Each reaching test carries the `via` tree edge and
-  `depth` from the closure. Distinguishes "exists but no test reaches it" (0
-  results) from "no such symbol" (empty roots). The foundation for static change
-  coverage. Fixture graph deferred to #13b. Over-approximate (call-graph
-  reachability) and pytest-default collection rules, both flagged.
+- **#3 · `deadcode` verb — graph reachability.** Callables reachable from no
+  entrypoint, via `CallGraph` forward reachability from a generous root set
+  (tests, dunders, decorated hooks, `__all__`, module-scope refs resolved through
+  ty, entrypoint files `manage.py`/`wsgi.py`/`urls.py`/`migrations/`/`management/
+  commands/`, framework base subclasses `BaseCommand`/`*View`/`*Serializer`/…
+  kept whole incl. methods + inner `Meta`, `[project.scripts]`). Over-approximate
+  liveness, under-reports death; residual dynamic dispatch flagged (dotted-string
+  config paths, callbacks-as-values, getattr, entry-point systems). New index
+  fields: `Def.decorated`, `Ref.module_scope`, `FileIndex.dunder_all`. *Tuned on
+  real Django repos:* first pass flagged 982 in scoring (test classes + framework
+  classes + inner `Meta` as false dead) → 261 after seeding entry-class subtrees
+  and expanding framework bases; alice 5.3%, mroi 1.6%. Verified it finds real
+  dead code (`toggle_number`) and the residual FPs are string-config (`EXCEPTION_HANDLER`).
+- **#13a · `tests` verb — test↔code map.** Which collected tests statically
+  reach a symbol, as a projection of `CallGraph`'s reverse closure filtered to
+  test nodes (`test_*` functions in `test_*.py`/`*_test.py`, `test_*` methods on
+  a collected class: `Test*`-named **or** `*TestCase`-subclassing — unittest/
+  Django/DRF, collected by inheritance). Each reaching test carries the `via`
+  tree edge and `depth`. Distinguishes "exists but no static test reaches it" (0
+  results) from "no such symbol" (empty roots). Framed as a *call-reachability
+  lens, not a coverage metric* — for "which tests to run before this edit," not
+  "what's my coverage": dynamic dispatch (attribute calls, framework routing,
+  signals/Celery) is invisible, so a 0 ≠ untested (`coverage.py` is the oracle
+  there), and aggregating into a percentage misleads. Both that and the over-
+  approximation are flagged in the warning + README. Fixture graph deferred to
+  #13b. *Found exercising it on a real Django repo:* `TestCase`-subclass test
+  classes (non-`Test*` names) were missed by a name-only rule — fixed to detect
+  `*TestCase` bases; root must be the package root or `pkg.sub` imports don't
+  link (documented).
 - **#18 · `mock-targets` verb.** Resolve every `mock.patch("a.b.c")` string
   against the project's module/symbol structure and flag *drifted* paths (the
   patch-where-looked-up gotcha — a silently-no-op patch). Built a focused

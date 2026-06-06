@@ -165,6 +165,47 @@ impl CallGraph {
         Closure { roots, nodes }
     }
 
+    /// Resolve the use at `(path, offset)` to its definition's `(path, name
+    /// offset)` anchor, following imports — `None` if it doesn't resolve to an
+    /// in-scope project def. Lets a caller seed reachability from a *use site*
+    /// (e.g. a module-scope reference to a callable) rather than a def.
+    pub fn resolve_anchor(&self, path: &str, offset: u32) -> Option<(String, u32)> {
+        self.ty.resolve_def_at(path, TextSize::from(offset))
+    }
+
+    /// Every FQN forward-reachable from any of `seeds` (each a `(path, name
+    /// offset)` anchor), the seeds themselves included. One multi-source BFS —
+    /// for whole-program reachability (dead-code) where per-root attribution and
+    /// depth aren't needed, so it returns just the reachable set and never
+    /// re-walks an overlapping subgraph.
+    pub fn reachable_from(&self, seeds: &[(String, u32)]) -> HashSet<String> {
+        let mut visited: HashSet<String> = HashSet::new();
+        let mut queue: VecDeque<(String, u32, String)> = VecDeque::new();
+        for (path, offset) in seeds {
+            let fqn = self
+                .fqn_by_anchor
+                .get(&(path.clone(), *offset))
+                .cloned()
+                .unwrap_or_else(|| scope_fqn(path, &[]));
+            if visited.insert(fqn.clone()) {
+                queue.push_back((path.clone(), *offset, fqn));
+            }
+        }
+        while let Some((path, offset, fqn)) = queue.pop_front() {
+            for nb in self.neighbours(&path, offset, &fqn, Direction::Forward) {
+                let nfqn = self
+                    .fqn_by_anchor
+                    .get(&(nb.path.clone(), nb.offset))
+                    .cloned()
+                    .unwrap_or_else(|| fallback_fqn(&nb.path, &nb.name, nb.kind));
+                if visited.insert(nfqn.clone()) {
+                    queue.push_back((nb.path, nb.offset, nfqn));
+                }
+            }
+        }
+        visited
+    }
+
     /// The direct call-graph neighbours of the node at `(path, offset)`.
     ///
     /// Forward is straightforward — ty's outgoing calls read the def's own body,

@@ -64,11 +64,25 @@ If yes, don't rebuild it — unless we can do it **deeper** (see below).
    third-party code, gated to genuine module bindings and `__getattr__`-free
    modules so it adds no false positives.
 
+7. **Dead code** (`deadcode`, shipped) — callables reachable from no entrypoint,
+   via forward reachability over the call graph (the deeper-than-"unused import"
+   version below). The hard part is the root set: Python has no single `main`,
+   and most live code is entered by convention/config, so the bias is toward
+   calling things live (a flagged live handler is the dangerous failure). Roots:
+   tests, dunders, decorated hooks, `__all__`, module-scope references (resolved
+   through ty), entrypoint *files* (`manage.py`/`wsgi.py`/`urls.py`/`migrations/`/
+   `management/commands/`/…), framework base subclasses (`BaseCommand`/`*View`/
+   `*Serializer`/`*Form`/`*Model`/… — class + methods + inner `Meta` kept whole),
+   and `[project.scripts]`. Over-approximate liveness, under-reports death; the
+   residual false positives are genuinely dynamic (dotted-string config paths,
+   callbacks-as-values, `getattr`, entry-point systems) and flagged.
+
 ## Worth building *deeper* than the existing tools (the exception to the filter)
 These exist elsewhere but a pyq-native version is better because it rides the
 index we already build:
 - **Dead code at a deeper level** — not "unused import" but "function reachable
-  from no entrypoint / test", across the resolved graph (over-approximate, flagged).
+  from no entrypoint / test", across the resolved graph (over-approximate,
+  flagged). *Shipped as `deadcode` (#7 above).*
 - **Change-coverage** — given a diff, which changed lines are exercised by which
   tests; which changed files have zero test reachability. (Dynamic half later.)
 

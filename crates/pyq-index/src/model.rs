@@ -45,6 +45,11 @@ pub struct Def {
     /// class with no bases. Lets a consumer know a class may inherit members it
     /// can't see (so a missing attribute isn't necessarily absent).
     pub bases: Vec<String>,
+    /// `true` if the function/class carries any decorator. A decorated callable
+    /// is usually wired to a framework (a route, fixture, task, CLI command,
+    /// signal handler) and *called by it*, not by project code — so reachability
+    /// analysis must treat it as a live entrypoint, not dead.
+    pub decorated: bool,
 }
 
 /// A use of a name in this file.
@@ -58,6 +63,11 @@ pub struct Ref {
     pub offset: u32,
     /// `true` when this name is the callee of a call expression (`name(...)`).
     pub is_call: bool,
+    /// `true` when this use sits at module (or class-body) scope — code that
+    /// runs at import time, not inside a function. A module-scope use of a
+    /// callable (`main()` under `__main__`, a view in a URL table, a handler
+    /// passed to `register(...)`) is an entry edge: it keeps the target live.
+    pub module_scope: bool,
 }
 
 /// An external input the module depends on — part of "what does this need to
@@ -180,4 +190,8 @@ pub struct FileIndex {
     pub imports: Vec<ImportStmt>,
     pub effects: Vec<Effect>,
     pub mocks: Vec<MockTarget>,
+    /// The names listed in this module's `__all__`, if any — its declared public
+    /// surface. Exported names are reachable from outside the project, so
+    /// reachability analysis treats them as live entrypoints.
+    pub dunder_all: Vec<String>,
 }

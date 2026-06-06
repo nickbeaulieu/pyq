@@ -722,6 +722,55 @@ fn mock_targets_resolve_module_attributes_via_typeshed() {
     assert_eq!(status.get("app.svc.getcwd.anything"), Some(&"unverifiable"), "{env}");
 }
 
+// `deadcode` reports callables reachable from no entrypoint. The whole game is
+// the root set: only the genuinely-unreachable `truly_dead`/`orphan_helper` are
+// flagged, while every flavour of entrypoint stays live — an `__all__` export
+// and its callees, a `__main__`-invoked `main`, a DRF serializer subtree (class
+// + `get_label` method + inner `Meta`), a Django management command + its
+// helper, and a pytest test.
+#[test]
+fn deadcode_flags_only_the_unreachable_and_respects_entrypoints() {
+    let root = fixture("deadcode");
+    let (env, ok) = run_json_in(&root, &["deadcode"]);
+    assert!(ok);
+    assert_eq!(env["query"]["kind"], "deadcode");
+
+    let dead: std::collections::HashSet<&str> = env["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["fqn"].as_str().unwrap())
+        .collect();
+
+    // The two genuinely-unreachable functions are flagged …
+    assert!(dead.contains("app.core.truly_dead"), "{env}");
+    assert!(dead.contains("app.core.orphan_helper"), "{env}");
+    // … and nothing else is (every other callable is live by some entrypoint).
+    assert_eq!(dead.len(), 2, "unexpected extra candidates: {dead:?}");
+
+    // Spell out the entrypoint rules that must keep these live:
+    for live in [
+        "app.core.exported_api",              // __all__ export
+        "app.core._helper",                   // reached from the export
+        "app.core.main",                      // called under __main__
+        "app.core.used_by_main",              // reached from main
+        "app.views.WidgetSerializer",         // framework class (DRF)
+        "app.views.WidgetSerializer.get_label", // framework method
+        "app.views.helper_for_label",         // reached from a framework method
+        "app.management.commands.sync.Command", // mgmt command (entrypoint file)
+        "app.management.commands.sync.do_sync", // reached from the command
+        "app.tests.test_core.test_exported",  // pytest test
+    ] {
+        assert!(!dead.contains(live), "`{live}` must not be flagged dead: {dead:?}");
+    }
+
+    // The over-approximation caveat is always present.
+    assert!(env["warnings"].as_array().unwrap().iter().any(|w| w
+        .as_str()
+        .unwrap()
+        .contains("over-approximate")));
+}
+
 #[test]
 fn imports_lists_edges_and_marks_external() {
     let (env, ok) = run_json(&["imports"]);

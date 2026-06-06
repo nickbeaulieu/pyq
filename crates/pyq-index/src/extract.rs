@@ -41,6 +41,7 @@ pub fn extract(path: &str, source: &str) -> FileIndex {
         imports: Vec::new(),
         effects: Vec::new(),
         mocks: Vec::new(),
+        dunder_all: Vec::new(),
     };
     for stmt in &parsed.syntax().body {
         collector.visit_stmt(stmt);
@@ -53,6 +54,7 @@ pub fn extract(path: &str, source: &str) -> FileIndex {
         imports: collector.imports,
         effects: collector.effects,
         mocks: collector.mocks,
+        dunder_all: collector.dunder_all,
     }
 }
 
@@ -73,6 +75,7 @@ struct Collector<'src> {
     imports: Vec<ImportStmt>,
     effects: Vec<Effect>,
     mocks: Vec<MockTarget>,
+    dunder_all: Vec<String>,
 }
 
 impl<'src> Collector<'src> {
@@ -233,6 +236,7 @@ impl<'src> Collector<'src> {
             container: self.scope.clone(),
             nested: self.depth > 0,
             bases: Vec::new(),
+            decorated: false,
         });
     }
 }
@@ -242,6 +246,11 @@ impl<'src, 'ast> Visitor<'ast> for Collector<'src> {
         match stmt {
             Stmt::FunctionDef(f) => {
                 self.push_def(f.name.as_str(), DefKind::Function, f.name.start());
+                if !f.decorator_list.is_empty() {
+                    if let Some(last) = self.defs.last_mut() {
+                        last.decorated = true;
+                    }
+                }
                 self.depth += 1;
                 self.func_depth += 1;
                 self.scope.push(f.name.to_string());
@@ -281,6 +290,7 @@ impl<'src, 'ast> Visitor<'ast> for Collector<'src> {
                 // provably absent.
                 if let Some(last) = self.defs.last_mut() {
                     last.bases = class_bases(c).collect();
+                    last.decorated = !c.decorator_list.is_empty();
                 }
                 // A pydantic BaseSettings subclass: its annotated class-level
                 // fields are configuration inputs.
@@ -308,6 +318,11 @@ impl<'src, 'ast> Visitor<'ast> for Collector<'src> {
                 for target in &a.targets {
                     if let Expr::Name(n) = target {
                         self.push_def(n.id.as_str(), DefKind::Variable, n.start());
+                        // `__all__ = ["a", "b"]` declares the module's public
+                        // surface — its string entries are exported names.
+                        if n.id.as_str() == "__all__" && self.func_depth == 0 {
+                            self.dunder_all.extend(string_seq(&a.value));
+                        }
                     }
                 }
                 // `env = os.environ` binds the whole mapping; the keys read
@@ -373,6 +388,7 @@ impl<'src, 'ast> Visitor<'ast> for Collector<'src> {
                     pos: self.pos(n.start()),
                     offset: n.start().to_u32(),
                     is_call: true,
+                    module_scope: self.func_depth == 0,
                 });
                 for arg in call.arguments.args.iter() {
                     self.visit_expr(arg);
@@ -390,6 +406,7 @@ impl<'src, 'ast> Visitor<'ast> for Collector<'src> {
                     pos: self.pos(n.start()),
                     offset: n.start().to_u32(),
                     is_call: false,
+                    module_scope: self.func_depth == 0,
                 });
             }
         }
@@ -511,6 +528,18 @@ fn literal_str(expr: Option<&Expr>) -> Option<String> {
         Expr::StringLiteral(s) => Some(s.value.to_str().to_string()),
         _ => None,
     }
+}
+
+/// The string-literal entries of a list/tuple expression — `["a", "b"]` →
+/// `["a", "b"]`. Used to read the names declared in `__all__`; non-literal
+/// entries (computed names) are skipped (over-approximate, never guessed).
+fn string_seq(expr: &Expr) -> Vec<String> {
+    let elts = match expr {
+        Expr::List(l) => &l.elts,
+        Expr::Tuple(t) => &t.elts,
+        _ => return Vec::new(),
+    };
+    elts.iter().filter_map(|e| literal_str(Some(e))).collect()
 }
 
 /// The canonical name of a CLI option/argument from its positional strings:

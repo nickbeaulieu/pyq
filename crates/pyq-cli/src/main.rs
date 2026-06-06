@@ -5,6 +5,7 @@
 //! about code-as-graph. This is the first slice — symbol/reference queries over
 //! a directory of Python files, single-file name resolution.
 
+mod deadcode;
 mod graph;
 mod mock;
 mod tests_map;
@@ -78,6 +79,12 @@ enum Command {
     /// drifted paths — a patch whose target no longer exists silently does
     /// nothing, so the test passes while exercising the real code.
     MockTargets,
+    /// Functions and classes reachable from no entrypoint — candidate dead code.
+    /// Reachability runs forward from the roots an agent can't see are live:
+    /// tests, dunders, decorated hooks, `__all__`, module-scope calls, framework
+    /// entrypoint files/classes, and console scripts. Over-approximate liveness
+    /// (so it under-reports death); residual dynamic dispatch is flagged.
+    Deadcode,
     /// The project import graph. With no module: every import edge. With a
     /// module (`pkg.models` or `pkg/models.py`): what it imports, or — with
     /// `--reverse` — who imports it (blast radius). `--cycles`: import cycles.
@@ -140,6 +147,7 @@ fn dispatch(cli: &Cli) -> anyhow::Result<Envelope> {
             query_inputs(&files)
         }
         Command::MockTargets => query_mock_targets(cli)?,
+        Command::Deadcode => query_deadcode(cli)?,
         Command::Imports {
             module,
             reverse,
@@ -244,9 +252,10 @@ fn query_graph(
     Ok(envelope)
 }
 
-/// The static test↔code map: which pytest-collected tests transitively reach
-/// `symbol`. A projection of the reverse call-graph closure, filtered to test
-/// nodes — the foundation for static change coverage.
+/// The static test↔code map: which collected tests transitively reach `symbol`.
+/// A projection of the reverse call-graph closure, filtered to test nodes — a
+/// call-reachability lens for "which tests to run before this edit," not a
+/// coverage metric (dynamic dispatch is invisible; see `tests_map`).
 fn query_tests(cli: &Cli, symbol: &str) -> anyhow::Result<Envelope> {
     let files = walk::index_tree(&cli.root)?;
     let scope = walk::walked_py_files(&cli.root);
@@ -466,6 +475,47 @@ fn query_inputs(files: &[FileIndex]) -> Envelope {
     let summary = format!("{} inputs", results.len());
     // Uniform query schema: every verb echoes kind + target (null where none).
     Envelope::new(json!({ "kind": "inputs", "target": null }), results).with_summary(summary)
+}
+
+/// Candidate dead code — callables reachable from no entrypoint. Builds the call
+/// graph, seeds the entrypoint roots, and reports the callables the forward
+/// closure never reaches.
+fn query_deadcode(cli: &Cli) -> anyhow::Result<Envelope> {
+    let files = walk::index_tree(&cli.root)?;
+    let scope = walk::walked_py_files(&cli.root);
+    let graph = CallGraph::new(&cli.root, files.clone(), scope)?;
+    let result = deadcode::find(&files, &graph, &cli.root);
+
+    let results: Vec<serde_json::Value> = result
+        .dead
+        .iter()
+        .map(|d| {
+            json!({
+                "loc": format!("{}:{}:{}", d.path, d.line, d.col),
+                "label": format!("{} {}", d.kind, d.fqn),
+                "fqn": d.fqn,
+                "node_kind": d.kind,
+            })
+        })
+        .collect();
+    let n = results.len();
+    let summary = format!(
+        "{n} dead-code {} of {} {}",
+        plural(n, "candidate"),
+        result.total,
+        plural(result.total, "callable")
+    );
+    let warnings = vec![
+        "over-approximate — verify before deleting. A candidate is reported when no \
+         static call path reaches it from an entrypoint; it is NOT dead if it's reached \
+         dynamically: a dotted-string path in config (Django `EXCEPTION_HANDLER`/`MIDDLEWARE`, \
+         Celery task names), a callable passed as a value (`side_effect=`, callbacks, registries), \
+         getattr/reflection, or a plugin/entry-point system pyq doesn't read."
+            .to_string(),
+    ];
+    Ok(Envelope::new(json!({ "kind": "deadcode", "target": null }), results)
+        .with_summary(summary)
+        .with_warnings(warnings))
 }
 
 /// Every `mock.patch("...")` target across the tree, resolved against the

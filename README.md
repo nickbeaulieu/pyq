@@ -31,8 +31,9 @@ pyq defs User                 # every definition of `User`
 pyq graph main                # everything `main` transitively calls
 pyq graph User --reverse      # everything that transitively reaches `User`
 pyq effects handle_request    # side effects it transitively performs (io/net/db/…)
-pyq tests add                 # which tests statically reach `add` (change coverage)
+pyq tests add                 # which tests are call-wired to `add` (run before editing)
 pyq mock-targets              # resolve every mock.patch("…") — flag drifted paths
+pyq deadcode                  # callables reachable from no entrypoint (candidates)
 pyq inputs                    # the external input surface of the project
 pyq imports pkg.models --reverse   # who imports pkg.models (blast radius)
 pyq imports --cycles          # import cycles among project modules
@@ -47,8 +48,9 @@ pyq imports --cycles          # import cycles among project modules
 | `defs <symbol>` | Every definition (function/class/variable/import binding), each tagged `role` (`definition`/`binding`); a `binding` points at its canonical def via `resolves_to`. |
 | `graph <symbol>` | The transitive call graph: everything the symbol calls (forward closure), or — with `--reverse` — everything that calls it. Nodes are stable fully-qualified IDs (`pkg.models.User.__init__`) re-queryable after edits; `--depth N` caps the hops. |
 | `effects <symbol>` | The transitive effect surface: which side effects (`fs`, `network`, `subprocess`, `env`, `db`, `random`, `clock`, `global`) the symbol and everything it transitively calls statically perform, plus import-time effects of the modules involved. "Is this pure / safe in a test." |
-| `tests <symbol>` | The test↔code map: which collected tests statically reach the symbol, each carrying the call path (`via`) and `depth` by which it reaches. A test is a `test_*` function in `test_*.py`/`*_test.py`, or a `test_*` method on a collected class — `Test*`-named **or** subclassing a `*TestCase` (unittest/Django/DRF, collected by inheritance). A projection of the reverse call graph — the foundation for static change coverage. Scope `--root` to the package root where first-party imports resolve (e.g. the dir whose children are your top-level packages), so cross-module reach links up. |
+| `tests <symbol>` | A call-reachability lens (**not** a coverage metric): which collected tests are structurally wired to a symbol via the reverse call graph, each with the call path (`via`) and `depth`. A test is a `test_*` function in `test_*.py`/`*_test.py`, or a `test_*` method on a collected class — `Test*`-named **or** `*TestCase`-subclassing (unittest/Django/DRF). For "which tests to run before this edit," not "what's my coverage." Blind to dynamic dispatch (attribute calls, framework routing, signals) — a 0 is "no *static* reaching test," not "untested." See [Tests](#tests). |
 | `mock-targets` | Resolve every `mock.patch("a.b.c")` target against the project and flag *drifted* paths — a patch whose looked-up name no longer exists silently no-ops, so the test passes while exercising the real code. |
+| `deadcode` | Functions/classes reachable from **no** entrypoint — candidate dead code, via forward reachability over the call graph. Roots are everything the runtime/framework enters without a project call: tests, dunders, decorated hooks, `__all__`, module-scope calls, entrypoint files (`manage.py`/`wsgi.py`/`urls.py`/`migrations/`/`management/commands/`/…), framework base classes (`BaseCommand`/`*View`/`*Serializer`/…), and `[project.scripts]`. Over-approximate liveness (so it under-reports death); residual dynamic dispatch is flagged. See [Dead code](#dead-code). |
 | `inputs` | What the code needs to run: env vars, literal files opened, CLI args (argparse/click), pydantic settings fields. |
 | `imports [module]` | The import graph. No arg: every edge. With a module: what it imports; `--reverse`: who imports it (blast radius); `--cycles`: import cycles. Accepts a module name or a file path. |
 
@@ -138,6 +140,53 @@ code *appears* to perform the effect, and — as with `callers` — effects behi
 calls that resolve through attribute/dynamic dispatch aren't followed, so "pure"
 means "no effect found," not a proof of purity.
 
+## Tests
+
+`tests` is a reverse-call-graph projection: it walks the closure of callers of a
+symbol and keeps the ones a test runner would collect — `test_*` functions in
+`test_*.py`/`*_test.py`, and `test_*` methods on a collected class (`Test*`-named
+**or** subclassing a `*TestCase`: unittest, Django, DRF — collected by
+inheritance). Each reaching test carries the `via` edge and `depth`, so you see
+the call path, not just the fact.
+
+```console
+$ pyq tests make_user --root path/to/project
+2 tests reach `make_user`
+tests/test_users.py:8:5   tests.test_users.test_make_user reaches `make_user` (depth 1, via app.make_user)
+tests/test_api.py:31:9    tests.test_api.UserApiTests.test_signup reaches `make_user` (depth 3, via app.signup)
+```
+
+**This is a call-reachability lens, not a coverage metric.** It answers "which
+tests are structurally wired to this symbol," exactly, for the call edges it can
+resolve — the question worth asking *before* an edit (which tests to run, what
+might break) without a test DB or a suite run. It is **not** a substitute for
+`coverage.py`, and a percentage built by aggregating it over many symbols will
+mislead. Reach for it per-symbol, at edit time, and verify what matters with a
+real coverage run.
+
+Two boundaries, both load-bearing — do not read a zero as "untested":
+
+- **Dynamic dispatch is invisible.** Reach through an attribute call
+  (`obj.method()`, pydantic's `Model.model_validate(...)`), framework routing
+  (Flask/FastAPI/Django/DRF views reached via URL dispatch), signals and Celery
+  tasks (`signal.send()`, `.delay()`), registries, or `getattr` is **not**
+  followed — the same boundary `callers`/`graph --reverse` have. A view or signal
+  handler exercised only through the framework will show **0 reaching tests while
+  being fully tested at runtime.** Framework-dispatched code is exactly where you
+  should trust `coverage.py` instead.
+- **Reachability ≠ execution.** A static caller edge may sit on a branch a given
+  test never takes (over-approximation), and collection uses the default
+  pytest/unittest naming + inheritance rules — custom `python_files`/
+  `python_classes` config is not read.
+
+A symbol that exists but is reached by no test is a `0`-result success (a
+candidate gap); a symbol that names no function or class is a distinct
+empty-`roots` answer (a typo) — so you can tell "structurally untested" from "no
+such symbol." **Scope `--root` to the package root where first-party imports
+resolve** (the directory whose children are your top-level packages), or
+absolute `pkg.sub`-style imports won't link and reach will be silently
+under-reported.
+
 ## Mock-target drift
 
 `mock.patch` replaces a name *where it is looked up*, not where it is defined —
@@ -187,6 +236,49 @@ binding is a value, not a module, and stays `unverifiable`), and to modules
 without a dynamic `__getattr__`, so it never manufactures a false drift —
 verified across three real repos, where it moved ~60 patches from `unverifiable`
 to `valid` (e.g. `time.sleep`) and added zero new drifts.
+
+## Dead code
+
+`deadcode` runs the call graph *forward from the program's entrypoints* and
+reports the callables nothing reaches. Python has no single `main`, and most
+live code is entered by **convention or config**, not a project call — so the
+verb's real work is the root set, and the bias is heavily toward calling things
+live (flagging a live route handler dead is the dangerous failure). Roots:
+
+- pytest-collected tests, and every method of a collected test class;
+- dunder methods (`__init__`, `__enter__`, …);
+- decorated callables (routes, fixtures, tasks, CLI commands, signals);
+- `__all__` exports;
+- callables referenced at module scope (`__main__`, URL tables, registries),
+  resolved through ty;
+- everything in an entrypoint *file* (`manage.py`, `wsgi.py`/`asgi.py`,
+  `urls.py`, `settings`, `conftest.py`, `migrations/`, `management/commands/`,
+  `scripts/`, `setup.py`) and the whole subtree of a framework base subclass
+  (`BaseCommand`, `*View`/`*ViewSet`, `*Serializer`, `*Form`, `*Admin`,
+  `*Model`, … — so a Django command's `handle`, a DRF serializer's `get_*`
+  methods, and inner `Meta`/`Config` classes are all live);
+- `[project.scripts]` / `[tool.poetry.scripts]` console entrypoints.
+
+```console
+$ pyq deadcode --root path/to/project
+2 dead-code candidates of 14 callables
+app/core.py:12:5  function app.core.truly_dead
+app/core.py:16:5  function app.core.orphan_helper
+! over-approximate — verify before deleting. …reached dynamically (a dotted-string
+  path in config, a callable passed as a value, getattr/reflection, an
+  entry-point system) is not dead.
+```
+
+It's **over-approximate**: a candidate is reported when no *static* call path
+reaches it, which is not the same as dead. The residual false positives are
+genuinely dynamic and flagged — a dotted-string path in config (Django
+`EXCEPTION_HANDLER`/`MIDDLEWARE`, Celery task names), a callable passed as a
+value (`side_effect=`, callbacks, registries), `getattr`/reflection, or a
+plugin/entry-point system pyq doesn't read. So treat the output as candidates to
+verify, not a delete list. (Conversely it under-reports: a class whose every
+method the framework drives is kept whole, so a genuinely dead method on a live
+serializer won't surface.) On three real repos it lands at 1.6–5.3% of
+callables. Run it from the package root so cross-module imports resolve.
 
 ## Output envelope
 

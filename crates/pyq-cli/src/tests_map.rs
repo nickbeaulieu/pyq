@@ -1,12 +1,20 @@
 //! The `tests` verb — the static test↔code map.
 //!
-//! "Which tests exercise this symbol" is the question an iterating agent asks
-//! after every edit, and answering it statically is the foundation for change
-//! coverage. It's a projection of the [`CallGraph`] reverse closure (#10): the
-//! set of callables that transitively reach the queried symbol, filtered to the
-//! ones pytest would *collect as tests*. Each reaching test carries the `via`
-//! edge and `depth` from the closure, so an agent sees not just "this test
-//! touches it" but the call path by which it does.
+//! "Which tests are call-wired to this symbol" is the question an iterating
+//! agent asks *before* an edit — which tests to run, what might break — and this
+//! answers it as a structural fact, not a coverage measurement. It's a
+//! projection of the [`CallGraph`] reverse closure (#10): the set of callables
+//! that transitively reach the queried symbol, filtered to the ones a runner
+//! would *collect as tests*. Each reaching test carries the `via` edge and
+//! `depth`, so an agent sees the call path, not just the fact.
+//!
+//! This is a *call-reachability lens, not a coverage metric.* Reach through
+//! dynamic dispatch (attribute calls, framework routing, signals/Celery,
+//! `getattr`) is invisible — the same boundary `callers`/`graph --reverse` have —
+//! so a framework-dispatched view or signal handler can show zero reaching tests
+//! while being fully exercised at runtime. A `0` means "no *static* reaching
+//! test found," never "untested"; `coverage.py` is the oracle for the dynamic
+//! paths. Aggregating this into a coverage percentage will mislead.
 //!
 //! Test collection follows pytest's defaults *and* the unittest/Django rule a
 //! Python-heavy codebase actually leans on: a test lives in a file matching
