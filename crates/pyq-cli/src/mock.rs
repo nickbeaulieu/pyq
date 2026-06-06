@@ -137,12 +137,30 @@ impl PatchResolver {
         // Longest dotted prefix that names a project module — the rest is the
         // attribute chain looked up on it at patch time.
         for k in (1..=parts.len()).rev() {
-            let module = parts[..k].join(".");
-            if self.modules.contains(&module) {
+            let prefix = parts[..k].join(".");
+            if let Some(module) = self.canonical_module(&prefix) {
                 return self.resolve_attr(&module, &parts[k..]);
             }
         }
         Status::External
+    }
+
+    /// Map a module spelling as written in a patch string to its canonical
+    /// file-derived id, honoring a source root: an exact match, else the *unique*
+    /// project module whose id ends with `.<spelling>` (the nested-root case,
+    /// where code is rooted at `alice/alice/` so patches read `main.services.x`
+    /// while the file id is `alice.alice.main.services.x`). Ambiguous or
+    /// unmatched → `None`. Mirrors the import graph's `canonicalize_target`.
+    fn canonical_module(&self, spelling: &str) -> Option<String> {
+        if self.modules.contains(spelling) {
+            return Some(spelling.to_string());
+        }
+        let suffix = format!(".{spelling}");
+        let mut matches = self.modules.iter().filter(|m| m.ends_with(&suffix));
+        match (matches.next(), matches.next()) {
+            (Some(only), None) => Some(only.clone()),
+            _ => None,
+        }
     }
 
     fn resolve_attr(&self, module: &str, chain: &[&str]) -> Status {

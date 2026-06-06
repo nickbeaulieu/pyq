@@ -674,6 +674,30 @@ fn mock_targets_surfaces_drift_as_warnings() {
     assert!(dynamic["target"].is_null());
 }
 
+// Regression (found running against a nested source-root repo): when code is
+// rooted below the repo (files at `alice/main/services.py` but imported and
+// patched as `main.services.*`), the patch target's module spelling differs
+// from the file-derived id. Without source-root canonicalization every target
+// reads as `external` and the tool silently checks nothing. The spelling must
+// resolve to the canonical module — so valid patches verify and real drift on
+// them still fires.
+#[test]
+fn mock_targets_resolve_across_source_root_spellings() {
+    let root = fixture("mock_src_root");
+    let (env, ok) = run_json_in(&root, &["mock-targets"]);
+    assert!(ok);
+    let status: std::collections::HashMap<&str, &str> = env["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|r| Some((r["target"].as_str()?, r["status"].as_str().unwrap())))
+        .collect();
+    // The source-rooted spelling resolves to the real symbol …
+    assert_eq!(status.get("main.services.get_thing"), Some(&"valid"), "{env}");
+    // … and a drift on that spelling is still caught (not lost to `external`).
+    assert_eq!(status.get("main.services.removed_thing"), Some(&"drifted"), "{env}");
+}
+
 #[test]
 fn imports_lists_edges_and_marks_external() {
     let (env, ok) = run_json(&["imports"]);

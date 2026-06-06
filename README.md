@@ -171,6 +171,11 @@ class that extends a base, which may be inherited or framework-injected
 drift is a real one. (`patch.object` / `patch.dict`, whose target isn't a dotted
 string, are out of scope.)
 
+Module spellings are matched honoring a source root: on a nested layout (files
+at `alice/main/services.py`, imported and patched as `main.services.*`) the
+target resolves to the canonical file-derived id by unique suffix — so the verb
+doesn't silently degrade to "all external" and check nothing.
+
 ## Output envelope
 
 Every verb emits the same shape. The default human view is a token-frugal
