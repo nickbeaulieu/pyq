@@ -10,34 +10,51 @@ imports use bare module names via `pythonpath = ["mroi_matcher"]`.)
 
 ---
 
-## ~MOSTLY FIXED via unified engine — ty under-reports source-root (bare-path) imports
+## ✅ FIXED — ty under-reports source-root (bare-path) first-party imports
 `mroi-matcher` declares `pythonpath = ["mroi_matcher"]`, so first-party code
 imports by bare name (`from helpers.validators import valid_email`). ty discovers
-the project at the repo root, doesn't honor that source root, and on its own
-returned def-only / 0 for the affected symbols (used code looked dead):
+the project at the repo root and previously didn't honor that source root, so the
+affected symbols returned def-only / 0 (used code looked dead).
+
+**Fixed natively** (`ty_backed.rs`): on project init, pyq reads
+`[tool.pytest.ini_options] pythonpath` from the project's `pyproject.toml` and
+feeds those dirs to ty as `environment.extra-paths` via `apply_overrides`
+(additive — ty keeps its own auto-detected `./src`/`./<project>` roots and the
+project root). ty now resolves the bare imports itself, so results are
+**ty-resolved**, not syntactic name-matches — precision restored, no warning.
 
 ```
-                     OLD (ty)            NOW (unified, ty ∪ syntactic)
-valid_email refs     1 (def only)        4  ✓
-valid_email callers  0                   3  ✓   (grep: 3 real calls)
+                     OLD (ty alone)   INTERIM (unified backfill)   NOW (ty resolves)
+valid_email refs     1 (def only)     4 (3 syntactic-only)         7  ✓ all ty
+valid_email callers  0                3 (syntactic-only)           3  ✓ all ty
+get_score  callers   0                0 (method via match_case)    2  ✓
+get_matches callers  0                0                            2  ✓
 ```
 
-**The `unified` default engine fixes the observable symptom** — syntactic
-name-matching backfills the call sites ty's unresolved imports miss, so `refs`/
-`callers` are no longer silent-zero here. Verified on the current binary.
+Verified: no-`pythonpath` repos unchanged (scoring `save`=62, `__init__`=37;
+alice reverse=138); missing/broken/`.`-only `pythonpath` handled gracefully
+(no crash). Best-effort: parse failure → no extra paths, never errors the query.
+(`[tool.ty] extra-paths`/`src.root` and `./src`/`./<project>` auto-detect are
+already honored by ty directly; a `--src-root` CLI flag remains a possible
+future nicety but isn't needed for the common pytest-`pythonpath` convention.)
 
-Residual (lower priority): the underlying ty *resolution* gap remains — unified
-papers over it by name (so it inherits name-collision imprecision rather than
-true resolution), and `settings` vs `helpers.validators` resolving inconsistently
-in ty is still a smell. Honoring a real source root (`[tool.pytest.ini_options]
-pythonpath`, `[tool.ty] extra-paths`/`src.root`, `src`-layout auto-detect, or a
-`--src-root` flag) would let ty resolve these natively and restore precision.
-(The related `imports`-graph forward/reverse identity mismatch is now fixed:
+(The related `imports`-graph forward/reverse identity mismatch is also fixed:
 targets canonicalize to the file-derived module id, so `main.models` and
 `alice.main.models` — and both directions — resolve to one node.)
 
 ---
 
+
+## P3 (residual) — dotted/qualified names accept the qualifier but ignore it
+Re-verifying the old "dotted names return 0" fix: `defs A.proc` and `defs B.proc`
+now return results (good, no longer 0) — but they return *identical* results
+(both `A.proc` and `B.proc` defs). The qualifier is dropped and only the last
+component (`proc`) is matched, so `A.proc` does not actually scope to `A`. It
+traded "returns 0" for "silently ignores the prefix," which can mislead an agent
+that believes it targeted one class. Practical disambiguation does exist via the
+new `resolves_to` field on `callers`/`refs` results (each call site is tagged
+with the def it resolves to — verified working), so this is low priority; but
+either honor the qualifier or reject/warn on it rather than silently widen.
 
 ## Design preferences (agent POV)
 What I'd want as the actual consumer. Principle: **pyq output is treated as

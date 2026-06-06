@@ -1,16 +1,18 @@
 //! ty-backed [`Resolver`]: a `ProjectDatabase` over the root + `ty_ide`.
 
 use anyhow::{anyhow, Context, Result};
-use ruff_db::files::{File, FilePath};
+use ruff_db::files::{system_path_to_file, File, FilePath};
 use ruff_db::source::source_text;
-use ruff_db::system::{OsSystem, SystemPathBuf};
-use ruff_text_size::TextSize;
+use ruff_db::system::{OsSystem, SystemPath, SystemPathBuf};
+use ruff_text_size::{TextRange, TextSize};
 use std::collections::HashSet;
 use std::path::PathBuf;
 use ty_ide::{find_references, incoming_calls, workspace_symbols};
+use ty_project::metadata::options::{EnvironmentOptions, Options, ProjectOptionsOverrides};
+use ty_project::metadata::value::RelativePathBuf;
 use ty_project::{ProjectDatabase, ProjectMetadata};
 
-use crate::{Loc, Resolver, Source};
+use crate::{Loc, Resolver};
 
 pub struct TyResolver {
     db: ProjectDatabase,
@@ -33,8 +35,35 @@ impl TyResolver {
         let root = SystemPathBuf::from_path_buf(abs)
             .map_err(|p| anyhow!("non-UTF-8 project path: {}", p.display()))?;
         let system = OsSystem::new(&root);
-        let metadata = ProjectMetadata::discover(&root, &system)
+        let mut metadata = ProjectMetadata::discover(&root, &system)
             .context("discovering project metadata")?;
+
+        // Honor source roots the runtime uses but ty doesn't discover on its own.
+        // ty auto-detects `./src` and `./<project>` layouts and reads `PYTHONPATH`,
+        // but a very common Python convention puts the import root behind pytest's
+        // `[tool.pytest.ini_options] pythonpath` (e.g. `pythonpath = ["mroi_matcher"]`,
+        // so first-party code imports `helpers.validators`, not
+        // `mroi_matcher.helpers.validators`). Without this, those imports don't
+        // resolve and `refs`/`callers` silently under-report. We feed the declared
+        // paths to ty as `extra-paths` — additive, so ty keeps its own auto-detected
+        // roots (incl. the project root) and just gains these.
+        let src_roots = pytest_pythonpath(metadata.root().as_str());
+        if !src_roots.is_empty() {
+            let overrides = ProjectOptionsOverrides {
+                options: Options {
+                    environment: Some(EnvironmentOptions {
+                        extra_paths: Some(
+                            src_roots.iter().map(RelativePathBuf::cli).collect(),
+                        ),
+                        ..EnvironmentOptions::default()
+                    }),
+                    ..Options::default()
+                },
+                ..ProjectOptionsOverrides::default()
+            };
+            metadata.apply_overrides(&overrides);
+        }
+
         let db = ProjectDatabase::fallible(metadata, system)
             .context("initializing project database")?;
         Ok(TyResolver {
@@ -44,19 +73,106 @@ impl TyResolver {
         })
     }
 
-    /// Files + offsets of every definition whose name is exactly `symbol`.
-    /// `workspace_symbols` is fuzzy, so we filter to exact matches.
+    /// Files + offsets of every definition matching `symbol`. A bare name
+    /// (`proc`) matches every def of that name; a *qualified* name (`A.proc`,
+    /// `Outer.Inner.m`) honors the qualifier — only defs whose enclosing scopes
+    /// match the prefix, by source-range containment, are kept. So `A.proc` and
+    /// `B.proc` no longer collapse to the same answer.
     fn exact_symbols(&self, symbol: &str) -> Vec<(File, TextSize)> {
-        workspace_symbols(&self.db, symbol)
+        let mut parts: Vec<&str> = symbol.split('.').collect();
+        let leaf = parts.pop().unwrap_or(symbol); // never empty: split yields ≥1
+        let quals = parts; // enclosing scopes, outermost first
+        self.symbols_named(leaf)
             .into_iter()
-            .filter(|s| s.symbol.name == symbol)
-            .map(|s| (s.file, s.symbol.name_range.start()))
+            .filter(|(file, _, full)| quals.is_empty() || self.enclosed_by(*file, *full, &quals))
+            .map(|(file, start, _)| (file, start))
             .collect()
     }
 
+    /// Every symbol named exactly `name` (file, name offset, full body range).
+    /// `workspace_symbols` is fuzzy, so we filter to exact matches.
+    fn symbols_named(&self, name: &str) -> Vec<(File, TextSize, TextRange)> {
+        workspace_symbols(&self.db, name)
+            .into_iter()
+            .filter(|s| s.symbol.name == name)
+            .map(|s| (s.file, s.symbol.name_range.start(), s.symbol.full_range))
+            .collect()
+    }
+
+    /// Whether the def occupying `target` in `file` is enclosed by a chain of
+    /// scopes named `quals` (outermost first) — e.g. `["A"]` requires a symbol
+    /// `A` whose body contains `target`. Climbs inner→outer, at each step picking
+    /// the tightest containing symbol of the expected name; any gap fails.
+    fn enclosed_by(&self, file: File, target: TextRange, quals: &[&str]) -> bool {
+        let mut inner = target;
+        for name in quals.iter().rev() {
+            let container = self
+                .symbols_named(name)
+                .into_iter()
+                .filter(|(f, _, full)| *f == file && *full != inner && full.contains_range(inner))
+                .min_by_key(|(_, _, full)| full.len());
+            match container {
+                Some((_, _, full)) => inner = full,
+                None => return false,
+            }
+        }
+        true
+    }
+
+    /// The ty `File` for a path relative to the project root, if ty indexed it.
+    fn file_at(&self, rel_path: &str) -> Option<File> {
+        let abs = self.root_canon.join(rel_path);
+        let sys = SystemPath::new(abs.to_str()?).to_path_buf();
+        system_path_to_file(&self.db, &sys).ok()
+    }
+
+    /// References to whatever binding sits at `offset` in `rel_path` — anchored
+    /// on a precise location, not a name. This is the linchpin of the
+    /// locate-then-resolve design: handed a definition (or use) offset — which
+    /// the syntactic index knows for *every* binding, including function-locals
+    /// and params that `workspace_symbols` never surfaces — ty resolves that
+    /// exact binding, scope and all.
+    pub fn references_at(&self, rel_path: &str, offset: TextSize) -> Vec<Loc> {
+        let Some(file) = self.file_at(rel_path) else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        if let Some(targets) = find_references(&self.db, file, offset, true) {
+            for t in targets {
+                if let Some(loc) =
+                    self.loc(t.file(), t.range().start(), reference_kind(t.kind()), "reference")
+                {
+                    out.push(loc);
+                }
+            }
+        }
+        dedupe(&mut out);
+        out
+    }
+
+    /// Call sites of whatever binding sits at `offset` in `rel_path`, each
+    /// labelled with its enclosing function. ty's `call_hierarchy` follows
+    /// `import as`/re-export renames, so anchoring here catches alias call sites
+    /// `find_references` misses.
+    pub fn callers_at(&self, rel_path: &str, offset: TextSize) -> Vec<Loc> {
+        let Some(file) = self.file_at(rel_path) else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for call in incoming_calls(&self.db, file, offset) {
+            let caller = call.from.name.as_str().to_string();
+            for range in call.from_ranges {
+                if let Some(loc) = self.loc(call.from.file, range.start(), &caller, "call") {
+                    out.push(loc);
+                }
+            }
+        }
+        dedupe(&mut out);
+        out
+    }
+
     /// Map a (file, byte offset) to a project-relative `Loc`, or `None` if the
-    /// file is outside the reporting scope (see [`Self::scope`]). Every ty
-    /// location carries [`Source::Ty`].
+    /// file is outside the reporting scope (see [`Self::scope`]).
     fn loc(&self, file: File, offset: TextSize, kind: &str, role: &'static str) -> Option<Loc> {
         let path = self.rel_path(file)?;
         let text = source_text(&self.db, file);
@@ -67,7 +183,6 @@ impl TyResolver {
             col,
             kind: kind.to_string(),
             role,
-            source: Source::Ty,
             resolves_to: None,
         })
     }
@@ -154,6 +269,37 @@ impl Resolver for TyResolver {
         dedupe(&mut out);
         Ok(out)
     }
+}
+
+/// Source roots declared via pytest's `[tool.pytest.ini_options] pythonpath` in
+/// `<project_root>/pyproject.toml`. `pythonpath` may be a string or a list; `.`
+/// (the project root, already a search path) is dropped. Returns paths verbatim
+/// (relative to the project root) for ty to resolve. Best-effort: any read/parse
+/// failure yields an empty list rather than erroring the whole query.
+fn pytest_pythonpath(project_root: &str) -> Vec<String> {
+    let path = std::path::Path::new(project_root).join("pyproject.toml");
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return Vec::new();
+    };
+    // Top-level document is a table; `Value`'s `FromStr` parses a single value.
+    let Ok(doc) = text.parse::<toml::Table>() else {
+        return Vec::new();
+    };
+    let pp = doc
+        .get("tool")
+        .and_then(|t| t.get("pytest"))
+        .and_then(|p| p.get("ini_options"))
+        .and_then(|i| i.get("pythonpath"));
+    let mut out = Vec::new();
+    match pp {
+        Some(toml::Value::String(s)) => out.push(s.clone()),
+        Some(toml::Value::Array(arr)) => {
+            out.extend(arr.iter().filter_map(|v| v.as_str().map(str::to_owned)));
+        }
+        _ => {}
+    }
+    out.retain(|p| p != "." && p != "./" && !p.is_empty());
+    out
 }
 
 fn reference_kind(kind: ty_ide::ReferenceKind) -> &'static str {

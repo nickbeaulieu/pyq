@@ -1,6 +1,6 @@
 //! End-to-end tests: run the built `pyq` binary against `examples/sample` and
-//! assert on the JSON envelope. Covers the dispatch wiring, the unified engine
-//! (ty ∪ syntactic) and its `--syntactic` debug filter, and the shared shape.
+//! assert on the JSON envelope. Covers the dispatch wiring, the one resolver
+//! contract (locate-then-resolve, no engine exposed), and the shared shape.
 
 use serde_json::Value;
 use std::path::PathBuf;
@@ -77,23 +77,24 @@ fn envelope_has_the_shared_shape() {
     );
 }
 
-// The query block is uniform across verbs: every one carries kind, target
-// (null where there's no single target), and engine — so an agent can branch
-// on query.engine / query.target without per-verb special-casing.
+// The query block is uniform across verbs: kind, target (null where there's no
+// single target), and the resolved root — and never an engine name, since the
+// caller doesn't choose one.
 #[test]
 fn query_block_is_uniform_across_verbs() {
-    for (args, engine) in [
-        (vec!["refs", "User"], "unified"),
-        (vec!["defs", "User", "--syntactic"], "syntactic"),
-        (vec!["inputs"], "syntactic"),
-        (vec!["imports"], "syntactic"),
+    for args in [
+        vec!["refs", "User"],
+        vec!["defs", "User"],
+        vec!["inputs"],
+        vec!["imports"],
     ] {
         let (env, ok) = run_json(&args);
         assert!(ok, "{args:?}");
         let q = &env["query"];
         assert!(q.get("kind").is_some(), "kind missing: {args:?}");
         assert!(q.get("target").is_some(), "target key missing (null ok): {args:?}");
-        assert_eq!(q["engine"], engine, "engine for {args:?}");
+        assert!(q.get("root").is_some(), "root missing: {args:?}");
+        assert!(q.get("engine").is_none(), "engine must not leak: {args:?}");
     }
 }
 
@@ -106,19 +107,6 @@ fn query_echoes_the_resolved_absolute_root() {
     let root = env["query"]["root"].as_str().expect("root in query");
     assert!(root.starts_with('/'), "root should be absolute: {root}");
     assert!(root.ends_with("examples/sample"), "root: {root}");
-}
-
-// The --syntactic debug path can't see attribute-access calls, so it flags that
-// a count may be incomplete rather than letting a bare 0 read as ground truth.
-#[test]
-fn syntactic_refs_warns_about_attribute_blind_spot() {
-    let (env, ok) = run_json(&["refs", "User", "--syntactic"]);
-    assert!(ok);
-    let warnings = env["warnings"].as_array().expect("warnings present");
-    assert!(
-        warnings.iter().any(|w| w.as_str().unwrap().contains("attribute-access")),
-        "syntactic refs should flag the attribute blind spot: {env}"
-    );
 }
 
 #[test]
@@ -144,8 +132,8 @@ fn inputs_surfaces_env_files_args_and_settings() {
 }
 
 #[test]
-fn defs_syntactic_finds_function_and_import_binding() {
-    let (env, ok) = run_json(&["defs", "make_user", "--syntactic"]);
+fn defs_finds_function_and_import_binding() {
+    let (env, ok) = run_json(&["defs", "make_user"]);
     assert!(ok);
     assert_eq!(env["query"]["kind"], "defs");
     let locs = locs(&env);
@@ -172,12 +160,27 @@ fn dotted_symbol_resolves_by_last_component() {
     assert!(dotted["summary"].as_str().unwrap().contains("pkg.models.User"));
 }
 
+// Regression: on a source-rooted layout (pyproject `pythonpath = ["src"]`, so
+// first-party code imports `helpers.validators` by bare name), a symbol used
+// across the bare-path import must still resolve to its def + import + call —
+// not silently under-report as ty alone once did (def-only).
 #[test]
-fn refs_via_ty_span_multiple_files() {
+fn refs_resolve_across_source_root_bare_imports() {
+    let (env, ok) = run_json_in(&fixture("pythonpath_root"), &["refs", "valid_email"]);
+    assert!(ok);
+    let files: std::collections::HashSet<_> = locs(&env)
+        .iter()
+        .map(|l| l.split(':').next().unwrap().to_string())
+        .collect();
+    assert!(files.contains("src/helpers/validators.py"), "the def: {env}");
+    assert!(files.contains("src/app.py"), "the bare-path use: {env}");
+    assert!(env["count"].as_u64().unwrap() >= 3, "{env}");
+}
+
+#[test]
+fn refs_span_multiple_files() {
     let (env, ok) = run_json(&["refs", "User"]);
     assert!(ok);
-    // Default is the merged engine, not a ty-only fork.
-    assert_eq!(env["query"]["engine"], "unified");
     let files: std::collections::HashSet<_> = locs(&env)
         .iter()
         .map(|l| l.split(':').next().unwrap().to_string())
@@ -187,22 +190,19 @@ fn refs_via_ty_span_multiple_files() {
     assert!(files.contains("app.py"));
 }
 
-// The unification: `defs` is ONE answer with a `role`, not two engines that
-// disagree. ty supplies the canonical definition; the syntactic scan supplies
-// the `import` binding that re-binds the name, pointed at the canonical def via
-// `resolves_to`. An agent filters `role == "definition"` for the origin.
+// `defs` is ONE answer with a `role`. The canonical definition and the `import`
+// binding that re-binds the name come back together; the binding points at the
+// canonical def via `resolves_to`. An agent filters `role == "definition"`.
 #[test]
-fn defs_unified_tags_definition_and_binding() {
+fn defs_tags_definition_and_binding() {
     let (env, ok) = run_json(&["defs", "make_user"]);
     assert!(ok);
-    assert_eq!(env["query"]["engine"], "unified");
     let results = env["results"].as_array().unwrap();
 
     let def = results
         .iter()
         .find(|r| r["role"] == "definition")
         .expect("a canonical definition");
-    assert_eq!(def["source"], "ty");
     assert!(def["loc"].as_str().unwrap().starts_with("pkg/models.py"));
 
     let binding = results
@@ -214,28 +214,19 @@ fn defs_unified_tags_definition_and_binding() {
     assert_eq!(binding["resolves_to"], def["loc"]);
 }
 
-// Regression (P1 silent-zero): ty cannot see function-local variables and
-// returns 0 — which reads as "unused / safe to delete." The merged engine
-// fills that blind spot from the syntactic scan and FLAGS it as over-
-// approximate, so the count is honest. `admin` is local to app.py's `main`.
+// Regression (P1 silent-zero): ty cannot see function-local variables on its own
+// and would return 0 — which reads as "unused / safe to delete." Locate-then-
+// resolve anchors ty at the local's offset, so a used local resolves precisely.
+// `admin` is local to app.py's `main`.
 #[test]
-fn refs_finds_function_local_via_syntactic_fallback() {
+fn refs_finds_function_local() {
     let (env, ok) = run_json(&["refs", "admin"]);
     assert!(ok);
     assert!(
         env["count"].as_u64().unwrap() >= 1,
         "a used local must not report 0: {env}"
     );
-    let results = env["results"].as_array().unwrap();
-    assert!(
-        results.iter().all(|r| r["source"] == "syntactic"),
-        "ty is blind to locals, so these come from the syntactic scan: {env}"
-    );
-    let warnings = env["warnings"].as_array().expect("warnings present");
-    assert!(
-        warnings.iter().any(|w| w.as_str().unwrap().contains("syntactic-only")),
-        "over-approximation must be flagged: {env}"
-    );
+    assert!(locs(&env).iter().all(|l| l.starts_with("app.py")));
 }
 
 // Regression: every call is a reference, so `callers ⊆ refs`. For an aliased
@@ -294,11 +285,7 @@ fn callers_via_ty_finds_the_call_site() {
 // that an agent would read as "this name is unused."
 #[test]
 fn empty_symbol_is_a_usage_error() {
-    for args in [
-        vec!["defs", ""],
-        vec!["refs", "   ", "--syntactic"],
-        vec!["callers", ""],
-    ] {
+    for args in [vec!["defs", ""], vec!["refs", "   "], vec!["callers", ""]] {
         let out = Command::new(env!("CARGO_BIN_EXE_pyq"))
             .args(&args)
             .arg("--root")
@@ -316,7 +303,7 @@ fn empty_symbol_is_a_usage_error() {
 
 #[test]
 fn unknown_symbol_is_zero_results_not_an_error() {
-    let (env, ok) = run_json(&["defs", "NoSuchSymbolAnywhere", "--syntactic"]);
+    let (env, ok) = run_json(&["defs", "NoSuchSymbolAnywhere"]);
     assert!(ok, "an unknown symbol should exit 0");
     assert_eq!(env["count"].as_u64().unwrap(), 0);
 }
@@ -457,7 +444,7 @@ fn broken_file_still_answers_for_pre_error_statements() {
         labels(&inputs)
     );
 
-    let (defs, ok) = run_json_in(&root, &["defs", "alpha", "--syntactic"]);
+    let (defs, ok) = run_json_in(&root, &["defs", "alpha"]);
     assert!(ok);
     assert!(labels(&defs).iter().any(|l| l == "function"));
 }

@@ -1293,6 +1293,7 @@ dependencies = [
  "pyq-index",
  "ruff_db",
  "ruff_text_size",
+ "toml",
  "ty_ide",
  "ty_project",
 ]

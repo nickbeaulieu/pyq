@@ -35,13 +35,13 @@ pyq imports --cycles          # import cycles among project modules
 
 ### Verbs
 
-| Verb | Answers | Engine |
-|------|---------|--------|
-| `refs <symbol>` | Every reference (reads, writes, calls) to a symbol, cross-file. | unified |
-| `callers <symbol>` | Every call site of a symbol. | unified |
-| `defs <symbol>` | Every definition (function/class/variable/import binding), each tagged `role` (`definition`/`binding`) and `source`. | unified |
-| `inputs` | What the code needs to run: env vars, literal files opened, CLI args (argparse/click), pydantic settings fields. | syntactic |
-| `imports [module]` | The import graph. No arg: every edge. With a module: what it imports; `--reverse`: who imports it (blast radius); `--cycles`: import cycles. Accepts a module name or a file path. | syntactic |
+| Verb | Answers |
+|------|---------|
+| `refs <symbol>` | Every reference (reads, writes, calls) to a symbol, cross-file. |
+| `callers <symbol>` | Every call site of a symbol. |
+| `defs <symbol>` | Every definition (function/class/variable/import binding), each tagged `role` (`definition`/`binding`); a `binding` points at its canonical def via `resolves_to`. |
+| `inputs` | What the code needs to run: env vars, literal files opened, CLI args (argparse/click), pydantic settings fields. |
+| `imports [module]` | The import graph. No arg: every edge. With a module: what it imports; `--reverse`: who imports it (blast radius); `--cycles`: import cycles. Accepts a module name or a file path. |
 
 ### Flags
 
@@ -52,29 +52,24 @@ All flags are global (accepted before or after the verb).
 | `--root <dir>` | Directory to scan. Defaults to the current directory. |
 | `--json` | Emit the compact single-line JSON envelope. |
 | `--pretty` | Emit indented JSON. |
-| `--syntactic` | Debug filter: answer `refs`/`callers`/`defs` from the syntactic scan alone, skipping ty. The fallback for when ty can't build (or to compare what each engine sees) — not a different question. |
 
-## One engine, two halves
+## One answer per verb
 
-`refs`/`callers`/`defs` run a single **unified** engine — not a fork you choose
-between. It merges two halves with complementary blind spots, so a `0` from one
-half's limitation can't masquerade as truth:
+`refs`/`callers`/`defs` run a single engine — there is no flag to choose, and the
+output never names one. Under the hood it's *locate-then-resolve*: a one-parse
+syntactic index locates every place a name is bound or used — including
+function-locals, parameters, and `import` bindings a name-level symbol table
+never surfaces — and ty resolves each precise location semantically (real
+binding through imports, re-exports, and aliasing, scope-aware). So every result
+is exact; there's no over-approximate tier to disclose.
 
-- **ty** — drives ty's project-wide semantic engine for real cross-file binding
-  through imports, re-exports, and aliasing. Authoritative where it resolves.
-  All ty contact is confined to `pyq-resolve`'s `ty_backed` module.
-- **syntactic** — one parse per file via `ruff_python_parser`, matching names
-  within a module. Covers what ty structurally can't: function-local variables
-  and `import` bindings. Parse errors are non-fatal, so a half-edited file still
-  answers. No project database.
+Results carry a `role` (`definition`/`binding`/`reference`/`call`); a `binding`,
+and any use of an ambiguous (same-named) symbol, points at its canonical def via
+`resolves_to`. `inputs`/`imports` are pure syntactic facts, over-approximate by
+design: computed env keys or paths bucket to `<dynamic>` rather than guess.
 
-Every result carries a `source` (`ty`/`syntactic`) and a `role`
-(`definition`/`binding`/`reference`/`call`); a `binding` points at its canonical
-def via `resolves_to`. When a result comes only from the syntactic scan (ty
-couldn't resolve it), the envelope's `warnings` say so — over-approximate-and-
-flagged beats silently-precise-and-wrong. `inputs`/`imports` are pure syntactic
-facts (no resolver), over-approximate by design: computed env keys or paths
-bucket to `<dynamic>` rather than guess.
+A qualified query (`pkg.mod.User`) resolves by its leaf today (every `User`, each
+tagged with its def); scoping the qualifier to one def is a planned addition.
 
 ## Output envelope
 

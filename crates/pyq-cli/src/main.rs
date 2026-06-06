@@ -11,7 +11,7 @@ mod walk;
 use clap::{Parser, Subcommand};
 use pyq_index::{extract, FileIndex, InputKind};
 use pyq_output::{Channel, Envelope};
-use pyq_resolve::{Loc, Resolver, Source, SyntacticResolver, UnifiedResolver};
+use pyq_resolve::{Loc, Resolver, UnifiedResolver};
 use serde_json::json;
 use std::process::ExitCode;
 
@@ -32,12 +32,6 @@ struct Cli {
     /// Root directory to scan (defaults to the current directory).
     #[arg(long, global = true, default_value = ".")]
     root: String,
-
-    /// Debug filter: answer from the syntactic AST scan alone, skipping ty.
-    /// The default merges both engines into one answer — this is the fallback
-    /// for when ty can't build (or for comparing what each engine sees).
-    #[arg(long, global = true)]
-    syntactic: bool,
 }
 
 #[derive(Subcommand)]
@@ -134,8 +128,8 @@ fn dispatch(cli: &Cli) -> anyhow::Result<Envelope> {
     Ok(envelope)
 }
 
-/// Run one symbol query through the resolver and build the uniform envelope.
-/// Default engine is `unified` (ty ∪ syntactic); `--syntactic` skips ty.
+/// Run one symbol query through the resolver and build the envelope. One engine,
+/// one answer — the caller never sees ty vs. the syntactic locator behind it.
 fn resolve(
     cli: &Cli,
     symbol: &str,
@@ -143,54 +137,12 @@ fn resolve(
     query: fn(&dyn Resolver, &str) -> anyhow::Result<Vec<Loc>>,
 ) -> anyhow::Result<Envelope> {
     let files = walk::index_tree(&cli.root)?;
-    let (engine, locs) = if cli.syntactic {
-        let r = SyntacticResolver::new(files);
-        ("syntactic", query(&r, base_name(symbol))?)
-    } else {
-        let scope = walk::walked_py_files(&cli.root);
-        let r = UnifiedResolver::new(&cli.root, files, scope)?;
-        ("unified", query(&r, base_name(symbol))?)
-    };
+    let scope = walk::walked_py_files(&cli.root);
+    let resolver = UnifiedResolver::new(&cli.root, files, scope)?;
+    let locs = query(&resolver, symbol)?;
     let results = locs.iter().map(loc_to_json).collect::<Vec<_>>();
-    let warnings = warnings_for(kind, engine, &locs);
-    let summary = format!("{} {} of `{}` ({engine})", results.len(), kind, symbol);
-    Ok(
-        Envelope::new(json!({ "kind": kind, "target": symbol, "engine": engine }), results)
-            .with_summary(summary)
-            .with_warnings(warnings),
-    )
-}
-
-/// Flag results an agent shouldn't read as ground truth without a second look:
-/// syntactic-only hits on a unified query are over-approximate name matches ty
-/// couldn't confirm (and, conversely, the only thing covering ty's blind spots).
-fn warnings_for(kind: &str, engine: &str, locs: &[Loc]) -> Vec<String> {
-    let mut w = Vec::new();
-    if !matches!(kind, "refs" | "callers") {
-        return w;
-    }
-    if engine == "unified" {
-        let syn = locs.iter().filter(|l| l.source == Source::Syntactic).count();
-        if syn > 0 {
-            w.push(format!(
-                "{syn} of {} result(s) are syntactic-only (over-approximate name \
-                 match; ty did not resolve them)",
-                locs.len()
-            ));
-        }
-    } else if engine == "syntactic" {
-        // The syntactic scan matches bare names only — never attribute-access
-        // calls (`obj.method()`). So a 0/low count here may be incomplete; the
-        // default unified engine sees those. Flag it so the debug path's bare
-        // count isn't mistaken for ground truth.
-        w.push(
-            "syntactic engine: attribute-access calls (obj.method()) are not \
-             matched — a 0 or low count may be incomplete; the default unified \
-             engine covers them"
-                .to_string(),
-        );
-    }
-    w
+    let summary = format!("{} {} of `{}`", results.len(), kind, symbol);
+    Ok(Envelope::new(json!({ "kind": kind, "target": symbol }), results).with_summary(summary))
 }
 
 fn loc_to_json(loc: &Loc) -> serde_json::Value {
@@ -198,7 +150,6 @@ fn loc_to_json(loc: &Loc) -> serde_json::Value {
         "loc": format!("{}:{}:{}", loc.path, loc.line, loc.col),
         "label": loc.kind,
         "role": loc.role,
-        "source": loc.source.as_str(),
     });
     if let Some(target) = &loc.resolves_to {
         v["resolves_to"] = json!(target);
@@ -224,13 +175,8 @@ fn query_inputs(files: &[FileIndex]) -> Envelope {
         }
     }
     let summary = format!("{} inputs", results.len());
-    // Uniform query schema: every verb echoes kind + target (null where none) +
-    // engine. `inputs` is a pure syntactic fact, with no single queried target.
-    Envelope::new(
-        json!({ "kind": "inputs", "target": null, "engine": "syntactic" }),
-        results,
-    )
-    .with_summary(summary)
+    // Uniform query schema: every verb echoes kind + target (null where none).
+    Envelope::new(json!({ "kind": "inputs", "target": null }), results).with_summary(summary)
 }
 
 /// The project import graph. Modes: cycles, reverse deps, forward deps, or —
@@ -260,7 +206,7 @@ fn query_imports(
         }
         let summary = format!("{} import {}", results.len(), plural(results.len(), "cycle"));
         return Envelope::new(
-            json!({ "kind": "imports", "mode": "cycles", "target": null, "engine": "syntactic" }),
+            json!({ "kind": "imports", "mode": "cycles", "target": null }),
             results,
         )
         .with_summary(summary);
@@ -315,8 +261,8 @@ fn query_imports(
 
     rows.sort_by(|a, b| a.0.cmp(&b.0));
     let results = rows.into_iter().map(|(_, v)| v).collect::<Vec<_>>();
-    // Uniform schema: kind + target (null for the whole-graph listing) + engine.
-    let mut query = json!({ "kind": "imports", "mode": mode, "target": target, "engine": "syntactic" });
+    // Uniform schema: kind + target (null for the whole-graph listing).
+    let mut query = json!({ "kind": "imports", "mode": mode, "target": target });
     if let Some(found) = found {
         query["found"] = json!(found);
     }
@@ -325,13 +271,6 @@ fn query_imports(
 
 fn loc_str(file: &str, pos: pyq_index::Pos) -> String {
     format!("{}:{}:{}", file, pos.line, pos.col)
-}
-
-/// The bare identifier of a possibly-qualified symbol: `scoring.models.Call` →
-/// `Call`. Python identifiers have no dots, so an agent reaching for the dotted
-/// path still resolves (over-approximately, by last component) instead of 0.
-fn base_name(symbol: &str) -> &str {
-    symbol.rsplit('.').next().unwrap_or(symbol)
 }
 
 fn plural(n: usize, word: &str) -> String {

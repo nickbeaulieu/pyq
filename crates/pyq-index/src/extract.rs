@@ -160,6 +160,7 @@ impl<'src> Collector<'src> {
             name: name.to_string(),
             kind,
             pos: self.pos(offset),
+            offset: offset.to_u32(),
             nested: self.depth > 0,
         });
     }
@@ -278,6 +279,7 @@ impl<'src, 'ast> Visitor<'ast> for Collector<'src> {
                 self.refs.push(Ref {
                     name: n.id.as_str().to_string(),
                     pos: self.pos(n.start()),
+                    offset: n.start().to_u32(),
                     is_call: true,
                 });
                 for arg in call.arguments.args.iter() {
@@ -294,6 +296,7 @@ impl<'src, 'ast> Visitor<'ast> for Collector<'src> {
                 self.refs.push(Ref {
                     name: n.id.as_str().to_string(),
                     pos: self.pos(n.start()),
+                    offset: n.start().to_u32(),
                     is_call: false,
                 });
             }
