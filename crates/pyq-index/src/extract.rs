@@ -5,7 +5,7 @@
 //! agent is mid-edit on should still answer queries).
 
 use ruff_python_ast::visitor::{walk_expr, walk_stmt, Visitor};
-use ruff_python_ast::{Expr, ExprContext, PySourceType, Stmt, StmtClassDef};
+use ruff_python_ast::{CmpOp, Expr, ExprContext, PySourceType, Stmt, StmtClassDef};
 use ruff_python_parser::parse_unchecked_source;
 use ruff_text_size::{Ranged, TextSize};
 
@@ -71,6 +71,10 @@ impl<'src> Collector<'src> {
 
     /// Detect env-var reads and literal file opens. Syntactic and
     /// over-approximate: computed keys/paths become `<dynamic>` or are skipped.
+    ///
+    /// Env matching is suffix-based so it follows the common aliases — bare
+    /// `getenv(...)`/`o.getenv(...)` (`import os as o`), and `environ[...]` /
+    /// `environ.get(...)` (`from os import environ`) — not just `os.*`.
     fn collect_input(&mut self, expr: &Expr) {
         match expr {
             Expr::Call(call) => {
@@ -78,11 +82,17 @@ impl<'src> Collector<'src> {
                     return;
                 };
                 let first = call.arguments.args.first();
+                // env reads: getenv(...), environ.get(...), and
+                // environ.setdefault(...) (a read-with-fallback like .get).
+                if is_getenv(&callee)
+                    || callee.ends_with("environ.get")
+                    || callee.ends_with("environ.setdefault")
+                {
+                    let value = literal_str(first).unwrap_or_else(|| "<dynamic>".into());
+                    self.push_input(InputKind::Env, value, expr.range().start());
+                    return;
+                }
                 match callee.as_str() {
-                    "os.getenv" | "getenv" | "os.environ.get" => {
-                        let value = literal_str(first).unwrap_or_else(|| "<dynamic>".into());
-                        self.push_input(InputKind::Env, value, expr.range().start());
-                    }
                     "open" | "io.open" => {
                         if let Some(path) = literal_str(first) {
                             self.push_input(InputKind::File, path, expr.range().start());
@@ -101,8 +111,19 @@ impl<'src> Collector<'src> {
                     _ => {}
                 }
             }
-            Expr::Subscript(sub) if dotted_name(&sub.value).as_deref() == Some("os.environ") => {
+            Expr::Subscript(sub) if is_environ(dotted_name(&sub.value).as_deref()) => {
                 let value = match sub.slice.as_ref() {
+                    Expr::StringLiteral(s) => s.value.to_str().to_string(),
+                    _ => "<dynamic>".into(),
+                };
+                self.push_input(InputKind::Env, value, expr.range().start());
+            }
+            // Membership tests: `"KEY" in os.environ` / `"KEY" not in os.environ`.
+            Expr::Compare(cmp)
+                if matches!(cmp.ops.first(), Some(CmpOp::In | CmpOp::NotIn))
+                    && is_environ(cmp.comparators.first().and_then(dotted_name).as_deref()) =>
+            {
+                let value = match cmp.left.as_ref() {
                     Expr::StringLiteral(s) => s.value.to_str().to_string(),
                     _ => "<dynamic>".into(),
                 };
@@ -159,6 +180,13 @@ impl<'src, 'ast> Visitor<'ast> for Collector<'src> {
                     if let Expr::Name(n) = target {
                         self.push_def(n.id.as_str(), DefKind::Variable, n.start());
                     }
+                }
+                // `env = os.environ` binds the whole mapping; the keys read
+                // through it later are unknown, so flag the dependency.
+                if matches!(a.value.as_ref(), Expr::Attribute(_) | Expr::Name(_))
+                    && is_environ(dotted_name(&a.value).as_deref())
+                {
+                    self.push_input(InputKind::Env, "<dynamic>".into(), a.value.range().start());
                 }
             }
             Stmt::Import(i) => {
@@ -225,6 +253,18 @@ impl<'src, 'ast> Visitor<'ast> for Collector<'src> {
         }
         walk_expr(self, expr);
     }
+}
+
+/// A `getenv` callee, following the `import os as o` / `from os import getenv`
+/// aliases: bare `getenv` or any `*.getenv`.
+fn is_getenv(callee: &str) -> bool {
+    callee == "getenv" || callee.ends_with(".getenv")
+}
+
+/// Whether a dotted name refers to `environ`, following `from os import environ`
+/// (bare `environ`) and `import os`/`import os as o` (`*.environ`).
+fn is_environ(dotted: Option<&str>) -> bool {
+    matches!(dotted, Some(d) if d == "environ" || d.ends_with(".environ"))
 }
 
 /// The dotted path of an attribute/name chain (`os.environ.get`), or `None`

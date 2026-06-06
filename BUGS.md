@@ -7,44 +7,6 @@ Severity: **P1** correctness, **P2** misleading output, **P3** UX/minor.
 
 ---
 
-## P2 — `inputs` misses `in os.environ` membership tests
-`scoring/management/commands/ephemeral_bootstrap_db.py:99`:
-
-```python
-if 'DJANGO_SUPERUSER_PASSWORD' not in os.environ:
-```
-
-`inputs` catches `os.environ['X']` and `os.environ.get('X')` but not
-`'X' in os.environ` / `not in`. A real env dependency the surface misses.
-
-## P2 — `inputs` misses `os.environ.setdefault(...)` — incl. DJANGO_SETTINGS_MODULE
-Of 15 env-access sites in the repo, `inputs` caught 7 and missed every
-`setdefault`. That pattern appears 5× and sets `DJANGO_SETTINGS_MODULE` at every
-entrypoint:
-
-```
-manage.py:6              os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'salessync.settings')
-salessync/wsgi.py:23     os.environ.setdefault('DJANGO_SETTINGS_MODULE', ...)
-salessync/celery.py:12   os.environ.setdefault('DJANGO_SETTINGS_MODULE', ...)
-mcp_server/main.py:14    os.environ.setdefault('DJANGO_SETTINGS_MODULE', ...)
-celeryhealthcheck/app.py:42  os.environ.setdefault('DJANGO_SETTINGS_MODULE', ...)
-```
-
-`DJANGO_SETTINGS_MODULE` is *the* "what does this need to run" env var for a
-Django app — exactly `inputs`' purpose — and it's invisible. `setdefault(key,
-default)` is a read-with-fallback (semantically like `.get(key, default)`) and
-should be captured.
-
-## P3 — `inputs` env detection doesn't follow `from os import environ` alias
-`sara/tests/test_handle_mroi_event.py:3048  environ.get('test_case')` is missed.
-Detection is attribute-matched on `os.environ`/`os.getenv`; a module imported as
-`from os import environ` (or `import os as o`) escapes it. Over-approximate
-suffix-matching (any `.environ`/`environ.get`) or tracking the import alias would
-close it. (Edge: `env_vars = os.environ` whole-dict binds expose unknown keys —
-candidate for an `env <dynamic>` flag.)
-
----
-
 ## P3 — Qualified/dotted names return 0
 `pyq defs scoring.models.Call` → 0, while `pyq defs Call` works. An agent will
 naturally reach for the dotted path. Consider stripping to the last component
@@ -232,6 +194,38 @@ Optimize for "an agent can act on this without double-checking."
 
 ---
 
+## P1 — ty returns 0 for function-local variables (and neither engine is a superset)
+A purely function-local variable, used 4× in one function:
+
+```python
+def f():
+    tally = 0
+    tally = tally + 1
+    return tally
+```
+```
+ty        refs tally  → 0     defs tally → 0
+syntactic refs tally  → 2
+```
+
+ty can't see function-local variables at all — silent 0. (Module-level vars do
+work in ty: the earlier `counter` global gave 8 refs.) This violates the
+documented `defs` contract ("function/class/**variable**/import binding") and is
+the dangerous silent-zero again: `refs tally` = 0 reads as "unused."
+
+Crucially this is the **mirror image** of the syntactic attribute-call miss, so
+**neither engine is a superset of the truth**:
+- ty misses function-local variables → 0
+- syntactic misses attribute-access method calls (`obj.save()`) → 0
+
+An agent can't trust a `0` from *either* engine without knowing which blind spot
+applies — and the default (ty) is the one that whiffs on locals. At minimum,
+document each engine's blind spot; better, have `refs`/`defs` fall back to (or
+union with) the syntactic scan for the category the active engine can't see, or
+emit a `warning` when a query targets a kind the engine doesn't cover.
+
+---
+
 ## Confirmed working
 - `callers` labels each call site with its enclosing function (as advertised).
 - Output is deterministic across runs.
@@ -252,3 +246,13 @@ Optimize for "an agent can act on this without double-checking."
   `make_widget`). Re-export through `__init__.py` resolves correctly; `defs`
   points to the single origin. (But `refs` does NOT follow the alias — see the
   P1 above.)
+- Decorators & `@property`: decorator application (`@my_decorator`) counts as a
+  caller; property access (`c.value`) is a read; calls to a decorated method
+  resolve to its def.
+- Star-imports (`from lib import *`) and `try/except ImportError` conditional
+  imports resolve correctly — call sites found, both candidate defs listed.
+- `inputs` detects pydantic `BaseSettings` fields (`setting db_url`, `setting
+  port`).
+- Column numbers are true Unicode **codepoints**, not bytes or UTF-16 units —
+  verified with multibyte (`é`) and astral (`🎉`) chars on the same line. (Many
+  LSP-backed tools leak UTF-16 here; pyq gets it right.)

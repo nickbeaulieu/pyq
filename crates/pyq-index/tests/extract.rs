@@ -79,6 +79,46 @@ open("settings.ini")
 }
 
 #[test]
+fn captures_setdefault_membership_and_aliased_env_access() {
+    let src = r#"
+import os
+from os import environ, getenv
+import os as o
+
+os.environ.setdefault("DJANGO_SETTINGS_MODULE", "app.settings")
+if "DJANGO_SUPERUSER_PASSWORD" not in os.environ:
+    pass
+if "EAGER" in os.environ:
+    pass
+a = environ.get("FROM_ENVIRON_ALIAS")
+b = environ["SUBSCRIPT_ALIAS"]
+c = getenv("BARE_GETENV")
+d = o.getenv("OS_ALIAS_GETENV")
+whole = os.environ
+"#;
+    let idx = extract("entry.py", src);
+    let env: Vec<&str> = idx
+        .inputs
+        .iter()
+        .filter(|i| i.kind == InputKind::Env)
+        .map(|i| i.value.as_str())
+        .collect();
+
+    // setdefault is a read-with-fallback
+    assert!(env.contains(&"DJANGO_SETTINGS_MODULE"), "{env:?}");
+    // membership tests, both `in` and `not in`
+    assert!(env.contains(&"DJANGO_SUPERUSER_PASSWORD"), "{env:?}");
+    assert!(env.contains(&"EAGER"), "{env:?}");
+    // aliased access via `from os import environ` and bare/aliased getenv
+    assert!(env.contains(&"FROM_ENVIRON_ALIAS"), "{env:?}");
+    assert!(env.contains(&"SUBSCRIPT_ALIAS"), "{env:?}");
+    assert!(env.contains(&"BARE_GETENV"), "{env:?}");
+    assert!(env.contains(&"OS_ALIAS_GETENV"), "{env:?}");
+    // whole-dict bind exposes unknown keys → flagged dynamic
+    assert!(env.contains(&"<dynamic>"), "{env:?}");
+}
+
+#[test]
 fn captures_cli_args_and_settings_fields() {
     let src = r#"
 import argparse, click

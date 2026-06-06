@@ -18,13 +18,14 @@ If yes, don't rebuild it — unless we can do it **deeper** (see below).
    `defs`. The grep-replacement: every use/def of a name as data. Pyright computes
    this but only hands it out one position at a time over LSP; there is no clean
    "all callers of X as JSON" CLI. Highest leverage.
-2. **Input / config surface** (`inputs`, shipped) — env reads
-   (`os.getenv`/`os.environ[...]`/`.get`), literal `open()` paths, CLI args
-   (argparse `add_argument`, click `@option`/`@argument`), and pydantic
-   `BaseSettings` fields. Computed keys/paths bucket to `<dynamic>` rather than
-   guess; arg detection is suffix-matched (`.add_argument`/`.option`/
-   `.argument`), so over-approximate by design. Pure AST walk on the syntactic
-   path (no db). "What does this need to run."
+2. **Input / config surface** (`inputs`, shipped) — env reads (`getenv`,
+   `environ[...]`, `environ.get`, `environ.setdefault`, and `"K" in environ`
+   membership tests), literal `open()` paths, CLI args (argparse `add_argument`,
+   click `@option`/`@argument`), and pydantic `BaseSettings` fields. Env matching
+   is suffix-based so it follows the `import os as o` / `from os import environ`
+   aliases; computed keys/paths (and whole-dict `env = os.environ` binds) bucket
+   to `<dynamic>` rather than guess. Over-approximate by design. Pure AST walk on
+   the syntactic path (no db). "What does this need to run."
 3. **Import / dependency graph as data** (`imports`, shipped) — forward deps,
    reverse deps (who imports X, the blast-radius question), and cycles (the
    non-trivial SCCs over internal edges). Syntactic today: files map to dotted
