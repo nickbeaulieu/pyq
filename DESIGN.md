@@ -44,30 +44,41 @@ index we already build:
   tests; which changed files have zero test reachability. (Dynamic half later.)
 
 ## Architecture
-- `pyq-resolve` — cross-file resolution behind the `Resolver` trait, backed by ty
-  (`ty_ide` + `ty_project`). **All ty contact is confined here.** ty is `0.0.x`,
-  so this insulation is load-bearing: pin to a ruff tag (churn becomes a scheduled
-  upgrade, not runtime flake), depend only on the LSP-shaped entry points
-  (`find_references`/`goto_definition`/`all_symbols`/`call_hierarchy`/`rename` —
-  the most stable layer), and if its API moves the blast radius is one crate. The
-  syntactic extractor can back the same trait as a fallback. Costs accepted:
-  larger binary + vendored typeshed, a Salsa db lifecycle, occasional tag-bump
-  migrations.
+- `pyq-resolve` — the `Resolver` trait and its **one shipping impl**,
+  `UnifiedResolver`. There is no user-visible engine fork: it merges ty
+  (`ty_ide` + `ty_project` — authoritative, cross-file, alias-aware) with the
+  syntactic scan from `pyq-index` (ty's blind spots: function-local variables
+  and `import` bindings) into a single answer. Every result is tagged with its
+  `Source` and a `role`, so the caller filters one set instead of choosing
+  between two that disagree — and *neither engine is a superset of the truth*,
+  so running only one leaves a silent-`0` blind spot. ty is authoritative on
+  overlap; syntactic-only hits are flagged (over-approximate). `TyResolver` and
+  `SyntacticResolver` implement the same trait and are usable alone.
+  - **All ty contact is confined to `ty_backed`.** ty is `0.0.x`, so this
+    insulation is load-bearing: pin to a ruff tag (churn becomes a scheduled
+    upgrade, not runtime flake), depend only on the LSP-shaped entry points
+    (`find_references`/`goto_definition`/`all_symbols`/`call_hierarchy`/`rename`
+    — the most stable layer), and if its API moves the blast radius is one
+    module — `SyntacticResolver` still answers. Costs accepted: larger binary +
+    vendored typeshed, a Salsa db lifecycle, occasional tag-bump migrations.
   - *Why ty over `ruff_python_semantic`:* the latter is externally-driven and
     single-module — using it means reimplementing ruff's `Checker` traversal and
     hand-building all cross-file linking. ty ships it correct and project-wide.
 - `pyq-index` — one parse per file (`ruff_python_parser`) → `FileIndex` of defs +
   refs. Parse errors non-fatal (an agent mid-edit still gets answers). Backs the
   cheap, type-free verbs (the `inputs`/config surface) that need no db, and the
-  `Resolver` fallback.
-- `pyq-output` — the one envelope `{ tool, query, summary, count, results }` with
-  human (default, even piped) + `--json`/`--pretty` renderers. Will grow the
-  `--baseline` differential ("did my edit add dead code / new effects") generic
-  over result sets — the question an iterating agent actually asks.
+  syntactic half of `UnifiedResolver`.
+- `pyq-output` — the one envelope `{ tool, query, summary, count, results,
+  warnings }` with human (default, even piped) + `--json`/`--pretty` renderers.
+  `warnings` surfaces what a query couldn't do precisely (an over-approximate
+  match, a blind spot) so a consumer knows when to fall back to reading the file.
+  Will grow the `--baseline` differential ("did my edit add dead code / new
+  effects") generic over result sets — the question an iterating agent asks.
 - `pyq-cli` — clap, verb-per-invocation, `ignore`-based tree walk (respects
-  `.gitignore`). Routes `refs`/`callers`/`defs` through ty (`callers` via
-  `call_hierarchy`, labelling each call site with its enclosing function);
-  `--syntactic` forces the `pyq-index` path.
+  `.gitignore`). Routes `refs`/`callers`/`defs` through `UnifiedResolver`
+  (`callers` via ty's `call_hierarchy`, labelling each call site with its
+  enclosing function); `--syntactic` is a debug filter that skips ty and answers
+  from the syntactic scan alone.
 
 ## Still open
 - **Dynamic tier.** Python's clean seams are `sys.addaudithook` (effect ledger,

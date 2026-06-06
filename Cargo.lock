@@ -1290,6 +1290,7 @@ name = "pyq-resolve"
 version = "0.0.1"
 dependencies = [
  "anyhow",
+ "pyq-index",
  "ruff_db",
  "ruff_text_size",
  "ty_ide",

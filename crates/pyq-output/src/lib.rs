@@ -34,6 +34,11 @@ pub struct Envelope {
     pub summary: String,
     pub count: usize,
     pub results: Vec<Value>,
+    /// Things the query couldn't do precisely — an over-approximate match, a
+    /// blind spot, a skipped path. Surfacing these lets a consumer know when to
+    /// fall back to reading the file. Omitted from JSON when empty.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
 }
 
 impl Envelope {
@@ -44,11 +49,17 @@ impl Envelope {
             summary: String::new(),
             query,
             results,
+            warnings: Vec::new(),
         }
     }
 
     pub fn with_summary(mut self, summary: impl Into<String>) -> Self {
         self.summary = summary.into();
+        self
+    }
+
+    pub fn with_warnings(mut self, warnings: Vec<String>) -> Self {
+        self.warnings = warnings;
         self
     }
 
@@ -73,6 +84,11 @@ impl Envelope {
         }
         if out.is_empty() {
             out.push_str("no results\n");
+        }
+        for w in &self.warnings {
+            out.push_str("! ");
+            out.push_str(w);
+            out.push('\n');
         }
         out
     }

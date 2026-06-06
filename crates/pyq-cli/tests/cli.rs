@@ -1,6 +1,6 @@
 //! End-to-end tests: run the built `pyq` binary against `examples/sample` and
-//! assert on the JSON envelope. Covers the dispatch wiring, both engines (ty
-//! and `--syntactic`), and the shared output shape.
+//! assert on the JSON envelope. Covers the dispatch wiring, the unified engine
+//! (ty ∪ syntactic) and its `--syntactic` debug filter, and the shared shape.
 
 use serde_json::Value;
 use std::path::PathBuf;
@@ -114,11 +114,26 @@ fn defs_syntactic_finds_function_and_import_binding() {
     assert!(labels.iter().any(|l| l == "import"));
 }
 
+// Regression: an agent reaching for a qualified path (pkg.models.User) should
+// resolve by the last component instead of returning a misleading 0.
+#[test]
+fn dotted_symbol_resolves_by_last_component() {
+    let (dotted, ok) = run_json(&["defs", "pkg.models.User"]);
+    assert!(ok);
+    let (bare, ok) = run_json(&["defs", "User"]);
+    assert!(ok);
+    assert_eq!(dotted["count"], bare["count"]);
+    assert!(dotted["count"].as_u64().unwrap() >= 1);
+    // The original qualified input is echoed back in the summary.
+    assert!(dotted["summary"].as_str().unwrap().contains("pkg.models.User"));
+}
+
 #[test]
 fn refs_via_ty_span_multiple_files() {
     let (env, ok) = run_json(&["refs", "User"]);
     assert!(ok);
-    assert_eq!(env["query"]["engine"], "ty");
+    // Default is the merged engine, not a ty-only fork.
+    assert_eq!(env["query"]["engine"], "unified");
     let files: std::collections::HashSet<_> = locs(&env)
         .iter()
         .map(|l| l.split(':').next().unwrap().to_string())
@@ -126,6 +141,57 @@ fn refs_via_ty_span_multiple_files() {
     // `User` is defined in pkg/models.py and used in app.py — cross-file.
     assert!(files.contains("pkg/models.py"));
     assert!(files.contains("app.py"));
+}
+
+// The unification: `defs` is ONE answer with a `role`, not two engines that
+// disagree. ty supplies the canonical definition; the syntactic scan supplies
+// the `import` binding that re-binds the name, pointed at the canonical def via
+// `resolves_to`. An agent filters `role == "definition"` for the origin.
+#[test]
+fn defs_unified_tags_definition_and_binding() {
+    let (env, ok) = run_json(&["defs", "make_user"]);
+    assert!(ok);
+    assert_eq!(env["query"]["engine"], "unified");
+    let results = env["results"].as_array().unwrap();
+
+    let def = results
+        .iter()
+        .find(|r| r["role"] == "definition")
+        .expect("a canonical definition");
+    assert_eq!(def["source"], "ty");
+    assert!(def["loc"].as_str().unwrap().starts_with("pkg/models.py"));
+
+    let binding = results
+        .iter()
+        .find(|r| r["role"] == "binding")
+        .expect("an import binding");
+    assert!(binding["loc"].as_str().unwrap().starts_with("app.py"));
+    // The binding resolves to the single canonical definition.
+    assert_eq!(binding["resolves_to"], def["loc"]);
+}
+
+// Regression (P1 silent-zero): ty cannot see function-local variables and
+// returns 0 — which reads as "unused / safe to delete." The merged engine
+// fills that blind spot from the syntactic scan and FLAGS it as over-
+// approximate, so the count is honest. `admin` is local to app.py's `main`.
+#[test]
+fn refs_finds_function_local_via_syntactic_fallback() {
+    let (env, ok) = run_json(&["refs", "admin"]);
+    assert!(ok);
+    assert!(
+        env["count"].as_u64().unwrap() >= 1,
+        "a used local must not report 0: {env}"
+    );
+    let results = env["results"].as_array().unwrap();
+    assert!(
+        results.iter().all(|r| r["source"] == "syntactic"),
+        "ty is blind to locals, so these come from the syntactic scan: {env}"
+    );
+    let warnings = env["warnings"].as_array().expect("warnings present");
+    assert!(
+        warnings.iter().any(|w| w.as_str().unwrap().contains("syntactic-only")),
+        "over-approximation must be flagged: {env}"
+    );
 }
 
 #[test]

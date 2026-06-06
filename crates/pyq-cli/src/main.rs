@@ -9,9 +9,9 @@ mod graph;
 mod walk;
 
 use clap::{Parser, Subcommand};
-use pyq_index::{extract, DefKind, FileIndex, InputKind};
+use pyq_index::{extract, FileIndex, InputKind};
 use pyq_output::{Channel, Envelope};
-use pyq_resolve::{Loc, Resolver, TyResolver};
+use pyq_resolve::{Loc, Resolver, Source, SyntacticResolver, UnifiedResolver};
 use serde_json::json;
 use std::process::ExitCode;
 
@@ -33,8 +33,9 @@ struct Cli {
     #[arg(long, global = true, default_value = ".")]
     root: String,
 
-    /// Use the single-file syntactic extractor instead of ty's cross-file
-    /// engine. For comparison/fallback; ty is the default for refs/defs.
+    /// Debug filter: answer from the syntactic AST scan alone, skipping ty.
+    /// The default merges both engines into one answer — this is the fallback
+    /// for when ty can't build (or for comparing what each engine sees).
     #[arg(long, global = true)]
     syntactic: bool,
 }
@@ -100,9 +101,9 @@ fn dispatch(cli: &Cli) -> anyhow::Result<Envelope> {
         anyhow::bail!("symbol must not be empty");
     }
 
-    // `inputs` and any verb under `--syntactic` use the single-file extractor;
-    // `refs`/`callers`/`defs` otherwise route through ty's cross-file engine
-    // behind the Resolver trait.
+    // One query path. `inputs`/`imports` are pure syntactic facts; for
+    // `refs`/`callers`/`defs` the Resolver trait merges ty (authoritative,
+    // cross-file) with the syntactic scan (ty's blind spots) into one answer.
     match &cli.command {
         Command::Inputs => {
             let files = walk::index_tree(&cli.root)?;
@@ -116,86 +117,68 @@ fn dispatch(cli: &Cli) -> anyhow::Result<Envelope> {
             let files = walk::index_tree(&cli.root)?;
             Ok(query_imports(&files, module.as_deref(), *reverse, *cycles))
         }
-        Command::Refs { symbol } if cli.syntactic => {
-            let files = walk::index_tree(&cli.root)?;
-            Ok(query_refs(&files, symbol, None))
-        }
-        Command::Callers { symbol } if cli.syntactic => {
-            let files = walk::index_tree(&cli.root)?;
-            Ok(query_refs(&files, symbol, Some(true)))
-        }
-        Command::Defs { symbol } if cli.syntactic => {
-            let files = walk::index_tree(&cli.root)?;
-            Ok(query_defs(&files, symbol))
-        }
-        Command::Refs { symbol } => resolved(&cli.root, symbol, "refs", |r, s| r.references(s)),
-        Command::Callers { symbol } => resolved(&cli.root, symbol, "callers", |r, s| r.callers(s)),
-        Command::Defs { symbol } => resolved(&cli.root, symbol, "defs", |r, s| r.definitions(s)),
+        Command::Refs { symbol } => resolve(cli, symbol, "refs", |r, s| r.references(s)),
+        Command::Callers { symbol } => resolve(cli, symbol, "callers", |r, s| r.callers(s)),
+        Command::Defs { symbol } => resolve(cli, symbol, "defs", |r, s| r.definitions(s)),
     }
 }
 
-/// Run a ty-backed resolver query and build the envelope.
-fn resolved(
-    root: &str,
+/// Run one symbol query through the resolver and build the uniform envelope.
+/// Default engine is `unified` (ty ∪ syntactic); `--syntactic` skips ty.
+fn resolve(
+    cli: &Cli,
     symbol: &str,
     kind: &str,
-    query: fn(&TyResolver, &str) -> anyhow::Result<Vec<Loc>>,
+    query: fn(&dyn Resolver, &str) -> anyhow::Result<Vec<Loc>>,
 ) -> anyhow::Result<Envelope> {
-    let resolver = TyResolver::new(root, walk::walked_py_files(root))?;
-    let locs = query(&resolver, symbol)?;
+    let files = walk::index_tree(&cli.root)?;
+    let (engine, locs) = if cli.syntactic {
+        let r = SyntacticResolver::new(files);
+        ("syntactic", query(&r, base_name(symbol))?)
+    } else {
+        let scope = walk::walked_py_files(&cli.root);
+        let r = UnifiedResolver::new(&cli.root, files, scope)?;
+        ("unified", query(&r, base_name(symbol))?)
+    };
     let results = locs.iter().map(loc_to_json).collect::<Vec<_>>();
-    let summary = format!("{} {} of `{}` (ty, cross-file)", results.len(), kind, symbol);
+    let warnings = warnings_for(kind, engine, &locs);
+    let summary = format!("{} {} of `{}` ({engine})", results.len(), kind, symbol);
     Ok(
-        Envelope::new(json!({ "kind": kind, "symbol": symbol, "engine": "ty" }), results)
-            .with_summary(summary),
+        Envelope::new(json!({ "kind": kind, "target": symbol, "engine": engine }), results)
+            .with_summary(summary)
+            .with_warnings(warnings),
     )
 }
 
+/// Flag results an agent shouldn't read as ground truth without a second look:
+/// syntactic-only hits on a unified query are over-approximate name matches ty
+/// couldn't confirm (and, conversely, the only thing covering ty's blind spots).
+fn warnings_for(kind: &str, engine: &str, locs: &[Loc]) -> Vec<String> {
+    let mut w = Vec::new();
+    if engine == "unified" && matches!(kind, "refs" | "callers") {
+        let syn = locs.iter().filter(|l| l.source == Source::Syntactic).count();
+        if syn > 0 {
+            w.push(format!(
+                "{syn} of {} result(s) are syntactic-only (over-approximate name \
+                 match; ty did not resolve them)",
+                locs.len()
+            ));
+        }
+    }
+    w
+}
+
 fn loc_to_json(loc: &Loc) -> serde_json::Value {
-    json!({
+    let mut v = json!({
         "loc": format!("{}:{}:{}", loc.path, loc.line, loc.col),
         "label": loc.kind,
-    })
-}
-
-/// References to `symbol`. `calls_only = Some(true)` restricts to call sites.
-fn query_refs(files: &[FileIndex], symbol: &str, calls_only: Option<bool>) -> Envelope {
-    let mut results = Vec::new();
-    for f in files {
-        for r in &f.refs {
-            if r.name != symbol {
-                continue;
-            }
-            if calls_only == Some(true) && !r.is_call {
-                continue;
-            }
-            results.push(json!({
-                "loc": format!("{}:{}:{}", f.path, r.pos.line, r.pos.col),
-                "label": if r.is_call { "call" } else { "ref" },
-            }));
-        }
+        "role": loc.role,
+        "source": loc.source.as_str(),
+    });
+    if let Some(target) = &loc.resolves_to {
+        v["resolves_to"] = json!(target);
     }
-    let kind = if calls_only == Some(true) { "callers" } else { "refs" };
-    let summary = format!("{} {} of `{}`", results.len(), kind, symbol);
-    Envelope::new(json!({ "kind": kind, "symbol": symbol }), results).with_summary(summary)
-}
-
-/// Definitions of `symbol`.
-fn query_defs(files: &[FileIndex], symbol: &str) -> Envelope {
-    let mut results = Vec::new();
-    for f in files {
-        for d in &f.defs {
-            if d.name != symbol {
-                continue;
-            }
-            results.push(json!({
-                "loc": format!("{}:{}:{}", f.path, d.pos.line, d.pos.col),
-                "label": format!("{}{}", def_kind_str(d.kind), if d.nested { " (nested)" } else { "" }),
-            }));
-        }
-    }
-    let summary = format!("{} definitions of `{}`", results.len(), symbol);
-    Envelope::new(json!({ "kind": "defs", "symbol": symbol }), results).with_summary(summary)
+    v
 }
 
 /// The external input surface across the tree (syntactic).
@@ -310,20 +293,18 @@ fn loc_str(file: &str, pos: pyq_index::Pos) -> String {
     format!("{}:{}:{}", file, pos.line, pos.col)
 }
 
+/// The bare identifier of a possibly-qualified symbol: `scoring.models.Call` →
+/// `Call`. Python identifiers have no dots, so an agent reaching for the dotted
+/// path still resolves (over-approximately, by last component) instead of 0.
+fn base_name(symbol: &str) -> &str {
+    symbol.rsplit('.').next().unwrap_or(symbol)
+}
+
 fn plural(n: usize, word: &str) -> String {
     if n == 1 {
         word.to_string()
     } else {
         format!("{word}s")
-    }
-}
-
-fn def_kind_str(kind: DefKind) -> &'static str {
-    match kind {
-        DefKind::Function => "function",
-        DefKind::Class => "class",
-        DefKind::Variable => "variable",
-        DefKind::Import => "import",
     }
 }
 

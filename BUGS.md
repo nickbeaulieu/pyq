@@ -5,65 +5,92 @@ Found by exercising the release binary against a large Django repo (`scoring`,
 
 Severity: **P1** correctness, **P2** misleading output, **P3** UX/minor.
 
----
-
-## P3 — Qualified/dotted names return 0
-`pyq defs scoring.models.Call` → 0, while `pyq defs Call` works. An agent will
-naturally reach for the dotted path. Consider stripping to the last component
-or matching the qualified form.
-
-## P3 — JSON envelope `query` block isn't uniform across verbs
-```
-refs/callers/defs : query = {engine, kind, symbol}
-imports <module>  : query = {kind, mode}          # no symbol/module, no engine
-inputs            : query = {kind}
-```
-`results` items are consistently `{label, loc}` (good), but the `query` block
-varies: `engine` appears only for ty verbs, and the queried target is echoed as
-`symbol` for refs/callers/defs yet omitted entirely for `imports <module>`. An
-agent keying off `query.symbol` / `query.engine` can't rely on either. Echo the
-queried target uniformly (e.g. `target`) and include `engine` everywhere.
+(Also exercised against `mroi-matcher` — a `src`-rooted package whose first-party
+imports use bare module names via `pythonpath = ["mroi_matcher"]`.)
 
 ---
 
-## P2 — `defs` means different things in each engine (contract violation)
-The two engines answer different questions under the same verb:
+## ~MOSTLY FIXED via unified engine — ty under-reports source-root (bare-path) imports
+`mroi-matcher` declares `pythonpath = ["mroi_matcher"]`, so first-party code
+imports by bare name (`from helpers.validators import valid_email`). ty discovers
+the project at the repo root, doesn't honor that source root, and on its own
+returned def-only / 0 for the affected symbols (used code looked dead):
 
 ```
-ty  defs Call             → 1   (just `class Call` — the canonical origin)
-syntactic defs Call       → 36  (1 class + 35 `from … import Call` bindings)
+                     OLD (ty)            NOW (unified, ty ∪ syntactic)
+valid_email refs     1 (def only)        4  ✓
+valid_email callers  0                   3  ✓   (grep: 3 real calls)
 ```
 
-The README defines a def as "function/class/variable/**import binding**." ty
-omits import bindings, so the *default* engine under-delivers against its own
-spec; syntactic over-delivers vs ty. `--syntactic` is sold as a
-"comparison/fallback" — implying same-question-shallower — but it returns a 36×
-larger, qualitatively different result set. An agent swapping engines for speed
-gets a different answer, not a degraded-same answer.
+**The `unified` default engine fixes the observable symptom** — syntactic
+name-matching backfills the call sites ty's unresolved imports miss, so `refs`/
+`callers` are no longer silent-zero here. Verified on the current binary.
+
+Residual (lower priority): the underlying ty *resolution* gap remains — unified
+papers over it by name (so it inherits name-collision imprecision rather than
+true resolution), and `settings` vs `helpers.validators` resolving inconsistently
+in ty is still a smell. Honoring a real source root (`[tool.pytest.ini_options]
+pythonpath`, `[tool.ty] extra-paths`/`src.root`, `src`-layout auto-detect, or a
+`--src-root` flag) would let ty resolve these natively and restore precision.
+**Note the `imports` graph does NOT benefit from unified** — see the forward/
+reverse identity P1 below, which is still open.
 
 ---
 
-## P1 — syntactic `refs`/`callers` silently miss ALL attribute-access call sites
-The syntactic engine matches only bare `Name` nodes, never `Attribute` access
-(`obj.method()`). For `save` — a Django model method called everywhere:
+## P1 — `imports` forward vs reverse use different module identities → blast-radius wrong
+On `alice` (Django; apps import each other app-relative, e.g. `from main.models
+import X`), for the *same* module `alice/main/models.py`:
 
 ```
-ty        callers save  → 62
-syntactic callers save  → 0
-syntactic refs   save   → 0
-grep '\.save('          → 469 call sites
+imports alice.main.models            → 28 modules     # forward keys on FILE-DERIVED path
+imports main.models                  → 0 modules      # the spelling the code ACTUALLY uses
+imports alice.main.models --reverse  → 1 importer      # reverse keys on LITERAL import string
+imports main.models      --reverse   → 137 importers   # the real blast radius
 ```
 
-`--syntactic` is advertised as the fast "grep-replacement / fallback," but for
-the most common Python pattern (method calls on an object) it returns **0**, the
-most dangerous possible answer: an agent reads "0 callers" as "dead, safe to
-delete." Worse than grep, not a degraded-grep. Either match attribute accesses
-syntactically (over-approximate, like grep) or make the fallback refuse
-attribute-style queries loudly instead of answering 0.
+Ground truth: `alice.main.models` is written **0** times in the code;
+`main.models` appears **414** times (137 import statements). So forward-deps key
+on the module's file-path-derived name (`alice.main.models`, which nobody
+imports) while reverse-deps key on the literal import string (`main.models`).
+The two halves don't compose, and each returns ~nothing for the other's natural
+input.
 
-Note the *good* side: ty's 62 vs grep's 469 is correct precision — ty resolves
-which `save` (the in-repo model overrides) and doesn't conflate unrelated
-`.save()` on other types. That disambiguation is the real value; don't lose it.
+Worst path: an agent takes the name pyq prints in the edge list
+(`alice.main.models`) and runs `--reverse` to gauge blast radius → **1** → "safe
+to change," when 137 modules actually import it. Same root cause as the
+source-root P1: pyq derives module names relative to the repo root, but the
+project's import namespace is rooted at `alice/`. Any Django/src-root/pythonpath
+repo (i.e. most non-trivial ones) hits this. Fix: resolve both directions to one
+canonical module identity (honor the source root so file-derived names match the
+import strings), and make `imports <name>` accept whichever spelling and map it
+to that identity.
+
+---
+
+## P3 — JSON envelope `query` block isn't fully uniform across verbs
+The queried target is now echoed uniformly as `query.target` (refs/callers/defs
+and `imports <module>`), and `engine` is present on every resolver verb. Residual:
+```
+refs/callers/defs : query = {engine, kind, target}
+imports <module>  : query = {kind, mode, target, found}   # no engine
+inputs / imports  : query = {kind[, mode]}                # no target/engine — none to report
+```
+`engine` is absent on `imports`/`inputs` (they're pure syntactic facts, not a
+resolver query) and `target` is absent where there is none. Tolerable, but for a
+fully uniform schema an agent can branch on blindly, consider emitting `engine`
+everywhere (`"syntactic"` for the fact verbs) and a `null` `target`.
+
+---
+
+## P3 — `--syntactic` debug filter still can't see attribute-access call sites
+The syntactic scan matches only bare `Name` nodes, never `Attribute` access
+(`obj.method()`), so `--syntactic callers save` → 0 where the merged default
+(ty) finds 62. This is no longer the dangerous silent-zero it was: the default
+engine is now `unified` (ty ∪ syntactic), so attribute calls *are* found by
+default, and `--syntactic` is documented as a debug filter (ty skipped), not a
+grep-replacement. Residual nicety: when `--syntactic` answers `refs`/`callers`
+for a name only ever used via attribute access, emit a warning rather than a
+bare 0, since the debug path itself has no over-approximation flag.
 
 ## P1 — `refs` misses alias call sites that `callers` finds (verbs disagree)
 With an aliased import `from pkg.core import make_widget as mw` and two `mw()`
@@ -123,17 +150,20 @@ What I'd want as the actual consumer. Principle: **pyq output is treated as
 ground truth, so every divergence from reality costs more than slowness would.**
 Optimize for "an agent can act on this without double-checking."
 
-1. **One notion of `def`, with a `role`/`kind` field — not two disagreeing
-   engines.** Always return canonical definition(s) *and* import bindings,
-   tagged so I can filter:
+1. ✅ **Done — one notion of `def`, with a `role` field, not two disagreeing
+   engines.** `refs`/`callers`/`defs` now run a single `unified` engine (ty ∪
+   syntactic). Every result is tagged `role` (`definition`/`binding`/
+   `reference`/`call`) and `source` (`ty`/`syntactic`), and a `binding` carries
+   `resolves_to` the canonical def:
    ```json
-   {"loc":"scoring/models.py:1629:7","kind":"class","role":"definition"}
-   {"loc":"ingest/views.py:46:28","kind":"import","role":"binding",
-    "resolves_to":"scoring/models.py:1629:7"}
+   {"loc":"pkg/models.py:5:5","label":"def","role":"definition","source":"ty"}
+   {"loc":"app.py:1:30","label":"import","role":"binding","source":"syntactic",
+    "resolves_to":"pkg/models.py:5:5"}
    ```
-   The 1-vs-36 split becomes one answer I filter (`role=="definition"` → 1).
-   Engine choice should be an implementation detail; `--syntactic` becomes a
-   debug flag, not a semantic fork.
+   The 1-vs-36 split is one answer the caller filters (`role=="definition"`).
+   `--syntactic` is now a debug filter, not a semantic fork. Function-local
+   variables (ty's blind spot) are filled from the syntactic scan and flagged
+   via a `warnings` entry, so a `0` is no longer silently wrong.
 
 2. **Determinism independent of cwd.** Same logical query → same answer from any
    directory. Discover the project once, anchor everything to that root, and put
@@ -159,38 +189,6 @@ Optimize for "an agent can act on this without double-checking."
    reading the list, so it must be de-duplicated and scoped. A doubled worktree
    count silently turns a safe refactor into wasted re-reading, or makes dead
    code look used.
-
----
-
-## P1 — ty returns 0 for function-local variables (and neither engine is a superset)
-A purely function-local variable, used 4× in one function:
-
-```python
-def f():
-    tally = 0
-    tally = tally + 1
-    return tally
-```
-```
-ty        refs tally  → 0     defs tally → 0
-syntactic refs tally  → 2
-```
-
-ty can't see function-local variables at all — silent 0. (Module-level vars do
-work in ty: the earlier `counter` global gave 8 refs.) This violates the
-documented `defs` contract ("function/class/**variable**/import binding") and is
-the dangerous silent-zero again: `refs tally` = 0 reads as "unused."
-
-Crucially this is the **mirror image** of the syntactic attribute-call miss, so
-**neither engine is a superset of the truth**:
-- ty misses function-local variables → 0
-- syntactic misses attribute-access method calls (`obj.save()`) → 0
-
-An agent can't trust a `0` from *either* engine without knowing which blind spot
-applies — and the default (ty) is the one that whiffs on locals. At minimum,
-document each engine's blind spot; better, have `refs`/`defs` fall back to (or
-union with) the syntactic scan for the category the active engine can't see, or
-emit a `warning` when a query targets a kind the engine doesn't cover.
 
 ---
 

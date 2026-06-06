@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use ty_ide::{find_references, incoming_calls, workspace_symbols};
 use ty_project::{ProjectDatabase, ProjectMetadata};
 
-use crate::{Loc, Resolver};
+use crate::{Loc, Resolver, Source};
 
 pub struct TyResolver {
     db: ProjectDatabase,
@@ -55,8 +55,9 @@ impl TyResolver {
     }
 
     /// Map a (file, byte offset) to a project-relative `Loc`, or `None` if the
-    /// file is outside the reporting scope (see [`Self::scope`]).
-    fn loc(&self, file: File, offset: TextSize, kind: &str) -> Option<Loc> {
+    /// file is outside the reporting scope (see [`Self::scope`]). Every ty
+    /// location carries [`Source::Ty`].
+    fn loc(&self, file: File, offset: TextSize, kind: &str, role: &'static str) -> Option<Loc> {
         let path = self.rel_path(file)?;
         let text = source_text(&self.db, file);
         let (line, col) = line_col(text.as_str(), offset.to_usize());
@@ -65,6 +66,9 @@ impl TyResolver {
             line,
             col,
             kind: kind.to_string(),
+            role,
+            source: Source::Ty,
+            resolves_to: None,
         })
     }
 
@@ -93,7 +97,9 @@ impl Resolver for TyResolver {
                 continue;
             };
             for t in targets {
-                if let Some(loc) = self.loc(t.file(), t.range().start(), reference_kind(t.kind())) {
+                if let Some(loc) =
+                    self.loc(t.file(), t.range().start(), reference_kind(t.kind()), "reference")
+                {
                     out.push(loc);
                 }
             }
@@ -108,7 +114,7 @@ impl Resolver for TyResolver {
             for call in incoming_calls(&self.db, file, offset) {
                 let caller = call.from.name.as_str().to_string();
                 for range in call.from_ranges {
-                    if let Some(loc) = self.loc(call.from.file, range.start(), &caller) {
+                    if let Some(loc) = self.loc(call.from.file, range.start(), &caller, "call") {
                         out.push(loc);
                     }
                 }
@@ -122,7 +128,7 @@ impl Resolver for TyResolver {
         let mut out: Vec<Loc> = self
             .exact_symbols(symbol)
             .into_iter()
-            .filter_map(|(file, offset)| self.loc(file, offset, "def"))
+            .filter_map(|(file, offset)| self.loc(file, offset, "def", "definition"))
             .collect();
         dedupe(&mut out);
         Ok(out)

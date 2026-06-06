@@ -37,9 +37,9 @@ pyq imports --cycles          # import cycles among project modules
 
 | Verb | Answers | Engine |
 |------|---------|--------|
-| `refs <symbol>` | Every reference (reads, writes, calls) to a symbol, cross-file. | ty |
-| `callers <symbol>` | Every call site of a symbol. | ty |
-| `defs <symbol>` | Every definition (function/class/variable/import binding). | ty |
+| `refs <symbol>` | Every reference (reads, writes, calls) to a symbol, cross-file. | unified |
+| `callers <symbol>` | Every call site of a symbol. | unified |
+| `defs <symbol>` | Every definition (function/class/variable/import binding), each tagged `role` (`definition`/`binding`) and `source`. | unified |
 | `inputs` | What the code needs to run: env vars, literal files opened, CLI args (argparse/click), pydantic settings fields. | syntactic |
 | `imports [module]` | The import graph. No arg: every edge. With a module: what it imports; `--reverse`: who imports it (blast radius); `--cycles`: import cycles. Accepts a module name or a file path. | syntactic |
 
@@ -52,20 +52,29 @@ All flags are global (accepted before or after the verb).
 | `--root <dir>` | Directory to scan. Defaults to the current directory. |
 | `--json` | Emit the compact single-line JSON envelope. |
 | `--pretty` | Emit indented JSON. |
-| `--syntactic` | Force the single-file syntactic extractor instead of ty (for `refs`/`callers`/`defs`). Faster, no project database, name-matched within a module — a fallback / comparison path. |
+| `--syntactic` | Debug filter: answer `refs`/`callers`/`defs` from the syntactic scan alone, skipping ty. The fallback for when ty can't build (or to compare what each engine sees) — not a different question. |
 
-## Two engines: ty vs. syntactic
+## One engine, two halves
 
-- **ty (default for `refs`/`callers`/`defs`)** — drives ty's project-wide
-  semantic engine for real cross-file binding through imports, re-exports, and
-  aliasing. All ty contact is confined to the `pyq-resolve` crate.
-- **syntactic (`--syntactic`, and always for `inputs`)** — one parse per file
-  via `ruff_python_parser`, matching names within a single module. Parse errors
-  are non-fatal, so a half-edited file still answers. No project database.
+`refs`/`callers`/`defs` run a single **unified** engine — not a fork you choose
+between. It merges two halves with complementary blind spots, so a `0` from one
+half's limitation can't masquerade as truth:
 
-`inputs` is intentionally syntactic and over-approximate: computed env keys or
-paths bucket to `<dynamic>` rather than guess, and CLI-arg detection is
-suffix-matched (`.add_argument`/`.option`/`.argument`).
+- **ty** — drives ty's project-wide semantic engine for real cross-file binding
+  through imports, re-exports, and aliasing. Authoritative where it resolves.
+  All ty contact is confined to `pyq-resolve`'s `ty_backed` module.
+- **syntactic** — one parse per file via `ruff_python_parser`, matching names
+  within a module. Covers what ty structurally can't: function-local variables
+  and `import` bindings. Parse errors are non-fatal, so a half-edited file still
+  answers. No project database.
+
+Every result carries a `source` (`ty`/`syntactic`) and a `role`
+(`definition`/`binding`/`reference`/`call`); a `binding` points at its canonical
+def via `resolves_to`. When a result comes only from the syntactic scan (ty
+couldn't resolve it), the envelope's `warnings` say so — over-approximate-and-
+flagged beats silently-precise-and-wrong. `inputs`/`imports` are pure syntactic
+facts (no resolver), over-approximate by design: computed env keys or paths
+bucket to `<dynamic>` rather than guess.
 
 ## Output envelope
 
