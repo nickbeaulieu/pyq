@@ -155,7 +155,10 @@ fn resolve(
 /// couldn't confirm (and, conversely, the only thing covering ty's blind spots).
 fn warnings_for(kind: &str, engine: &str, locs: &[Loc]) -> Vec<String> {
     let mut w = Vec::new();
-    if engine == "unified" && matches!(kind, "refs" | "callers") {
+    if !matches!(kind, "refs" | "callers") {
+        return w;
+    }
+    if engine == "unified" {
         let syn = locs.iter().filter(|l| l.source == Source::Syntactic).count();
         if syn > 0 {
             w.push(format!(
@@ -164,6 +167,17 @@ fn warnings_for(kind: &str, engine: &str, locs: &[Loc]) -> Vec<String> {
                 locs.len()
             ));
         }
+    } else if engine == "syntactic" {
+        // The syntactic scan matches bare names only — never attribute-access
+        // calls (`obj.method()`). So a 0/low count here may be incomplete; the
+        // default unified engine sees those. Flag it so the debug path's bare
+        // count isn't mistaken for ground truth.
+        w.push(
+            "syntactic engine: attribute-access calls (obj.method()) are not \
+             matched — a 0 or low count may be incomplete; the default unified \
+             engine covers them"
+                .to_string(),
+        );
     }
     w
 }
@@ -199,7 +213,13 @@ fn query_inputs(files: &[FileIndex]) -> Envelope {
         }
     }
     let summary = format!("{} inputs", results.len());
-    Envelope::new(json!({ "kind": "inputs" }), results).with_summary(summary)
+    // Uniform query schema: every verb echoes kind + target (null where none) +
+    // engine. `inputs` is a pure syntactic fact, with no single queried target.
+    Envelope::new(
+        json!({ "kind": "inputs", "target": null, "engine": "syntactic" }),
+        results,
+    )
+    .with_summary(summary)
 }
 
 /// The project import graph. Modes: cycles, reverse deps, forward deps, or —
@@ -228,8 +248,11 @@ fn query_imports(
             }));
         }
         let summary = format!("{} import {}", results.len(), plural(results.len(), "cycle"));
-        return Envelope::new(json!({ "kind": "imports", "mode": "cycles" }), results)
-            .with_summary(summary);
+        return Envelope::new(
+            json!({ "kind": "imports", "mode": "cycles", "target": null, "engine": "syntactic" }),
+            results,
+        )
+        .with_summary(summary);
     }
 
     let mut rows: Vec<(String, serde_json::Value)> = Vec::new();
@@ -281,9 +304,9 @@ fn query_imports(
 
     rows.sort_by(|a, b| a.0.cmp(&b.0));
     let results = rows.into_iter().map(|(_, v)| v).collect::<Vec<_>>();
-    let mut query = json!({ "kind": "imports", "mode": mode });
-    if let Some(t) = target {
-        query["target"] = json!(t);
+    // Uniform schema: kind + target (null for the whole-graph listing) + engine.
+    let mut query = json!({ "kind": "imports", "mode": mode, "target": target, "engine": "syntactic" });
+    if let Some(found) = found {
         query["found"] = json!(found);
     }
     Envelope::new(query, results).with_summary(summary)

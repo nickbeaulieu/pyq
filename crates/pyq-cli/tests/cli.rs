@@ -77,6 +77,39 @@ fn envelope_has_the_shared_shape() {
     );
 }
 
+// The query block is uniform across verbs: every one carries kind, target
+// (null where there's no single target), and engine — so an agent can branch
+// on query.engine / query.target without per-verb special-casing.
+#[test]
+fn query_block_is_uniform_across_verbs() {
+    for (args, engine) in [
+        (vec!["refs", "User"], "unified"),
+        (vec!["defs", "User", "--syntactic"], "syntactic"),
+        (vec!["inputs"], "syntactic"),
+        (vec!["imports"], "syntactic"),
+    ] {
+        let (env, ok) = run_json(&args);
+        assert!(ok, "{args:?}");
+        let q = &env["query"];
+        assert!(q.get("kind").is_some(), "kind missing: {args:?}");
+        assert!(q.get("target").is_some(), "target key missing (null ok): {args:?}");
+        assert_eq!(q["engine"], engine, "engine for {args:?}");
+    }
+}
+
+// The --syntactic debug path can't see attribute-access calls, so it flags that
+// a count may be incomplete rather than letting a bare 0 read as ground truth.
+#[test]
+fn syntactic_refs_warns_about_attribute_blind_spot() {
+    let (env, ok) = run_json(&["refs", "User", "--syntactic"]);
+    assert!(ok);
+    let warnings = env["warnings"].as_array().expect("warnings present");
+    assert!(
+        warnings.iter().any(|w| w.as_str().unwrap().contains("attribute-access")),
+        "syntactic refs should flag the attribute blind spot: {env}"
+    );
+}
+
 #[test]
 fn inputs_surfaces_env_files_args_and_settings() {
     let (env, ok) = run_json(&["inputs"]);

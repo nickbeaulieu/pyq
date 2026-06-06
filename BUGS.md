@@ -38,30 +38,6 @@ targets canonicalize to the file-derived module id, so `main.models` and
 
 ---
 
-## P3 — JSON envelope `query` block isn't fully uniform across verbs
-The queried target is now echoed uniformly as `query.target` (refs/callers/defs
-and `imports <module>`), and `engine` is present on every resolver verb. Residual:
-```
-refs/callers/defs : query = {engine, kind, target}
-imports <module>  : query = {kind, mode, target, found}   # no engine
-inputs / imports  : query = {kind[, mode]}                # no target/engine — none to report
-```
-`engine` is absent on `imports`/`inputs` (they're pure syntactic facts, not a
-resolver query) and `target` is absent where there is none. Tolerable, but for a
-fully uniform schema an agent can branch on blindly, consider emitting `engine`
-everywhere (`"syntactic"` for the fact verbs) and a `null` `target`.
-
----
-
-## P3 — `--syntactic` debug filter still can't see attribute-access call sites
-The syntactic scan matches only bare `Name` nodes, never `Attribute` access
-(`obj.method()`), so `--syntactic callers save` → 0 where the merged default
-(ty) finds 62. This is no longer the dangerous silent-zero it was: the default
-engine is now `unified` (ty ∪ syntactic), so attribute calls *are* found by
-default, and `--syntactic` is documented as a debug filter (ty skipped), not a
-grep-replacement. Residual nicety: when `--syntactic` answers `refs`/`callers`
-for a name only ever used via attribute access, emit a warning rather than a
-bare 0, since the debug path itself has no over-approximation flag.
 
 ## P2 — `callers`/`refs` union over same-named defs with no way to target one
 Two unrelated classes each defining `process`:
