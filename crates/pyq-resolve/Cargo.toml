@@ -1,0 +1,17 @@
+[package]
+name = "pyq-resolve"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ruff_text_size.workspace = true
+anyhow.workspace = true
+
+# The ty stack — pinned to the same ruff tag as the rest. All contact with ty is
+# confined to this crate (the insulation layer): if ty's API churns, the blast
+# radius is here, and the syntactic extractor in pyq-index can back the same
+# trait as a fallback.
+ty_project = { git = "https://github.com/astral-sh/ruff", tag = "0.15.16" }
+ty_ide = { git = "https://github.com/astral-sh/ruff", tag = "0.15.16" }
+ruff_db = { git = "https://github.com/astral-sh/ruff", tag = "0.15.16", features = ["os"] }

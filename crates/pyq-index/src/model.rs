@@ -43,10 +43,31 @@ pub struct Ref {
     pub is_call: bool,
 }
 
+/// An external input the module depends on — part of "what does this need to
+/// run." Syntactic and over-approximate by design (computed keys/paths are
+/// bucketed or omitted, never guessed).
+#[derive(Clone, Debug, Serialize)]
+pub struct Input {
+    pub kind: InputKind,
+    /// The literal name/path, or `<dynamic>` when the key/path is computed.
+    pub value: String,
+    pub pos: Pos,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum InputKind {
+    /// An environment variable read (`os.getenv`, `os.environ[...]`, `.get`).
+    Env,
+    /// A literal filesystem path opened (`open("...")`).
+    File,
+}
+
 /// All facts extracted from one Python module.
 #[derive(Clone, Debug, Serialize)]
 pub struct FileIndex {
     pub path: String,
     pub defs: Vec<Def>,
     pub refs: Vec<Ref>,
+    pub inputs: Vec<Input>,
 }

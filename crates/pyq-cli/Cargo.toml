@@ -11,6 +11,7 @@ path = "src/main.rs"
 [dependencies]
 pyq-index.workspace = true
 pyq-output.workspace = true
+pyq-resolve.workspace = true
 clap.workspace = true
 serde_json.workspace = true
 ignore.workspace = true

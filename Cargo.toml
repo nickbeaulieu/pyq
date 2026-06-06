@@ -4,6 +4,7 @@ members = [
     "crates/pyq-cli",
     "crates/pyq-index",
     "crates/pyq-output",
+    "crates/pyq-resolve",
 ]
 
 [workspace.package]
@@ -17,6 +18,7 @@ repository = "https://github.com/nickbeaulieu/pyq"
 # Internal
 pyq-index = { path = "crates/pyq-index" }
 pyq-output = { path = "crates/pyq-output" }
+pyq-resolve = { path = "crates/pyq-resolve" }
 
 # Python parsing/semantics — pinned to a ruff release tag (not on crates.io).
 ruff_python_parser = { git = "https://github.com/astral-sh/ruff", tag = "0.15.16" }
