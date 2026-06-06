@@ -11,9 +11,10 @@ completed work is logged at the bottom. `→ blocked by #N` marks a dependency.
 - **#12 · `hierarchy` verb — class tree + override map.** Subclasses / supers /
   MRO, abstract methods left unimplemented, and for a base method every override
   (and vice-versa). The high-frequency OO-refactor footgun.
-- **#13 · `tests` verb — test↔code map + fixture graph.** Which tests statically
-  reach which symbols; pytest fixtures, scopes, deps, conftest resolution.
-  Foundation for static change-coverage. (now unblocked: `CallGraph` reverse closure)
+- **#13b · `tests` verb — fixture graph.** The second half of #13: pytest
+  fixtures (`@pytest.fixture` defs), scopes, fixture→fixture deps, and conftest
+  resolution (fixtures visible to sibling/descendant test dirs). Needs new
+  decorator extraction in `pyq-index`. (test↔code map shipped as #13a)
 
 ### P3 — deeper projections / differential
 - **#3 · `deadcode` verb — graph reachability.** Functions/classes reachable from
@@ -70,6 +71,14 @@ completed work is logged at the bottom. `→ blocked by #N` marks a dependency.
 ## Completed
 
 ### Verbs & infrastructure
+- **#13a · `tests` verb — test↔code map.** Which pytest-collected tests
+  statically reach a symbol, as a projection of `CallGraph`'s reverse closure
+  filtered to test nodes (`test_*` functions in `test_*.py`/`*_test.py`, `test_*`
+  methods on `Test*` classes). Each reaching test carries the `via` tree edge and
+  `depth` from the closure. Distinguishes "exists but no test reaches it" (0
+  results) from "no such symbol" (empty roots). The foundation for static change
+  coverage. Fixture graph deferred to #13b. Over-approximate (call-graph
+  reachability) and pytest-default collection rules, both flagged.
 - **#18 · `mock-targets` verb.** Resolve every `mock.patch("a.b.c")` string
   against the project's module/symbol structure and flag *drifted* paths (the
   patch-where-looked-up gotcha — a silently-no-op patch). Built a focused
@@ -77,6 +86,13 @@ completed work is logged at the bottom. `→ blocked by #N` marks a dependency.
   class members) rather than waiting on the full #16 resolution surface.
   High-precision: `drifted` only when the module is first-party and the name is
   provably absent; `external`/`dynamic`/`unverifiable` are reported, not flagged.
+  Hardened against false positives found on real repos (Django manager/inherited
+  members, builtins, nested source roots). Tier-1 third-party: when the tail
+  attribute is on an imported *module*, ty follows the import into typeshed /
+  site-packages and verifies it there (`time.sleep` valid, `time.slep` drift) —
+  gated so it adds no false positives (moved ~60 patches unverifiable→valid
+  across three repos, zero new drifts). Tier-2 (types of values, e.g. boto3
+  clients) deliberately left unverifiable.
 - **#11 · `effects` verb — static effect surface.** Transitive effect surface as
   a projection of `CallGraph`'s forward closure: `fs`/`network`/`subprocess`/
   `env`/`db`/`random`/`clock`/`global` per reachable callable, each attributed to

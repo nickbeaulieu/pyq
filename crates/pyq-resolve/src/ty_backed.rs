@@ -228,6 +228,62 @@ impl TyResolver {
         Some((path, target.focus_range().start().to_u32()))
     }
 
+    /// Whether `member` is a top-level name of the *module* that the binding at
+    /// `(rel_path, offset)` resolves to. This is how `mock-targets` verifies a
+    /// patch whose tail attribute is on an imported module (`patch("m.time.sleep")`
+    /// → resolve `time`, look up `sleep`): ty navigates the import into typeshed
+    /// (or site-packages), and we read that module's surface — reaching into
+    /// third-party code the project-local index can't see.
+    ///
+    /// Gated to genuine module bindings: ty reports a module navigation target as
+    /// an empty range at file start (`0..0`), versus a real symbol whose range
+    /// covers its def — so a `from m import func` binding (func is a value, not a
+    /// module) returns [`MemberCheck::Unknown`] and stays unverifiable rather than
+    /// being checked against the wrong namespace.
+    pub fn module_member(&self, rel_path: &str, offset: u32, member: &str) -> crate::MemberCheck {
+        use crate::MemberCheck;
+        let Some(file) = self.file_at(rel_path) else {
+            return MemberCheck::Unknown;
+        };
+        let Some(target) =
+            goto_definition(&self.db, file, TextSize::from(offset)).and_then(|t| t.into_iter().next())
+        else {
+            return MemberCheck::Unknown;
+        };
+        // A module target is an empty range at the file start; a real symbol has
+        // a non-empty range over its definition.
+        let fr = target.full_range();
+        if !(fr.start() == fr.end() && fr.start().to_u32() == 0) {
+            return MemberCheck::Unknown;
+        }
+        let module_file = target.file();
+        let path = match module_file.path(&self.db) {
+            FilePath::System(p) => p.as_str().to_string(),
+            FilePath::Vendored(p) => p.as_str().to_string(),
+            FilePath::SystemVirtual(_) => return MemberCheck::Unknown,
+        };
+        if !(path.ends_with(".pyi") || path.ends_with(".py")) {
+            return MemberCheck::Unknown;
+        }
+        // Read the module's surface and check for the member. A module-level
+        // `__getattr__` (PEP 562) means attributes can appear dynamically, so we
+        // can't prove absence — stay Unknown in that case.
+        let text = source_text(&self.db, module_file);
+        let idx = pyq_index::extract(&path, text.as_str());
+        let top = |name: &str| {
+            idx.defs
+                .iter()
+                .any(|d| d.container.is_empty() && d.name == name)
+        };
+        if top(member) {
+            MemberCheck::Present
+        } else if top("__getattr__") {
+            MemberCheck::Unknown
+        } else {
+            MemberCheck::Absent
+        }
+    }
+
     /// Turn a call-hierarchy item into a [`Neighbor`], or `None` if it is out of
     /// the reporting scope (typeshed, third-party, a `--root`-excluded file).
     /// Anchors on the item's `selection_range` — the symbol *name* range, the

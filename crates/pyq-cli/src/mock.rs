@@ -17,7 +17,7 @@
 use std::collections::{HashMap, HashSet};
 
 use pyq_index::{DefKind, FileIndex};
-use pyq_resolve::scope_fqn;
+use pyq_resolve::{scope_fqn, MemberCheck, TyResolver};
 
 /// The verdict for one patch target.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -73,6 +73,10 @@ pub struct PatchResolver {
     /// A missing attribute on such a class may be inherited or framework-injected
     /// (Django's `objects` manager, `Model._save_table`), so it isn't drift.
     subclasses: HashSet<(String, String)>,
+    /// (module id, imported name) → (file, offset of the import binding). Lets
+    /// the resolver hand ty a precise anchor to follow an import into the module
+    /// it names (typeshed/site-packages) and check an attribute on it.
+    import_bindings: HashMap<(String, String), (String, u32)>,
 }
 
 impl PatchResolver {
@@ -82,6 +86,7 @@ impl PatchResolver {
         let mut module_classes: HashMap<String, HashSet<String>> = HashMap::new();
         let mut class_members: HashMap<(String, String), HashSet<String>> = HashMap::new();
         let mut subclasses = HashSet::new();
+        let mut import_bindings = HashMap::new();
 
         for f in files {
             let module = scope_fqn(&f.path, &[]);
@@ -92,6 +97,11 @@ impl PatchResolver {
                     // Module scope: a name you can patch as `module.<name>`.
                     [] => {
                         names.insert(d.name.clone());
+                        if d.kind == DefKind::Import {
+                            import_bindings
+                                .entry((module.clone(), d.name.clone()))
+                                .or_insert((f.path.clone(), d.offset));
+                        }
                         if d.kind == DefKind::Class {
                             module_classes
                                 .entry(module.clone())
@@ -122,11 +132,15 @@ impl PatchResolver {
             module_classes,
             class_members,
             subclasses,
+            import_bindings,
         }
     }
 
-    /// Resolve a patch target (`None` = the argument wasn't a literal).
-    pub fn resolve(&self, target: Option<&str>) -> Status {
+    /// Resolve a patch target (`None` = the argument wasn't a literal). `ty`, when
+    /// supplied, lets the resolver follow an imported module into typeshed /
+    /// site-packages to verify a tail attribute (`patch("m.time.sleep")`); without
+    /// it those stay `unverifiable`.
+    pub fn resolve(&self, target: Option<&str>, ty: Option<&TyResolver>) -> Status {
         let Some(t) = target else {
             return Status::Dynamic;
         };
@@ -139,7 +153,7 @@ impl PatchResolver {
         for k in (1..=parts.len()).rev() {
             let prefix = parts[..k].join(".");
             if let Some(module) = self.canonical_module(&prefix) {
-                return self.resolve_attr(&module, &parts[k..]);
+                return self.resolve_attr(&module, &parts[k..], ty);
             }
         }
         Status::External
@@ -163,7 +177,7 @@ impl PatchResolver {
         }
     }
 
-    fn resolve_attr(&self, module: &str, chain: &[&str]) -> Status {
+    fn resolve_attr(&self, module: &str, chain: &[&str], ty: Option<&TyResolver>) -> Status {
         // Patching the module object itself.
         let Some(first) = chain.first() else {
             return Status::Valid;
@@ -190,6 +204,28 @@ impl PatchResolver {
             .get(module)
             .is_some_and(|c| c.contains(*first));
         if !is_class {
+            // `first` is bound but not a project class. If it's an imported
+            // *module* and we have ty, follow the import into the module it names
+            // (typeshed / site-packages) and check the single tail attribute —
+            // `patch("m.time.sleep")` resolves `time`, looks up `sleep`.
+            if chain.len() == 2 {
+                if let (Some(ty), Some((path, offset))) =
+                    (ty, self.import_bindings.get(&(module.to_string(), first.to_string())))
+                {
+                    match ty.module_member(path, *offset, chain[1]) {
+                        MemberCheck::Present => return Status::Valid,
+                        MemberCheck::Absent => {
+                            return Status::Drifted(format!(
+                                "module `{first}` has no member `{}`",
+                                chain[1]
+                            ))
+                        }
+                        // Not a module binding, unresolved, or dynamic (`__getattr__`)
+                        // — fall through to unverifiable.
+                        MemberCheck::Unknown => {}
+                    }
+                }
+            }
             return Status::Unverifiable(format!(
                 "`{module}.{first}` is not a project class; can't check `.{}`",
                 chain[1..].join(".")

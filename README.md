@@ -31,6 +31,7 @@ pyq defs User                 # every definition of `User`
 pyq graph main                # everything `main` transitively calls
 pyq graph User --reverse      # everything that transitively reaches `User`
 pyq effects handle_request    # side effects it transitively performs (io/net/db/…)
+pyq tests add                 # which tests statically reach `add` (change coverage)
 pyq mock-targets              # resolve every mock.patch("…") — flag drifted paths
 pyq inputs                    # the external input surface of the project
 pyq imports pkg.models --reverse   # who imports pkg.models (blast radius)
@@ -46,6 +47,7 @@ pyq imports --cycles          # import cycles among project modules
 | `defs <symbol>` | Every definition (function/class/variable/import binding), each tagged `role` (`definition`/`binding`); a `binding` points at its canonical def via `resolves_to`. |
 | `graph <symbol>` | The transitive call graph: everything the symbol calls (forward closure), or — with `--reverse` — everything that calls it. Nodes are stable fully-qualified IDs (`pkg.models.User.__init__`) re-queryable after edits; `--depth N` caps the hops. |
 | `effects <symbol>` | The transitive effect surface: which side effects (`fs`, `network`, `subprocess`, `env`, `db`, `random`, `clock`, `global`) the symbol and everything it transitively calls statically perform, plus import-time effects of the modules involved. "Is this pure / safe in a test." |
+| `tests <symbol>` | The test↔code map: which collected tests statically reach the symbol, each carrying the call path (`via`) and `depth` by which it reaches. A test is a `test_*` function in `test_*.py`/`*_test.py`, or a `test_*` method on a collected class — `Test*`-named **or** subclassing a `*TestCase` (unittest/Django/DRF, collected by inheritance). A projection of the reverse call graph — the foundation for static change coverage. Scope `--root` to the package root where first-party imports resolve (e.g. the dir whose children are your top-level packages), so cross-module reach links up. |
 | `mock-targets` | Resolve every `mock.patch("a.b.c")` target against the project and flag *drifted* paths — a patch whose looked-up name no longer exists silently no-ops, so the test passes while exercising the real code. |
 | `inputs` | What the code needs to run: env vars, literal files opened, CLI args (argparse/click), pydantic settings fields. |
 | `imports [module]` | The import graph. No arg: every edge. With a module: what it imports; `--reverse`: who imports it (blast radius); `--cycles`: import cycles. Accepts a module name or a file path. |
@@ -175,6 +177,16 @@ Module spellings are matched honoring a source root: on a nested layout (files
 at `alice/main/services.py`, imported and patched as `main.services.*`) the
 target resolves to the canonical file-derived id by unique suffix — so the verb
 doesn't silently degrade to "all external" and check nothing.
+
+When a target's tail attribute is on an imported **module** (`patch("svc.time.sleep")`,
+where `svc.py` does `import time`), resolution follows the import into that
+module — including typeshed and installed site-packages — and verifies the
+attribute there: `time.sleep` is `valid`, a typo like `time.slep` is real
+`drifted`. This is gated to genuine module bindings (a `from m import func`
+binding is a value, not a module, and stays `unverifiable`), and to modules
+without a dynamic `__getattr__`, so it never manufactures a false drift —
+verified across three real repos, where it moved ~60 patches from `unverifiable`
+to `valid` (e.g. `time.sleep`) and added zero new drifts.
 
 ## Output envelope
 

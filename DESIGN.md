@@ -58,6 +58,11 @@ If yes, don't rebuild it — unless we can do it **deeper** (see below).
    that extends a base (possibly inherited / framework-injected) are reported
    but never flagged. The last two were false positives found running it against
    a real Django repo — the index records class bases so they can be suppressed.
+   When the tail attribute is on an imported *module*, ty follows the import into
+   typeshed / site-packages and verifies it there (so `time.sleep` is valid and
+   `time.slep` is real drift) — the one place `mock-targets` reaches into
+   third-party code, gated to genuine module bindings and `__getattr__`-free
+   modules so it adds no false positives.
 
 ## Worth building *deeper* than the existing tools (the exception to the filter)
 These exist elsewhere but a pyq-native version is better because it rides the

@@ -87,6 +87,7 @@ fn query_block_is_uniform_across_verbs() {
         vec!["defs", "User"],
         vec!["graph", "User"],
         vec!["effects", "User"],
+        vec!["tests", "User"],
         vec!["inputs"],
         vec!["imports"],
     ] {
@@ -698,6 +699,29 @@ fn mock_targets_resolve_across_source_root_spellings() {
     assert_eq!(status.get("main.services.removed_thing"), Some(&"drifted"), "{env}");
 }
 
+// Tier-1 third-party resolution: when a patch target's tail attribute is on an
+// imported *module*, ty follows the import into typeshed (or site-packages) and
+// the attribute is verified there — `time.sleep` is valid, the typo `time.slep`
+// is real drift. A symbol binding (`from os import getcwd`) is not a module, so
+// `getcwd.x` correctly stays unverifiable rather than being checked wrongly.
+#[test]
+fn mock_targets_resolve_module_attributes_via_typeshed() {
+    let root = fixture("mock_modattr");
+    let (env, ok) = run_json_in(&root, &["mock-targets"]);
+    assert!(ok);
+    let status: std::collections::HashMap<&str, &str> = env["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|r| Some((r["target"].as_str()?, r["status"].as_str().unwrap())))
+        .collect();
+    // Resolved into the `time` stub: real attribute is valid, typo is drift.
+    assert_eq!(status.get("app.svc.time.sleep"), Some(&"valid"), "{env}");
+    assert_eq!(status.get("app.svc.time.slep"), Some(&"drifted"), "{env}");
+    // `getcwd` is a function binding, not a module — not checked as a namespace.
+    assert_eq!(status.get("app.svc.getcwd.anything"), Some(&"unverifiable"), "{env}");
+}
+
 #[test]
 fn imports_lists_edges_and_marks_external() {
     let (env, ok) = run_json(&["imports"]);
@@ -850,4 +874,91 @@ fn human_view_is_a_summary_line_then_results() {
     let first = stdout.lines().next().unwrap_or_default();
     assert!(first.ends_with("inputs"), "summary line was: {first:?}");
     assert!(stdout.contains("settings.ini"));
+}
+
+// ── `tests` verb — the static test↔code map ──────────────────────────────────
+// A projection of the reverse call graph filtered to pytest-collected tests.
+// `add` is reached directly by `test_add` (depth 1) and transitively, through
+// `helper`, by `test_helper` and the `Test*`-class method `test_via_helper`
+// (depth 2). The non-test caller `not_a_test` and the non-`test_` method
+// `not_collected` must NOT appear — that exclusion is the whole point.
+#[test]
+fn tests_maps_reaching_tests_transitively() {
+    let root = fixture("tests_map");
+    let (env, ok) = run_json_in(&root, &["tests", "add"]);
+    assert!(ok);
+    assert_eq!(env["query"]["kind"], "tests");
+    assert_eq!(env["query"]["roots"][0], "pkg.calc.add");
+
+    let by_fqn: std::collections::HashMap<&str, u64> = env["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| (r["fqn"].as_str().unwrap(), r["depth"].as_u64().unwrap()))
+        .collect();
+    assert_eq!(by_fqn.get("test_calc.test_add"), Some(&1), "direct test: {env}");
+    assert_eq!(by_fqn.get("test_calc.test_helper"), Some(&2), "test via helper: {env}");
+    assert_eq!(
+        by_fqn.get("tests.test_more.TestThings.test_via_helper"),
+        Some(&2),
+        "Test*-class method via helper: {env}"
+    );
+    assert!(
+        !by_fqn.contains_key("test_calc.not_a_test"),
+        "a non-`test_` caller in a test file is not a test: {env}"
+    );
+    assert!(
+        !by_fqn.keys().any(|k| k.contains("not_collected")),
+        "a non-`test_` method on a Test* class is not collected: {env}"
+    );
+    assert!(
+        !by_fqn.keys().any(|k| k.contains("use_add")),
+        "a caller outside a test file is not a test: {env}"
+    );
+    // A `*TestCase`-subclassing class with a non-`Test*` name (`AdditionTests`)
+    // is collected by pytest via inheritance — its `test_*` method must count,
+    // and its `_helper` (non-`test_`) method must not. This is the Django/
+    // unittest convention real codebases lean on, missed by a name-only rule.
+    assert_eq!(
+        by_fqn.get("tests.test_case_subclass.AdditionTests.test_add_is_correct"),
+        Some(&1),
+        "a TestCase-subclass test method (non-Test* class name) must count: {env}"
+    );
+    assert!(
+        !by_fqn.contains_key("tests.test_case_subclass.AdditionTests._helper"),
+        "a non-`test_` method on a TestCase subclass is not collected: {env}"
+    );
+}
+
+// A symbol reached by no test is a 0-result success (distinct summary), NOT the
+// "not found" case — an agent must tell "exists but untested" from "no such
+// symbol", since the first is a coverage gap and the second is a typo.
+#[test]
+fn tests_distinguishes_untested_from_not_found() {
+    let root = fixture("tests_map");
+
+    let (untested, ok) = run_json_in(&root, &["tests", "use_add"]);
+    assert!(ok);
+    assert_eq!(untested["query"]["roots"][0], "uses_calc.use_add");
+    assert_eq!(untested["count"].as_u64().unwrap(), 0, "{untested}");
+    assert!(
+        untested["summary"].as_str().unwrap().contains("no test"),
+        "untested summary: {untested}"
+    );
+
+    let (missing, ok) = run_json_in(&root, &["tests", "nope"]);
+    assert!(ok);
+    assert!(missing["query"]["roots"].as_array().unwrap().is_empty(), "{missing}");
+    assert!(
+        missing["summary"].as_str().unwrap().contains("found"),
+        "not-found summary: {missing}"
+    );
+    assert!(
+        missing["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|w| w.as_str().unwrap().contains("no function or class")),
+        "{missing}"
+    );
 }

@@ -18,6 +18,22 @@ mod ty_backed;
 mod unified;
 
 pub use graph::{scope_fqn, CallGraph, Closure, Direction, GraphNode};
+
+/// Whether a name is a top-level member of a resolved module — the answer to
+/// "does `patch("pkg.mod.time.sleep")` point at something real," for the case
+/// where the tail attribute sits on an imported *module* (ty resolves the import
+/// into typeshed/site-packages, and we read that module's surface).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MemberCheck {
+    /// The module declares the member at top level.
+    Present,
+    /// The module was resolved and read, and the member is absent — and the
+    /// module has no `__getattr__`, so it can't appear dynamically either.
+    Absent,
+    /// Couldn't resolve the binding to a readable module (not a module binding,
+    /// unresolved, or a module with a dynamic `__getattr__`).
+    Unknown,
+}
 pub use ty_backed::TyResolver;
 pub use unified::UnifiedResolver;
 

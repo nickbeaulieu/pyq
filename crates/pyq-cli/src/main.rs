@@ -7,12 +7,15 @@
 
 mod graph;
 mod mock;
+mod tests_map;
 mod walk;
 
 use clap::{Parser, Subcommand};
 use pyq_index::{extract, EffectKind, FileIndex, InputKind};
 use pyq_output::{Channel, Envelope};
-use pyq_resolve::{scope_fqn, CallGraph, Direction, GraphNode, Loc, Resolver, UnifiedResolver};
+use pyq_resolve::{
+    scope_fqn, CallGraph, Direction, GraphNode, Loc, Resolver, TyResolver, UnifiedResolver,
+};
 use std::collections::{BTreeSet, HashSet};
 use serde_json::json;
 use std::process::ExitCode;
@@ -62,6 +65,12 @@ enum Command {
     /// everything it transitively calls statically touch — plus import-time
     /// effects of the modules involved. "Is this pure / safe in a test."
     Effects { symbol: String },
+    /// Which tests statically reach a symbol — the test↔code map. Projects the
+    /// reverse call graph and keeps the callers pytest would collect as tests
+    /// (`test_*` functions in `test_*.py`/`*_test.py`, `test_*` methods on
+    /// `Test*` classes). Each test carries the call path (`via`) and `depth` by
+    /// which it reaches the symbol. The foundation for static change coverage.
+    Tests { symbol: String },
     /// The external input surface — env vars, literal files opened, CLI args,
     /// and pydantic settings fields. "What does this need to run."
     Inputs,
@@ -114,6 +123,7 @@ fn dispatch(cli: &Cli) -> anyhow::Result<Envelope> {
         | Command::Callers { symbol }
         | Command::Defs { symbol }
         | Command::Graph { symbol, .. }
+        | Command::Tests { symbol }
         | Command::Effects { symbol } => Some(symbol.as_str()),
         _ => None,
     };
@@ -129,10 +139,7 @@ fn dispatch(cli: &Cli) -> anyhow::Result<Envelope> {
             let files = walk::index_tree(&cli.root)?;
             query_inputs(&files)
         }
-        Command::MockTargets => {
-            let files = walk::index_tree(&cli.root)?;
-            query_mock_targets(&files)
-        }
+        Command::MockTargets => query_mock_targets(cli)?,
         Command::Imports {
             module,
             reverse,
@@ -150,6 +157,7 @@ fn dispatch(cli: &Cli) -> anyhow::Result<Envelope> {
             depth,
         } => query_graph(cli, symbol, *reverse, *depth)?,
         Command::Effects { symbol } => query_effects(cli, symbol)?,
+        Command::Tests { symbol } => query_tests(cli, symbol)?,
     };
 
     // Anchor every result to one resolved root, echoed in the query — so the
@@ -233,6 +241,66 @@ fn query_graph(
         envelope = envelope
             .with_warnings(vec![format!("no function or class named `{symbol}` found")]);
     }
+    Ok(envelope)
+}
+
+/// The static test↔code map: which pytest-collected tests transitively reach
+/// `symbol`. A projection of the reverse call-graph closure, filtered to test
+/// nodes — the foundation for static change coverage.
+fn query_tests(cli: &Cli, symbol: &str) -> anyhow::Result<Envelope> {
+    let files = walk::index_tree(&cli.root)?;
+    let scope = walk::walked_py_files(&cli.root);
+    // The classes pytest collects (Test*-named or *TestCase-subclassing) — built
+    // from the index before `files` is moved into the graph, since a graph node
+    // alone carries no base-class info.
+    let test_classes = tests_map::test_class_fqns(&files);
+    let graph = CallGraph::new(&cli.root, files, scope)?;
+    let closure = graph.closure(symbol, Direction::Reverse, None);
+
+    // A test may be a root (it reaches the symbol directly) only if the symbol
+    // itself is a test — the roots are the queried symbol, not its callers — so
+    // reaching tests come from the closure's reached nodes.
+    let mut tests: Vec<&GraphNode> = closure
+        .nodes
+        .iter()
+        .filter(|n| tests_map::is_test_node(n, &test_classes))
+        .collect();
+    tests.sort_by(|a, b| (a.depth, &a.fqn).cmp(&(b.depth, &b.fqn)));
+
+    let results: Vec<serde_json::Value> = tests
+        .iter()
+        .map(|n| {
+            json!({
+                "loc": format!("{}:{}:{}", n.path, n.line, n.col),
+                "label": format!("{} reaches `{symbol}` (depth {}, via {})", n.fqn, n.depth, n.via),
+                "fqn": n.fqn,
+                "depth": n.depth,
+                "via": n.via,
+            })
+        })
+        .collect();
+
+    let summary = tests_map::summary(symbol, closure.roots.is_empty(), results.len());
+    let query = json!({
+        "kind": "tests",
+        "target": symbol,
+        "roots": closure.roots,
+    });
+    let mut envelope = Envelope::new(query, results).with_summary(summary);
+
+    let mut warnings = Vec::new();
+    if closure.roots.is_empty() {
+        warnings.push(format!("no function or class named `{symbol}` found"));
+    } else {
+        // Honest boundary: reachability is the call graph's static
+        // over-approximation (dynamic/attribute dispatch not followed), and test
+        // collection uses pytest's default naming/location rules — custom
+        // `python_files`/`python_classes` config is not read.
+        warnings.push(
+            "static over-approximation: tests reaching via dynamic/attribute dispatch are not followed; test collection uses pytest naming + unittest/TestCase-inheritance rules (custom python_files/python_classes config not read)".to_string(),
+        );
+    }
+    envelope = envelope.with_warnings(warnings);
     Ok(envelope)
 }
 
@@ -403,14 +471,20 @@ fn query_inputs(files: &[FileIndex]) -> Envelope {
 /// Every `mock.patch("...")` target across the tree, resolved against the
 /// project. Drifted targets (a real project module, missing the looked-up name)
 /// are the actionable signal — surfaced as warnings as well as results.
-fn query_mock_targets(files: &[FileIndex]) -> Envelope {
-    let resolver = mock::PatchResolver::build(files);
+fn query_mock_targets(cli: &Cli) -> anyhow::Result<Envelope> {
+    let files = walk::index_tree(&cli.root)?;
+    let resolver = mock::PatchResolver::build(&files);
+    // ty lets the resolver follow an imported module into typeshed/site-packages
+    // to verify a tail attribute; best-effort, so a ty init failure just falls
+    // back to the syntactic answer (those cases stay `unverifiable`).
+    let scope = walk::walked_py_files(&cli.root);
+    let ty = TyResolver::new(&cli.root, scope).ok();
     let mut rows: Vec<(String, serde_json::Value)> = Vec::new();
     let mut warnings = Vec::new();
     let mut drifted = 0usize;
-    for f in files {
+    for f in &files {
         for m in &f.mocks {
-            let status = resolver.resolve(m.target.as_deref());
+            let status = resolver.resolve(m.target.as_deref(), ty.as_ref());
             let loc = format!("{}:{}:{}", f.path, m.pos.line, m.pos.col);
             let shown = m.target.as_deref().unwrap_or("<dynamic>");
             let tag = status.tag();
@@ -450,9 +524,9 @@ fn query_mock_targets(files: &[FileIndex]) -> Envelope {
             plural(n, "target")
         )
     };
-    Envelope::new(json!({ "kind": "mock-targets", "target": null }), results)
+    Ok(Envelope::new(json!({ "kind": "mock-targets", "target": null }), results)
         .with_summary(summary)
-        .with_warnings(warnings)
+        .with_warnings(warnings))
 }
 
 /// The project import graph. Modes: cycles, reverse deps, forward deps, or —
