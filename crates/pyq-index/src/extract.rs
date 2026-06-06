@@ -5,14 +5,25 @@
 //! agent is mid-edit on should still answer queries).
 
 use ruff_python_ast::visitor::{walk_expr, walk_stmt, Visitor};
-use ruff_python_ast::{Expr, ExprContext, Stmt, StmtClassDef};
+use ruff_python_ast::{Expr, ExprContext, PySourceType, Stmt, StmtClassDef};
+use ruff_python_parser::parse_unchecked_source;
 use ruff_text_size::{Ranged, TextSize};
 
 use crate::model::{Def, DefKind, FileIndex, ImportStmt, Input, InputKind, Pos, Ref};
 
 /// Parse `source` and extract its facts. `path` is recorded verbatim for output.
+///
+/// Uses ruff's error-recovering parser and walks the best-effort tree even when
+/// the source has syntax errors — a file an agent is mid-edit on still answers
+/// for every statement that parsed *before* the error (this is load-bearing for
+/// the "half-edited file still answers" guarantee, not just a nicety).
 pub fn extract(path: &str, source: &str) -> FileIndex {
-    let parsed = ruff_python_parser::parse_module(source);
+    let source_type = if path.ends_with(".pyi") {
+        PySourceType::Stub
+    } else {
+        PySourceType::Python
+    };
+    let parsed = parse_unchecked_source(source, source_type);
     let lines = Lines::new(source);
     let mut collector = Collector {
         source,
@@ -23,10 +34,8 @@ pub fn extract(path: &str, source: &str) -> FileIndex {
         inputs: Vec::new(),
         imports: Vec::new(),
     };
-    if let Ok(parsed) = parsed {
-        for stmt in &parsed.syntax().body {
-            collector.visit_stmt(stmt);
-        }
+    for stmt in &parsed.syntax().body {
+        collector.visit_stmt(stmt);
     }
     FileIndex {
         path: path.to_string(),

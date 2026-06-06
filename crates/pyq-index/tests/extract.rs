@@ -152,3 +152,31 @@ fn parse_errors_are_non_fatal() {
     // Should not panic; may extract little, but must produce a FileIndex.
     assert_eq!(idx.path, "broken.py");
 }
+
+#[test]
+fn recovers_facts_before_a_trailing_syntax_error() {
+    // The "half-edited file still answers" guarantee: statements that parsed
+    // before the error must still be indexed, not zeroed out by the error.
+    let src = r#"
+import os
+
+def alpha():
+    return 1
+
+KEY = os.environ["EARLY_KEY"]
+
+class Broken(
+"#;
+    let idx = extract("wip.py", src);
+
+    assert!(
+        idx.defs.iter().any(|d| d.name == "alpha"),
+        "def before the error should survive: {:?}",
+        idx.defs
+    );
+    assert!(
+        idx.inputs.iter().any(|i| i.value == "EARLY_KEY"),
+        "env read before the error should survive: {:?}",
+        idx.inputs
+    );
+}

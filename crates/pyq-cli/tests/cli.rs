@@ -188,6 +188,46 @@ fn sample_has_no_cycles() {
     assert_eq!(env["count"].as_u64().unwrap(), 0);
 }
 
+// Regression: ty must inherit the CLI walk's --root scoping. `User` is used in
+// both app.py and pkg/models.py; scoping the root to the pkg subtree must drop
+// the app.py reference and report paths anchored to that root.
+#[test]
+fn ty_refs_honor_root_scoping() {
+    let pkg = sample_root().join("pkg");
+    let (env, ok) = run_json_in(&pkg, &["refs", "User"]);
+    assert!(ok);
+    let files: std::collections::HashSet<_> = locs(&env)
+        .iter()
+        .map(|l| l.split(':').next().unwrap().to_string())
+        .collect();
+    assert!(
+        files.contains("models.py"),
+        "in-scope file should appear, anchored to root: {files:?}"
+    );
+    assert!(
+        !files.iter().any(|f| f.contains("app.py")),
+        "out-of-scope app.py must be filtered: {files:?}"
+    );
+}
+
+// Regression: a file with a trailing syntax error must still answer for the
+// statements that parsed before the error ("half-edited file still answers").
+#[test]
+fn broken_file_still_answers_for_pre_error_statements() {
+    let root = fixture("broken");
+    let (inputs, ok) = run_json_in(&root, &["inputs"]);
+    assert!(ok);
+    assert!(
+        labels(&inputs).iter().any(|l| l == "env EARLY_KEY"),
+        "env read before the error should survive: {:?}",
+        labels(&inputs)
+    );
+
+    let (defs, ok) = run_json_in(&root, &["defs", "alpha", "--syntactic"]);
+    assert!(ok);
+    assert!(labels(&defs).iter().any(|l| l == "function"));
+}
+
 #[test]
 fn human_view_is_a_summary_line_then_results() {
     let out = Command::new(env!("CARGO_BIN_EXE_pyq"))

@@ -94,41 +94,6 @@ Note the *good* side: ty's 62 vs grep's 469 is correct precision — ty resolves
 which `save` (the in-repo model overrides) and doesn't conflate unrelated
 `.save()` on other types. That disambiguation is the real value; don't lose it.
 
-## P2 — "half-edited file still answers" is false; one parse error zeros the whole file
-DESIGN.md: *"Parse errors non-fatal (an agent mid-edit still gets answers)"*;
-README: *"a half-edited file still answers."* Actual behavior — a file with a
-trailing syntax error yields **0** results for the entire file, including valid
-defs/inputs *above* the error:
-
-```python
-import os
-def alpha():           # valid
-    return 1
-KEY = os.environ["EARLY_KEY"]   # valid env read
-class Broken(          # <- syntax error on last line
-```
-```
-defs alpha   → 0      (should recover; it's a complete def before the error)
-inputs       → 0      (should recover EARLY_KEY)
-```
-
-Resilience is only *file-granular*: a broken file does NOT break sibling clean
-files (verified — those still answer). But the broken file itself returns
-nothing. The "agent mid-edit" scenario — the stated motivation — is exactly the
-failing case. `ruff_python_parser` does error-recovery and returns a best-effort
-AST alongside the errors; pyq appears to discard the file when `errors` is
-non-empty instead of walking the recovered tree. Walk the partial AST so
-pre-error statements are still indexed.
-
-**Root cause (confirmed in source):** `crates/pyq-index/src/extract.rs:26` —
-`if let Ok(parsed) = parsed { ... }`. `parse_module` returns `Err` on any syntax
-error while still carrying a best-effort recovered tree; the `if let Ok` throws
-that tree away, so a single error skips the whole file. The doc-comment four
-lines above (extract.rs:3-4) asserts the opposite ("Parse errors are non-fatal:
-we extract what parsed and move on"). Fix: take the `Parsed` even in the `Err`
-arm (e.g. `parse_module(...).map_or_else(|e| e.parsed?, identity)` / use the
-unchecked accessor) and walk `parsed.syntax().body` regardless.
-
 ## P2 — `imports --cycles` false-positives on TYPE_CHECKING / deferred imports
 The cycle detector counts `if TYPE_CHECKING:` imports (never execute at runtime)
 and function-local/deferred imports (lazy, by design) as load-time cycle edges.
@@ -193,7 +158,37 @@ reconciling and documenting.
 (Re-export through `__init__.py` and `import as` aliasing otherwise work well —
 see Confirmed working. `callers` is the verb that gets aliases right.)
 
-## Design preferences (agent POV)
+Scope: this is **specific to `import as` renames**. With a plain
+`from lib import thing` + two `thing()` calls, `refs thing` = 4 *does* include
+both call sites (reads) — `callers ⊆ refs` holds. The defect is that `refs`
+matches the queried name (`make_widget`) and never crosses to uses under the
+renamed binding (`mw`), whereas `callers`/call_hierarchy follows the rename.
+
+## P2 — `callers`/`refs` union over same-named defs with no way to target one
+Two unrelated classes each defining `process`:
+
+```python
+class Alpha:
+    def process(self): ...
+class Beta:
+    def process(self): ...
+a.process(); b.process()
+```
+```
+defs    process  → 2   (Alpha.process, Beta.process)
+callers process  → 2   (a.process(), b.process())  — merged, both labeled scope `m`
+```
+
+A bare-name query collapses all defs of that name: `callers process` returns
+Alpha's *and* Beta's call sites with no indication of which `process` each site
+resolves to. For the core refactor use case ("who calls `Alpha.process` so I can
+rename it") this conflates unrelated methods — an agent would wrongly think
+`b.process()` also needs updating. ty's `call_hierarchy` is anchored per-def and
+*knows* which target each call resolves to; pyq unions the results and discards
+that. Two fixes, ideally both: (a) label each caller/ref with the def it resolves
+to (`→ Alpha.process`), and (b) allow targeting a single def (qualified name
+`Alpha.process`, or a `path:line` anchor) — note dotted names currently return 0
+(see P3), so there's *no* precise-targeting path today.
 What I'd want as the actual consumer. Principle: **pyq output is treated as
 ground truth, so every divergence from reality costs more than slowness would.**
 Optimize for "an agent can act on this without double-checking."
@@ -249,3 +244,11 @@ Optimize for "an agent can act on this without double-checking."
   import past the top-level package — yields a junk `(ext)` target, but that's
   invalid input, not a bug.)
 - `imports --cycles` and full-graph build are fast (~0.1-0.25s on ~1900 files).
+- `refs` read/write classification is good: tags writes vs reads, splits
+  `counter = counter + 1` into a write (LHS) + read (RHS), and labels `global x`
+  as a generic `ref`. Beyond grep.
+- `callers` is alias-aware: a call through `import as`/re-export resolves back to
+  the origin (`make_widget()` and aliased `mw()` both attributed to
+  `make_widget`). Re-export through `__init__.py` resolves correctly; `defs`
+  points to the single origin. (But `refs` does NOT follow the alias — see the
+  P1 above.)
