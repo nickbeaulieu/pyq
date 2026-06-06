@@ -194,4 +194,12 @@ pub struct FileIndex {
     /// surface. Exported names are reachable from outside the project, so
     /// reachability analysis treats them as live entrypoints.
     pub dunder_all: Vec<String>,
+    /// String literals shaped like a dotted import path (`api.utils.handler`,
+    /// `pkg.mod:func`) — every segment a valid identifier. Frameworks reference
+    /// callables by such strings (Django `EXCEPTION_HANDLER`/`MIDDLEWARE`, Celery
+    /// task names, entry points), invisible to the call graph; a consumer
+    /// resolves them against the project to recover the reference. Captured
+    /// over-approximately (any path-shaped literal); the resolver filters to ones
+    /// that name a real symbol.
+    pub dotted_strings: Vec<String>,
 }

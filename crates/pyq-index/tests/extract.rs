@@ -458,3 +458,29 @@ fn captures_decorated_dunder_all_and_module_scope_refs() {
     let helper_ref = idx.refs.iter().find(|r| r.name == "helper" && r.is_call).unwrap();
     assert!(!helper_ref.module_scope, "call inside a function is not module scope");
 }
+
+#[test]
+fn captures_dotted_path_string_literals_only() {
+    let src = r#"
+HANDLER = "api.utils.custom_exception_handler"
+ENTRY = "pkg.mod:func"
+MIDDLEWARE = ["app.mw.Auth", "app.mw.Cors"]
+not_a_path = "just a sentence."
+filename = "report.txt"
+version = "1.2.3"
+url = "http://example.com/x"
+"#;
+    let idx = extract("settings.py", src);
+    let got: std::collections::HashSet<&str> =
+        idx.dotted_strings.iter().map(String::as_str).collect();
+    // path-shaped literals captured (entry-point `:` form included)
+    assert!(got.contains("api.utils.custom_exception_handler"), "{got:?}");
+    assert!(got.contains("pkg.mod:func"), "{got:?}");
+    assert!(got.contains("app.mw.Auth") && got.contains("app.mw.Cors"), "{got:?}");
+    // prose / files / versions / urls are not paths
+    assert!(!got.contains("just a sentence."), "{got:?}");
+    assert!(!got.contains("1.2.3"), "{got:?}");
+    assert!(!got.iter().any(|s| s.contains("http")), "{got:?}");
+    // "report.txt" is identifier-shaped, so it's captured here but the deadcode
+    // resolver discards it (names no project symbol) — over-capture is harmless.
+}

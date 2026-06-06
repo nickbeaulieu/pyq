@@ -42,6 +42,7 @@ pub fn extract(path: &str, source: &str) -> FileIndex {
         effects: Vec::new(),
         mocks: Vec::new(),
         dunder_all: Vec::new(),
+        dotted_strings: Vec::new(),
     };
     for stmt in &parsed.syntax().body {
         collector.visit_stmt(stmt);
@@ -55,6 +56,7 @@ pub fn extract(path: &str, source: &str) -> FileIndex {
         effects: collector.effects,
         mocks: collector.mocks,
         dunder_all: collector.dunder_all,
+        dotted_strings: collector.dotted_strings,
     }
 }
 
@@ -76,6 +78,7 @@ struct Collector<'src> {
     effects: Vec<Effect>,
     mocks: Vec<MockTarget>,
     dunder_all: Vec<String>,
+    dotted_strings: Vec<String>,
 }
 
 impl<'src> Collector<'src> {
@@ -378,6 +381,15 @@ impl<'src, 'ast> Visitor<'ast> for Collector<'src> {
         self.collect_input(expr);
         self.collect_effect(expr);
 
+        // A path-shaped string literal may be a framework's reference to a
+        // callable (`'api.utils.handler'`). Capture it over-approximately.
+        if let Expr::StringLiteral(s) = expr {
+            let value = s.value.to_str();
+            if is_dotted_path(value) {
+                self.dotted_strings.push(value.to_string());
+            }
+        }
+
         // A call's callee, when a bare name, is recorded as a call reference and
         // we skip re-walking it as a plain load (so `f` in `f()` is one ref).
         if let Expr::Call(call) = expr {
@@ -528,6 +540,31 @@ fn literal_str(expr: Option<&Expr>) -> Option<String> {
         Expr::StringLiteral(s) => Some(s.value.to_str().to_string()),
         _ => None,
     }
+}
+
+/// Whether a string looks like a dotted import path — at least two segments,
+/// each a valid Python identifier. One `:` is allowed (the `module:attr`
+/// entry-point form) and treated as a `.`. Rejects prose, paths, versions, URLs
+/// (whitespace/`/`/digits-leading break identifier-ness). Over-approximate: a
+/// match only means "path-shaped," not that it names anything.
+fn is_dotted_path(s: &str) -> bool {
+    if s.len() > 200 || s.matches(':').count() > 1 {
+        return false;
+    }
+    let normalized = s.replacen(':', ".", 1);
+    let parts: Vec<&str> = normalized.split('.').collect();
+    parts.len() >= 2 && parts.iter().all(|p| is_py_identifier(p))
+}
+
+/// Whether `s` is a valid Python identifier (ASCII-pragmatic: leader is a letter
+/// or `_`, the rest letters/digits/`_`).
+fn is_py_identifier(s: &str) -> bool {
+    let mut chars = s.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
+        _ => return false,
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
 /// The string-literal entries of a list/tuple expression — `["a", "b"]` →

@@ -760,6 +760,7 @@ fn deadcode_flags_only_the_unreachable_and_respects_entrypoints() {
         "app.management.commands.sync.Command", // mgmt command (entrypoint file)
         "app.management.commands.sync.do_sync", // reached from the command
         "app.tests.test_core.test_exported",  // pytest test
+        "app.core.string_referenced",         // named by a dotted-string config path
     ] {
         assert!(!dead.contains(live), "`{live}` must not be flagged dead: {dead:?}");
     }

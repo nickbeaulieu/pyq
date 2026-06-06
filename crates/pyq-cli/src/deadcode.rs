@@ -28,7 +28,7 @@
 //! residual false-positive source is genuine dynamic dispatch — a callable
 //! reached only via reflection / a registry / `getattr` — which is flagged.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use pyq_index::{Def, DefKind, FileIndex};
@@ -77,6 +77,19 @@ pub fn find(files: &[FileIndex], graph: &CallGraph, root: &str) -> DeadCode {
         .flat_map(|f| f.defs.iter().map(|d| d.name.as_str()))
         .collect();
 
+    // FQN → anchor for every callable, so a dotted-string config path
+    // (`'api.utils.handler'`) can be resolved to a real def and seeded.
+    let mut def_anchor: HashMap<String, (String, u32)> = HashMap::new();
+    for f in files {
+        for d in &f.defs {
+            if matches!(d.kind, DefKind::Function | DefKind::Class) {
+                def_anchor
+                    .entry(scope_fqn(&f.path, &def_scope(d)))
+                    .or_insert((f.path.clone(), d.offset));
+            }
+        }
+    }
+
     // Collect root anchors: (path, name offset) of every callable that is live by
     // entry. Deduped because a def can satisfy several rules.
     let mut seeds: HashSet<(String, u32)> = HashSet::new();
@@ -113,6 +126,14 @@ pub fn find(files: &[FileIndex], graph: &CallGraph, root: &str) -> DeadCode {
                 if let Some(anchor) = graph.resolve_anchor(&f.path, r.offset) {
                     seeds.insert(anchor);
                 }
+            }
+        }
+        // A dotted-string config path naming a project callable keeps it live —
+        // the framework invokes it by that string (Django `EXCEPTION_HANDLER`,
+        // Celery task names, entry points), invisible to the call graph.
+        for s in &f.dotted_strings {
+            if let Some(anchor) = resolve_dotted(&def_anchor, s) {
+                seeds.insert(anchor);
             }
         }
     }
@@ -156,6 +177,28 @@ pub fn find(files: &[FileIndex], graph: &CallGraph, root: &str) -> DeadCode {
         .collect();
     dead.sort_by(|a, b| (&a.path, a.line, a.col).cmp(&(&b.path, b.line, b.col)));
     DeadCode { dead, total }
+}
+
+/// Resolve a dotted-string config path to the callable it names, if any —
+/// matching against project def FQNs exactly, else by *unique* suffix (the
+/// source-root case: config says `main.x.handler`, the file id is
+/// `alice.main.x.handler`). The `module:attr` entry-point form is normalized to
+/// a dot. `None` when it names nothing first-party (so a coincidental
+/// path-shaped string is ignored, never seeded).
+fn resolve_dotted(
+    def_anchor: &HashMap<String, (String, u32)>,
+    s: &str,
+) -> Option<(String, u32)> {
+    let fqn = s.replacen(':', ".", 1);
+    if let Some(anchor) = def_anchor.get(&fqn) {
+        return Some(anchor.clone());
+    }
+    let suffix = format!(".{fqn}");
+    let mut matches = def_anchor.iter().filter(|(k, _)| k.ends_with(&suffix));
+    match (matches.next(), matches.next()) {
+        (Some((_, anchor)), None) => Some(anchor.clone()),
+        _ => None,
+    }
 }
 
 /// A def's full scope path (enclosing scopes + its own name) — the input to

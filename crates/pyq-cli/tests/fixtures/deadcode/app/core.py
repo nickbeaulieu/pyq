@@ -27,3 +27,7 @@ def main():                # live: called under __main__
 
 if __name__ == "__main__":
     main()
+
+
+def string_referenced():   # live ONLY via the dotted-string path in registry.py
+    return 99
