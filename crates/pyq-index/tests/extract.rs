@@ -416,6 +416,70 @@ class JustObject(object):
     assert_eq!(class("JustObject").bases, vec!["object".to_string()]);
 }
 
+const CARD_SRC: &str = r#"
+import functools
+
+
+@functools.lru_cache
+def add(a: int, b: int = 1) -> int:
+    """Add two numbers.
+
+    More detail on the next paragraph.
+    """
+    return a + b
+
+
+def wide(
+    x,
+    y,
+):
+    return x
+
+
+@dataclass
+class Box:
+    '''A box.'''
+    value: int
+
+
+def bare():
+    return 1
+"#;
+
+#[test]
+fn captures_signature_decorators_doc_and_span_for_the_card() {
+    let idx = extract("m.py", CARD_SRC);
+    let def = |name: &str| idx.defs.iter().find(|d| d.name == name).unwrap();
+
+    // Signature: parameter list (with annotations + defaults) and return type,
+    // normalized; the decorator is recorded verbatim, without the `@`.
+    let add = def("add");
+    assert_eq!(add.signature.as_deref(), Some("(a: int, b: int = 1) -> int"));
+    assert_eq!(add.decorators, vec!["functools.lru_cache".to_string()]);
+    // Docstring: first non-empty line only, trimmed.
+    assert_eq!(add.doc.as_deref(), Some("Add two numbers."));
+    // Span: `def` line through the end of the body (the docstring spans it out).
+    assert_eq!(add.pos.line, 6);
+    assert_eq!(add.end_line, 11);
+
+    // A multi-line signature collapses onto one line, parens de-spaced.
+    assert_eq!(def("wide").signature.as_deref(), Some("(x, y,)"));
+
+    // A class has no function signature, but carries its decorators + docstring;
+    // its span runs to the end of the class body.
+    let boxd = def("Box");
+    assert_eq!(boxd.signature, None);
+    assert_eq!(boxd.decorators, vec!["dataclass".to_string()]);
+    assert_eq!(boxd.doc.as_deref(), Some("A box."));
+    assert!(boxd.end_line > boxd.pos.line);
+
+    // No annotations, no decorators, no docstring → empty signature, no doc.
+    let bare = def("bare");
+    assert_eq!(bare.signature.as_deref(), Some("()"));
+    assert!(bare.decorators.is_empty());
+    assert_eq!(bare.doc, None);
+}
+
 const ENTRYPOINTS: &str = r#"
 __all__ = ["public", "Widget"]
 

@@ -50,6 +50,21 @@ pub struct Def {
     /// signal handler) and *called by it*, not by project code — so reachability
     /// analysis must treat it as a live entrypoint, not dead.
     pub decorated: bool,
+    /// The decorators as written, outermost first, without the leading `@`
+    /// (`["staticmethod", "app.route(\"/\")"]`) — the framework wiring `describe`
+    /// surfaces. Empty when undecorated.
+    pub decorators: Vec<String>,
+    /// For a [`Function`](DefKind::Function), the parameter list and return
+    /// annotation as written (`(a, b=1) -> int`), whitespace-normalized;
+    /// `None` for classes/variables/imports. The signature half of `describe`.
+    pub signature: Option<String>,
+    /// The first non-empty line of the def's docstring, trimmed — a one-line
+    /// "what is this." `None` when there's no docstring.
+    pub doc: Option<String>,
+    /// The 1-based last source line of the def (its `pos.line` is the first), so
+    /// `pos.line..=end_line` is the def's line span. Equals `pos.line` for a
+    /// single-line binding (variable/import).
+    pub end_line: usize,
 }
 
 /// A use of a name in this file.

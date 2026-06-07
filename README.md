@@ -32,9 +32,11 @@ pyq graph main                # everything `main` transitively calls
 pyq graph User --reverse      # everything that transitively reaches `User`
 pyq effects handle_request    # side effects it transitively performs (io/net/db/…)
 pyq tests add                 # which tests are call-wired to `add` (run before editing)
+pyq describe make_user        # signature + callers + callees + reaching tests, in one pack
 pyq mock-targets              # resolve every mock.patch("…") — flag drifted paths
 pyq hierarchy Animal          # supertypes, subclasses, and the override map
 pyq deadcode                  # callables reachable from no entrypoint (candidates)
+pyq canonical                 # most-used helpers, untested public surface, test inventory
 pyq inputs                    # the external input surface of the project
 pyq imports pkg.models --reverse   # who imports pkg.models (blast radius)
 pyq imports --cycles          # import cycles among project modules
@@ -50,9 +52,11 @@ pyq imports --cycles          # import cycles among project modules
 | `graph <symbol>` | The transitive call graph: everything the symbol calls (forward closure), or — with `--reverse` — everything that calls it. Nodes are stable fully-qualified IDs (`pkg.models.User.__init__`) re-queryable after edits; `--depth N` caps the hops. |
 | `effects <symbol>` | The transitive effect surface: which side effects (`fs`, `network`, `subprocess`, `env`, `db`, `random`, `clock`, `global`) the symbol and everything it transitively calls statically perform, plus import-time effects of the modules involved. "Is this pure / safe in a test." |
 | `tests <symbol>` | A call-reachability lens (**not** a coverage metric): which collected tests are structurally wired to a symbol via the reverse call graph, each with the call path (`via`) and `depth`. A test is a `test_*` function in `test_*.py`/`*_test.py`, or a `test_*` method on a collected class — `Test*`-named **or** `*TestCase`-subclassing (unittest/Django/DRF). For "which tests to run before this edit," not "what's my coverage." Blind to dynamic dispatch (attribute calls, framework routing, signals) — a 0 is "no *static* reaching test," not "untested." See [Tests](#tests). |
+| `describe <symbol>` | One compact context pack for a symbol — its signature, decorators, docstring line, and def line-span, plus its **immediate** callers and callees (depth-1 call graph) and the collected tests that reach it. The token-frugal "tell me about X" in a single envelope, instead of separate `defs`/`callers`/`graph`/`tests` calls. Rows carry a `role` (`definition`/`caller`/`callee`/`test`). Same dynamic-dispatch blind spot as the call graph. See [Describe](#describe). |
 | `mock-targets` | Resolve every `mock.patch("a.b.c")` target against the project and flag *drifted* paths — a patch whose looked-up name no longer exists silently no-ops, so the test passes while exercising the real code. |
 | `hierarchy <class>` | The class's supertypes (bases, external marked), transitive subclasses, and the override map — which base methods it overrides and which subclasses override its methods. Resolved across files by ty, subclasses computed by inverting the supertype graph. The OO-refactor footgun, as data. |
 | `deadcode` | Functions/classes reachable from **no** entrypoint — candidate dead code, via forward reachability over the call graph. Roots are everything the runtime/framework enters without a project call: tests, dunders, decorated hooks, `__all__`, module-scope calls, entrypoint files (`manage.py`/`wsgi.py`/`urls.py`/`migrations/`/`management/commands/`/…), framework base classes (`BaseCommand`/`*View`/`*Serializer`/…), and `[project.scripts]`. Over-approximate liveness (so it under-reports death); residual dynamic dispatch is flagged. See [Dead code](#dead-code). |
+| `canonical` | The repo's canonical surface in one pass: the **most-used** helpers (internal callables ranked by how many distinct non-test callers reach them — what to reach for, not reinvent), the **untested-public** surface (top-level public functions/classes no collected test statically reaches), and the **test** inventory (every collected test with its markers). Rows carry a `section`. The project-level "tell me about this codebase." Same dynamic-dispatch blind spot as the call graph (it cuts both ways). See [Canonical](#canonical). |
 | `inputs` | What the code needs to run: env vars, literal files opened, CLI args (argparse/click), pydantic settings fields. |
 | `imports [module]` | The import graph. No arg: every edge. With a module: what it imports; `--reverse`: who imports it (blast radius); `--cycles`: import cycles. Accepts a module name or a file path. |
 
@@ -189,6 +193,39 @@ resolve** (the directory whose children are your top-level packages), or
 absolute `pkg.sub`-style imports won't link and reach will be silently
 under-reported.
 
+## Describe
+
+`describe` answers "tell me about X" in one round-trip. Instead of running
+`defs`, then `callers`, then `graph`, then `tests` and stitching the answers
+together, it packs a symbol's static facets and its immediate neighbourhood into
+a single envelope:
+
+- **Definition** — signature (parameters + return annotation; for a class, its
+  bases), decorators as written, the first docstring line, and the def's line
+  span (`[first, last]`), read straight off the syntactic index.
+- **Immediate callers / callees** — the depth-1 call graph in both directions
+  (what it calls in one hop, who calls it in one hop).
+- **Reaching tests** — the collected tests that reach it transitively, each with
+  the call path (`via`) and `depth` — the same lens as the `tests` verb.
+
+```console
+$ pyq describe make_user --root path/to/project
+describe `make_user`: 1 def, 1 immediate caller, 1 callee, 1 reaching test
+pkg/models.py:5:5         def make_user(name: str) -> User  [L5-6]  — Build a user.
+app.py:3:5                caller app.main
+pkg/models.py:1:7         callee pkg.models.User
+tests/test_users.py:8:5   test tests.test_users.test_make_user (depth 2, via app.main)
+```
+
+Every row carries a `role` (`definition`/`caller`/`callee`/`test`); the
+definition row also exposes `signature`, `decorators`, `doc`, and `lines` as
+structured fields under `--json`. The neighbourhood inherits the call graph's
+**dynamic-dispatch blind spot** — callers/callees/tests reached only through
+attribute or framework dispatch are not shown (flagged in `warnings`). A name
+that resolves to several defs gets one definition row apiece, with the
+caller/callee/test sets taken as the union over them (flagged); qualify the name
+(`Alpha.process`) to disambiguate.
+
 ## Mock-target drift
 
 `mock.patch` replaces a name *where it is looked up*, not where it is defined —
@@ -319,11 +356,94 @@ method the framework drives is kept whole, so a genuinely dead method on a live
 serializer won't surface.) On three real repos it lands at 1.6–5.3% of
 callables. Run it from the package root so cross-module imports resolve.
 
+## Canonical
+
+`deadcode` asks "what's reachable from the entrypoints"; `canonical` asks three
+questions an agent has *before* it edits an unfamiliar repo, and answers them in
+one pass. Each row carries a `section`:
+
+- **`most-used`** — internal callables ranked by **use**: the count of distinct
+  callers *defined outside the test tree* (a projection of the call graph's
+  in-degree). These are the utilities to reach for instead of reinventing. A
+  helper used in ≥2 non-test places is shown, top 30 by use; candidates defined
+  in the test tree (fixtures/factories) or an entrypoint file (`scripts/`,
+  `manage.py`, migrations, management commands) and dunder plumbing are excluded
+  — those are glue, not utilities to reach for.
+- **`untested-public`** — the public surface (top-level, non-`_` functions and
+  classes) that **no collected test statically reaches** and that the framework
+  doesn't drive. Same reachability machinery as `deadcode`, seeded from the test
+  set instead of the entrypoints (override edges included, so a symbol reached
+  only polymorphically from a test still counts as tested); then the same
+  framework entrypoints `deadcode` treats as live — serializers, configs,
+  migrations, commands, routers, decorated handlers, string-config targets — are
+  subtracted, since a test rarely *calls* those directly and leaving them in
+  buries the real gaps under framework classes exercised through dispatch. (On
+  real Django repos this cut the list ~80–90%, e.g. 835→89, leaving the plain
+  untested service/helper functions.)
+- **`test`** — the test inventory: every pytest-collected test, with the markers
+  read off its own and its enclosing class's decorators (`@pytest.mark.slow`,
+  `parametrize`, a class-level `django_db` inherited by each method).
+
+```console
+$ pyq canonical --root path/to/project
+canonical: 1 most-used helper, 3 untested public symbols, 3 collected tests
+pkg/core.py:6:5    most-used pkg.core.normalize (used by 3)
+pkg/core.py:14:5   untested-public pkg.core.parse_title
+pkg/core.py:18:5   untested-public pkg.core.parse_tag
+pkg/core.py:26:5   untested-public pkg.core.untested_public
+tests/test_core.py:12:5  test tests.test_core.test_param [parametrize]
+tests/test_core.py:7:5   test tests.test_core.test_tested_public [slow]
+tests/test_models.py:8:9 test tests.test_models.TestModels.test_one [django_db]
+```
+
+The call graph's **dynamic-dispatch blind spot cuts both ways** here, and that's
+flagged in `warnings`: a helper reached only through attribute/framework
+dispatch is *undercounted* in `most-used`. Subtracting the framework entrypoints
+removes the bulk of the false `untested-public` (the serializers/configs/tasks a
+test never calls directly), but a symbol reached only through *other* dynamic
+dispatch can still be flagged though it runs at runtime. So "untested" means "no
+*static* reaching test," **not** "uncovered" — `change-coverage` is the runtime
+oracle for coverage. Test
+collection follows the same pytest + unittest/`TestCase`-inheritance rules as the
+`tests` verb (custom `python_files`/`python_classes` config isn't read); markers
+come from decorators, so a module-level `pytestmark` isn't captured.
+
 ## Output envelope
 
-Every verb emits the same shape. The default human view is a token-frugal
-summary line plus one result per line (used even when piped); `--json` opts into
-the structured envelope:
+Every verb emits the same structured envelope; two renderers project it.
+
+**Human view (default, even when piped).** A summary header, then results
+grouped into blank-line-separated **sections** (the classifier each row would
+otherwise repeat — the effect category, the role, the depth ring — hoisted to a
+`section (count)` header), with `loc` and the remaining fields aligned into
+columns. Warnings collect under a trailing `notes` block. The full clickable
+`path:line:col` stays on every row.
+
+```console
+$ pyq inputs --root examples/sample
+11 inputs
+
+env (4)
+  config.py:3:9   DEBUG
+  config.py:4:10  DATABASE_URL
+  config.py:5:11  TIMEOUT
+  config.py:7:10  <dynamic>
+
+file (1)
+  config.py:10:10  settings.ini
+
+setting (2)
+  cli.py:7:5  db_url
+  cli.py:8:5  port
+
+arg (4)
+  cli.py:14:5  --verbose
+  ...
+```
+
+**`--json` (opt-in).** The structured envelope — stable, presentation-agnostic.
+Each row carries its semantic fields plus presentation hints (`group`, `cols`)
+the human renderer uses; consumers read the typed fields and ignore the rest.
 
 ```json
 {
@@ -332,29 +452,13 @@ the structured envelope:
   "summary": "11 inputs",
   "count": 11,
   "results": [
-    { "loc": "config.py:3:9", "label": "env DEBUG" },
-    { "loc": "cli.py:14:5",   "label": "arg --verbose" }
+    { "loc": "config.py:3:9", "label": "env DEBUG", "group": "env", "cols": ["DEBUG"] },
+    { "loc": "cli.py:14:5",   "label": "arg --verbose", "group": "arg", "cols": ["--verbose"] }
   ]
 }
 ```
 
 Locations are `path:line:col` (1-based, UTF-8 character columns).
-
-## Example
-
-```console
-$ pyq inputs --root examples/sample
-11 inputs
-config.py:3:9   env DEBUG
-config.py:4:10  env DATABASE_URL
-config.py:5:11  env TIMEOUT
-config.py:7:10  env <dynamic>
-config.py:10:10 file settings.ini
-cli.py:7:5      setting db_url
-cli.py:8:5      setting port
-cli.py:14:5     arg --verbose
-...
-```
 
 ## Workspace
 

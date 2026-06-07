@@ -4,7 +4,7 @@
 //! are durable fully-qualified names (`pkg.models.User.__init__`) rather than
 //! line numbers, so an agent can hold a node id across edits and re-query it
 //! without re-grepping. Most of the heavier verbs (blast radius, dead code,
-//! the symbol "card") are projections of this closure.
+//! the symbol `describe` pack) are projections of this closure.
 //!
 //! Construction rides the existing locate-then-resolve seam: the syntactic
 //! index assigns each callable a stable FQN and records its name offset; ty's
@@ -163,6 +163,33 @@ impl CallGraph {
 
         nodes.sort_by(|a, b| (a.depth, &a.fqn).cmp(&(b.depth, &b.fqn)));
         Closure { roots, nodes }
+    }
+
+    /// Whole-project caller index: for every first-party callable, the set of
+    /// distinct first-party caller FQNs that statically call it. One forward
+    /// `outgoing_at` sweep per node — the same cost as building the graph once —
+    /// accumulating the *reverse* of each resolved call edge (a callee gains its
+    /// caller). Self-edges from recursion are excluded (a function calling
+    /// itself isn't "used elsewhere"); only edges whose callee maps back to a
+    /// known def anchor count, so third-party callees are naturally dropped.
+    /// The basis for ranking the repo's most-reused internal helpers
+    /// (`canonical`). Inherits the call graph's dynamic-dispatch blind spot, so
+    /// a helper reached only via attribute/framework dispatch is undercounted.
+    pub fn caller_index(&self) -> HashMap<String, HashSet<String>> {
+        let mut callers: HashMap<String, HashSet<String>> = HashMap::new();
+        for ((path, offset), caller_fqn) in &self.fqn_by_anchor {
+            for nb in self.ty.outgoing_at(path, TextSize::from(*offset)) {
+                if let Some(callee_fqn) = self.fqn_by_anchor.get(&(nb.path.clone(), nb.offset)) {
+                    if callee_fqn != caller_fqn {
+                        callers
+                            .entry(callee_fqn.clone())
+                            .or_default()
+                            .insert(caller_fqn.clone());
+                    }
+                }
+            }
+        }
+        callers
     }
 
     /// The immediate base classes of the class at `(path, offset)` — see

@@ -118,7 +118,7 @@ index we already build:
     maps straight back to its FQN and the walk recurses by re-feeding the offset.
     A breadth-first closure (forward = callees, reverse = callers) is the
     foundation primitive the heavier verbs — blast radius, dead code, the symbol
-    card — are projections of. Nodes are durable ids, not line numbers, so an
+    `describe` pack — are projections of. Nodes are durable ids, not line numbers, so an
     agent holds them across edits.
   - **All ty contact is confined to `ty_backed`.** ty is `0.0.x`, so this
     insulation is load-bearing: pin to a ruff tag (churn becomes a scheduled

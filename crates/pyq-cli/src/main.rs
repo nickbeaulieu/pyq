@@ -5,8 +5,10 @@
 //! about code-as-graph. This is the first slice — symbol/reference queries over
 //! a directory of Python files, single-file name resolution.
 
+mod canonical;
 mod change_cov;
 mod deadcode;
+mod describe;
 mod graph;
 mod hierarchy;
 mod mock;
@@ -27,7 +29,50 @@ use serde_json::json;
 use std::process::ExitCode;
 
 #[derive(Parser)]
-#[command(name = "pyq", version, about = "Queryable static index for Python")]
+#[command(
+    name = "pyq",
+    version,
+    about = "Queryable static index for Python",
+    // clap has no native subcommand grouping, so the menu is a curated template.
+    // Per-command detail still comes from each variant's doc comment
+    // (`pyq <command> --help`) — this only shapes the top-level overview.
+    help_template = "\
+{about}
+
+Usage: {usage}
+
+Find & describe a symbol
+  refs <symbol>       Every reference (reads, writes, calls) to a symbol, cross-file.
+  callers <symbol>    Every call site of a symbol.
+  defs <symbol>       Every definition (function / class / variable / import).
+  describe <symbol>   Signature, callers, callees & reaching tests — one pack.
+
+Graph & relationships
+  graph <symbol>      Transitive call graph: callees, or callers with --reverse.
+  hierarchy <class>   Supertypes, subclasses, and the override map.
+  imports [module]    Import graph: edges, reverse deps (--reverse), or --cycles.
+
+Effects, tests & dead code
+  effects <symbol>    Side effects it transitively performs (fs / net / db / …).
+  tests <symbol>      Which collected tests are call-wired to a symbol.
+  deadcode            Callables reachable from no entrypoint (candidates).
+
+Whole-project surface
+  inputs              Env vars, files, CLI args & settings the project reads.
+  mock-targets        Resolve every mock.patch(...) and flag drifted targets.
+  canonical           Most-used helpers, untested public surface, test inventory.
+
+Dynamic — runs your test suite
+  trace               Side effects the suite actually performs at runtime.
+  effect-diff         Static effect surface vs. what the suite really does.
+  change-coverage     Which changed lines the suite covers (--base <ref>).
+  shapes              Concrete return types each callable produced at runtime.
+
+Options:
+{options}
+Run `pyq <command> --help` for the full description of any command.
+"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -77,6 +122,12 @@ enum Command {
     /// `Test*` classes). Each test carries the call path (`via`) and `depth` by
     /// which it reaches the symbol. The foundation for static change coverage.
     Tests { symbol: String },
+    /// One compact context pack for a symbol — signature, decorators, docstring
+    /// line, and def line-span, plus its immediate callers, immediate callees,
+    /// and the collected tests that reach it. The token-frugal "tell me about
+    /// X": everything an agent would otherwise grep for, in one envelope.
+    /// Accepts a bare name, a qualified name, or a full FQN.
+    Describe { symbol: String },
     /// The external input surface — env vars, literal files opened, CLI args,
     /// and pydantic settings fields. "What does this need to run."
     Inputs,
@@ -95,6 +146,14 @@ enum Command {
     /// entrypoint files/classes, and console scripts. Over-approximate liveness
     /// (so it under-reports death); residual dynamic dispatch is flagged.
     Deadcode,
+    /// The repo's canonical surface, in one pass: its **most-used** helpers
+    /// (internal callables ranked by how many distinct non-test callers use
+    /// them — what to reach for, not reinvent), its **untested-public** surface
+    /// (top-level public functions/classes no collected test statically
+    /// reaches), and the **test** inventory (every collected test with its
+    /// markers). The project-level "tell me about this codebase." Rows carry a
+    /// `section`. Same dynamic-dispatch blind spot as the call graph.
+    Canonical,
     /// The project import graph. With no module: every import edge. With a
     /// module (`pkg.models` or `pkg/models.py`): what it imports, or — with
     /// `--reverse` — who imports it (blast radius). `--cycles`: import cycles.
@@ -196,6 +255,7 @@ fn dispatch(cli: &Cli) -> anyhow::Result<Envelope> {
         | Command::Graph { symbol, .. }
         | Command::Tests { symbol }
         | Command::Hierarchy { symbol }
+        | Command::Describe { symbol }
         | Command::Effects { symbol } => Some(symbol.as_str()),
         _ => None,
     };
@@ -214,6 +274,7 @@ fn dispatch(cli: &Cli) -> anyhow::Result<Envelope> {
         Command::MockTargets => query_mock_targets(cli)?,
         Command::Hierarchy { symbol } => query_hierarchy(cli, symbol)?,
         Command::Deadcode => query_deadcode(cli)?,
+        Command::Canonical => canonical::query(&cli.root)?,
         Command::Imports {
             module,
             reverse,
@@ -231,6 +292,7 @@ fn dispatch(cli: &Cli) -> anyhow::Result<Envelope> {
             depth,
         } => query_graph(cli, symbol, *reverse, *depth)?,
         Command::Effects { symbol } => query_effects(cli, symbol)?,
+        Command::Describe { symbol } => describe::query(&cli.root, symbol)?,
         Command::Tests { symbol } => query_tests(cli, symbol)?,
         Command::Trace {
             pytest_args,
@@ -296,15 +358,30 @@ fn resolve(
 }
 
 fn loc_to_json(loc: &Loc) -> serde_json::Value {
+    // Group by kind (the classifier that used to repeat on every line); the body
+    // is just the resolved target when the use is ambiguous, else nothing — so a
+    // grouped row is a clean column of locations.
+    let cols: Vec<String> = match &loc.resolves_to {
+        Some(target) => vec![format!("→ {target}")],
+        None => Vec::new(),
+    };
     let mut v = json!({
         "loc": format!("{}:{}:{}", loc.path, loc.line, loc.col),
         "label": loc.kind,
         "role": loc.role,
+        "group": loc.kind,
+        "cols": cols,
     });
     if let Some(target) = &loc.resolves_to {
         v["resolves_to"] = json!(target);
     }
     v
+}
+
+/// The trailing component of a dotted FQN (`pkg.mod.f` → `f`) — the readable
+/// short form for a `via` edge in the human view.
+fn leaf(fqn: &str) -> &str {
+    fqn.rsplit('.').next().unwrap_or(fqn)
 }
 
 /// The transitive call graph of a symbol — forward (callees) or, with
@@ -383,6 +460,10 @@ fn query_tests(cli: &Cli, symbol: &str) -> anyhow::Result<Envelope> {
                 "fqn": n.fqn,
                 "depth": n.depth,
                 "via": n.via,
+                // Sectioned by reachability ring; the body is the test FQN and
+                // the edge it arrived on.
+                "group": format!("depth {}", n.depth),
+                "cols": [n.fqn.clone(), format!("via {}", leaf(&n.via))],
             })
         })
         .collect();
@@ -419,6 +500,9 @@ fn node_to_json(node: &GraphNode) -> serde_json::Value {
         "node_kind": node.kind,
         "depth": node.depth,
         "via": node.via,
+        // Concentric rings: one section per hop from the root.
+        "group": format!("depth {}", node.depth),
+        "cols": [node.fqn.clone(), format!("via {}", leaf(&node.via))],
     })
 }
 
@@ -473,6 +557,9 @@ fn query_effects(cli: &Cli, symbol: &str) -> anyhow::Result<Envelope> {
                 owner.clone()
             };
             let label = format!("{cat} {}  in {in_label}", e.detail);
+            // Section by category; columns are the API, its owner, and an
+            // import-time flag (blank when it runs inside a function).
+            let flag = if e.import_time { "import-time" } else { "" };
             rows.push((
                 loc.clone(),
                 json!({
@@ -482,6 +569,8 @@ fn query_effects(cli: &Cli, symbol: &str) -> anyhow::Result<Envelope> {
                     "api": e.detail,
                     "owner": owner,
                     "import_time": e.import_time,
+                    "group": cat,
+                    "cols": [e.detail.clone(), owner.clone(), flag.to_string()],
                 }),
                 cat,
             ));
@@ -598,18 +687,21 @@ fn query_effect_diff(
             results.push(json!({
                 "status": "confirmed", "effect": cat, "owner": owner, "loc": loc,
                 "label": format!("confirmed {cat}  {owner}"),
+                "group": "confirmed", "cols": [cat.to_string(), owner.clone()],
             }));
         } else if AUDITABLE.contains(cat) {
             n_static += 1;
             results.push(json!({
                 "status": "static-only", "effect": cat, "owner": owner, "loc": loc,
                 "label": format!("static-only {cat}  {owner} (over-approx or unexercised)"),
+                "group": "static-only", "cols": [cat.to_string(), owner.clone(), "over-approx or unexercised".to_string()],
             }));
         } else {
             n_unverif += 1;
             results.push(json!({
                 "status": "unverifiable", "effect": cat, "owner": owner, "loc": loc,
                 "label": format!("unverifiable {cat}  {owner} (category not audited)"),
+                "group": "unverifiable", "cols": [cat.to_string(), owner.clone(), "category not audited".to_string()],
             }));
         }
     }
@@ -620,6 +712,7 @@ fn query_effect_diff(
             results.push(json!({
                 "status": "dynamic-only", "effect": cat, "owner": owner,
                 "label": format!("dynamic-only {cat}  {owner} (static missed this edge)"),
+                "group": "dynamic-only", "cols": [cat.clone(), owner.clone(), "static missed this edge".to_string()],
             }));
         }
     }
@@ -703,6 +796,7 @@ fn query_change_cov(
                         "loc": format!("{file}:{ln}"),
                         "status": "unknown",
                         "label": format!("unknown {file}:{ln} (line coverage needs Python 3.12+)"),
+                        "group": "unknown", "cols": [],
                     })
                 })
             })
@@ -731,12 +825,15 @@ fn query_change_cov(
                 covered += 1;
                 let mut tests = cov.covering_tests(file, ln);
                 tests.sort();
+                let n_tests = tests.len();
                 results.push(json!({
                     "loc": format!("{file}:{ln}"),
                     "status": "covered",
                     "tests": tests,
                     "label": format!("covered {file}:{ln}  ({} test{})",
-                        tests.len(), if tests.len() == 1 { "" } else { "s" }),
+                        n_tests, if n_tests == 1 { "" } else { "s" }),
+                    "group": "covered",
+                    "cols": [format!("{n_tests} test{}", if n_tests == 1 { "" } else { "s" })],
                 }));
             } else {
                 uncovered += 1;
@@ -744,6 +841,7 @@ fn query_change_cov(
                     "loc": format!("{file}:{ln}"),
                     "status": "uncovered",
                     "label": format!("uncovered {file}:{ln}"),
+                    "group": "uncovered", "cols": [],
                 }));
             }
         }
@@ -825,6 +923,9 @@ fn query_shapes(
                 "owner": fqn,
                 "returns": types,
                 "label": format!("{fqn} -> {}", types.join(" | ")),
+                // No loc (runtime observation); two columns: callable and the
+                // union of return types it was seen to produce.
+                "cols": [fqn.clone(), format!("-> {}", types.join(" | "))],
             })
         })
         .collect();
@@ -880,6 +981,8 @@ fn query_inputs(files: &[FileIndex]) -> Envelope {
             results.push(json!({
                 "loc": format!("{}:{}:{}", f.path, i.pos.line, i.pos.col),
                 "label": format!("{kind} {}", i.value),
+                "group": kind,
+                "cols": [i.value.clone()],
             }));
         }
     }
@@ -928,6 +1031,7 @@ fn query_hierarchy(cli: &Cli, symbol: &str) -> anyhow::Result<Envelope> {
                 "loc": loc_of.get(&base).cloned().unwrap_or_else(|| root_loc.clone()),
                 "label": format!("supertype {base}"),
                 "relation": "supertype", "fqn": base,
+                "group": "supertypes", "cols": [base.clone()],
             }));
         }
         for ext in h.external_bases(root) {
@@ -935,6 +1039,7 @@ fn query_hierarchy(cli: &Cli, symbol: &str) -> anyhow::Result<Envelope> {
                 "loc": root_loc,
                 "label": format!("supertype {ext} (external)"),
                 "relation": "supertype-external", "fqn": ext,
+                "group": "supertypes (external)", "cols": [ext.clone()],
             }));
         }
         // Subclasses (transitive, first-party).
@@ -943,6 +1048,7 @@ fn query_hierarchy(cli: &Cli, symbol: &str) -> anyhow::Result<Envelope> {
                 "loc": loc_of.get(&sub).cloned().unwrap_or_else(|| root_loc.clone()),
                 "label": format!("subtype {sub}"),
                 "relation": "subtype", "fqn": sub,
+                "group": "subtypes", "cols": [sub.clone()],
             }));
         }
         // Override map: methods of this class that override a base method, and
@@ -957,6 +1063,7 @@ fn query_hierarchy(cli: &Cli, symbol: &str) -> anyhow::Result<Envelope> {
                         "loc": loc_of.get(&mfqn).cloned().unwrap_or_else(|| root_loc.clone()),
                         "label": format!("{mfqn} overrides {base}.{m}"),
                         "relation": "overrides", "fqn": format!("{base}.{m}"),
+                        "group": "overrides", "cols": [format!("{mfqn}  →  {base}.{m}")],
                     }));
                 }
                 for sub in h.overridden_by(root, m) {
@@ -964,6 +1071,7 @@ fn query_hierarchy(cli: &Cli, symbol: &str) -> anyhow::Result<Envelope> {
                         "loc": loc_of.get(&format!("{sub}.{m}")).cloned().unwrap_or_else(|| root_loc.clone()),
                         "label": format!("{sub}.{m} overrides {mfqn}"),
                         "relation": "overridden-by", "fqn": format!("{sub}.{m}"),
+                        "group": "overridden by", "cols": [format!("{sub}.{m}  →  {mfqn}")],
                     }));
                 }
             }
@@ -1012,6 +1120,8 @@ fn query_deadcode(cli: &Cli) -> anyhow::Result<Envelope> {
                 "label": format!("{} {}", d.kind, d.fqn),
                 "fqn": d.fqn,
                 "node_kind": d.kind,
+                "group": d.kind,
+                "cols": [d.fqn.clone()],
             })
         })
         .collect();
@@ -1075,13 +1185,21 @@ fn query_mock_targets(cli: &Cli) -> anyhow::Result<Envelope> {
                 drifted += 1;
                 warnings.push(format!("drifted patch `{shown}` ({loc}): {}", detail.clone().unwrap_or_default()));
             }
+            // Section by resolution status; columns are the patched target and
+            // (for drifted/unverifiable) the reason.
+            let cols: Vec<String> = match &detail {
+                Some(why) => vec![shown.to_string(), why.clone()],
+                None => vec![shown.to_string()],
+            };
             rows.push((
-                loc.clone(),
+                format!("{tag}{loc}"),
                 json!({
                     "loc": loc,
                     "label": label,
                     "target": m.target,
                     "status": tag,
+                    "group": tag,
+                    "cols": cols,
                 }),
             ));
         }
@@ -1127,6 +1245,7 @@ fn query_imports(
             results.push(json!({
                 "loc": loc,
                 "label": format!("cycle: {}", path.join(" → ")),
+                "cols": [path.join(" → ")],
             }));
         }
         let summary = format!("{} import {}", results.len(), plural(results.len(), "cycle"));
@@ -1152,7 +1271,7 @@ fn query_imports(
             if reverse {
                 for e in g.edges.iter().filter(|e| e.target == m) {
                     let loc = loc_str(&e.importer_file, e.pos);
-                    rows.push((loc.clone(), json!({ "loc": loc, "label": format!("imported by {}", e.importer) })));
+                    rows.push((loc.clone(), json!({ "loc": loc, "label": format!("imported by {}", e.importer), "cols": [e.importer.clone()] })));
                 }
                 let summary = if !known {
                     format!("module `{m}` not found in project")
@@ -1164,7 +1283,8 @@ fn query_imports(
                 for e in g.edges.iter().filter(|e| e.importer == m) {
                     let loc = loc_str(&e.importer_file, e.pos);
                     let tag = if e.internal { "" } else { " (ext)" };
-                    rows.push((format!("{}{}", e.target, loc), json!({ "loc": loc, "label": format!("imports {}{}", e.target, tag) })));
+                    let group = if e.internal { "internal" } else { "external" };
+                    rows.push((format!("{}{}", e.target, loc), json!({ "loc": loc, "label": format!("imports {}{}", e.target, tag), "group": group, "cols": [e.target.clone()] })));
                 }
                 let summary = if !known {
                     format!("module `{m}` not found in project")
@@ -1178,7 +1298,8 @@ fn query_imports(
             for e in &g.edges {
                 let loc = loc_str(&e.importer_file, e.pos);
                 let tag = if e.internal { "" } else { " (ext)" };
-                rows.push((loc.clone(), json!({ "loc": loc, "label": format!("{} → {}{}", e.importer, e.target, tag) })));
+                // Section per importer module; the body is the edge target.
+                rows.push((format!("{}{}", e.importer, loc), json!({ "loc": loc, "label": format!("{} → {}{}", e.importer, e.target, tag), "group": e.importer.clone(), "cols": [format!("→ {}{}", e.target, tag)] })));
             }
             ("all", format!("{} import {}", rows.len(), plural(rows.len(), "edge")))
         }

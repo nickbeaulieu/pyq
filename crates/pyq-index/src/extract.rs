@@ -5,9 +5,11 @@
 //! agent is mid-edit on should still answer queries).
 
 use ruff_python_ast::visitor::{walk_expr, walk_stmt, Visitor};
-use ruff_python_ast::{CmpOp, Expr, ExprContext, PySourceType, Stmt, StmtClassDef};
+use ruff_python_ast::{
+    CmpOp, Decorator, Expr, ExprContext, PySourceType, Stmt, StmtClassDef, StmtFunctionDef,
+};
 use ruff_python_parser::parse_unchecked_source;
-use ruff_text_size::{Ranged, TextSize};
+use ruff_text_size::{Ranged, TextRange, TextSize};
 
 use crate::model::{
     Def, DefKind, Effect, EffectKind, FileIndex, ImportContext, ImportStmt, Input, InputKind,
@@ -231,15 +233,22 @@ impl<'src> Collector<'src> {
     }
 
     fn push_def(&mut self, name: &str, kind: DefKind, offset: TextSize) {
+        let pos = self.pos(offset);
         self.defs.push(Def {
             name: name.to_string(),
             kind,
-            pos: self.pos(offset),
+            pos,
             offset: offset.to_u32(),
             container: self.scope.clone(),
             nested: self.depth > 0,
             bases: Vec::new(),
             decorated: false,
+            decorators: Vec::new(),
+            signature: None,
+            doc: None,
+            // A single-line binding ends on its own line; function/class defs
+            // overwrite this with the span of their full body below.
+            end_line: pos.line,
         });
     }
 }
@@ -249,10 +258,20 @@ impl<'src, 'ast> Visitor<'ast> for Collector<'src> {
         match stmt {
             Stmt::FunctionDef(f) => {
                 self.push_def(f.name.as_str(), DefKind::Function, f.name.start());
-                if !f.decorator_list.is_empty() {
-                    if let Some(last) = self.defs.last_mut() {
-                        last.decorated = true;
-                    }
+                // The describe facets — signature, decorators, docstring, span — read
+                // off the same parse. Copy the source/line refs out first so the
+                // `last_mut` borrow doesn't collide with reading `self`.
+                let (source, lines) = (self.source, self.lines);
+                let signature = render_signature(f, source);
+                let decorators = render_decorators(&f.decorator_list, source);
+                let doc = first_doc_line(&f.body);
+                let end_line = lines.pos(f.range().end().to_usize(), source).line;
+                if let Some(last) = self.defs.last_mut() {
+                    last.decorated = !f.decorator_list.is_empty();
+                    last.decorators = decorators;
+                    last.signature = Some(signature);
+                    last.doc = doc;
+                    last.end_line = end_line;
                 }
                 self.depth += 1;
                 self.func_depth += 1;
@@ -291,9 +310,16 @@ impl<'src, 'ast> Visitor<'ast> for Collector<'src> {
                 // inherit members we can't see (`User._save_table` from Django's
                 // `Model`), so a missing attribute on a class with bases is not
                 // provably absent.
+                let (source, lines) = (self.source, self.lines);
+                let decorators = render_decorators(&c.decorator_list, source);
+                let doc = first_doc_line(&c.body);
+                let end_line = lines.pos(c.range().end().to_usize(), source).line;
                 if let Some(last) = self.defs.last_mut() {
                     last.bases = class_bases(c).collect();
                     last.decorated = !c.decorator_list.is_empty();
+                    last.decorators = decorators;
+                    last.doc = doc;
+                    last.end_line = end_line;
                 }
                 // A pydantic BaseSettings subclass: its annotated class-level
                 // fields are configuration inputs.
@@ -532,6 +558,57 @@ fn class_bases(c: &StmtClassDef) -> impl Iterator<Item = String> + '_ {
         .iter()
         .flat_map(|a| a.args.iter())
         .filter_map(dotted_name)
+}
+
+/// The function's signature as written: the parenthesized parameter list
+/// (ruff's `Parameters` range spans the `(`…`)`) plus its return annotation,
+/// whitespace-normalized so a multi-line signature reads on one line.
+fn render_signature(f: &StmtFunctionDef, source: &str) -> String {
+    let mut sig = slice_normalized(source, f.parameters.range());
+    if let Some(returns) = &f.returns {
+        sig.push_str(" -> ");
+        sig.push_str(&slice_normalized(source, returns.range()));
+    }
+    sig
+}
+
+/// Each decorator as written, without the leading `@` — a faithful slice so the
+/// call-form ones (`@app.route("/x")`) survive, not just bare names.
+fn render_decorators(decorators: &[Decorator], source: &str) -> Vec<String> {
+    decorators
+        .iter()
+        .map(|d| slice_normalized(source, d.expression.range()))
+        .collect()
+}
+
+/// The first non-empty line of a def's docstring (its body's leading string
+/// expression), trimmed — `None` when there's no docstring.
+fn first_doc_line(body: &[Stmt]) -> Option<String> {
+    let Some(Stmt::Expr(e)) = body.first() else {
+        return None;
+    };
+    let Expr::StringLiteral(s) = e.value.as_ref() else {
+        return None;
+    };
+    let text = s.value.to_str();
+    text.lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .map(str::to_string)
+}
+
+/// The source text for a range with internal runs of whitespace (including
+/// newlines) collapsed to single spaces — keeps a signature/decorator on one
+/// line. Byte ranges from ruff are always char-aligned, so the slice is safe.
+/// Spaces hugging the inside of a paren are dropped so a multi-line `(\n  x,\n)`
+/// reads as `(x,)`, not `( x, )`.
+fn slice_normalized(source: &str, range: TextRange) -> String {
+    let raw = &source[range.start().to_usize()..range.end().to_usize()];
+    raw.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .replace("( ", "(")
+        .replace(" )", ")")
 }
 
 /// The value of a string-literal argument, if the expr is one.

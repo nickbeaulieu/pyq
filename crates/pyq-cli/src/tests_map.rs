@@ -29,7 +29,7 @@
 //! silently assumed away.
 
 use crate::plural;
-use pyq_index::{DefKind, FileIndex};
+use pyq_index::{Def, DefKind, FileIndex};
 use pyq_resolve::{scope_fqn, GraphNode};
 use std::collections::HashSet;
 use std::path::Path;
@@ -107,6 +107,24 @@ pub fn is_test_node(node: &GraphNode, test_classes: &HashSet<String>) -> bool {
     match node.kind {
         "method" => test_classes.contains(class_fqn),
         _ => true,
+    }
+}
+
+/// Whether a *def* is a pytest-collected test, from the syntactic index alone
+/// (no call graph): a `test`-prefixed function in a test file, that is either
+/// module-level or a method on a class in `test_classes`. The def-level mirror
+/// of [`is_test_node`] — `deadcode` (seeding test roots) and `canonical` (the
+/// test inventory + the "reached by a test" set) both need it before any graph
+/// node exists.
+pub fn is_collected_test_def(d: &Def, path: &str, test_classes: &HashSet<String>) -> bool {
+    if !is_test_file(path) || d.kind != DefKind::Function || !is_test_name(&d.name) {
+        return false;
+    }
+    match d.container.last() {
+        // A method: its enclosing class must be one pytest collects.
+        Some(_) => test_classes.contains(&scope_fqn(path, &d.container)),
+        // A free function in a test file.
+        None => true,
     }
 }
 

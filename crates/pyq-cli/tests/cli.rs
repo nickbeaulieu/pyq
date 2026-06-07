@@ -88,6 +88,8 @@ fn query_block_is_uniform_across_verbs() {
         vec!["graph", "User"],
         vec!["effects", "User"],
         vec!["tests", "User"],
+        vec!["describe", "User"],
+        vec!["canonical"],
         vec!["inputs"],
         vec!["imports"],
     ] {

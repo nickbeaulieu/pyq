@@ -24,10 +24,6 @@ completed work is logged at the bottom. `→ blocked by #N` marks a dependency.
   closure: everything that must change / be re-tested if a symbol's signature
   changes (reverse call graph + import graph + reaching tests). (now unblocked:
   `CallGraph` reverse closure + the import graph)
-- **#15 · `card` verb — symbol signature + neighborhood.** One compact context
-  pack: signature, decorators, docstring line, def line-range, immediate callers
-  + callees + reaching tests. The token-frugal "tell me about X". (now unblocked:
-  `CallGraph` depth-1 neighbours)
 
 ### P4 — resolution surface & convenience
 - **#16 · resolution-surface verbs — `resolve` / re-exports / `imports-from`.**
@@ -42,10 +38,6 @@ completed work is logged at the bottom. `→ blocked by #N` marks a dependency.
 - **#19 · `raises` verb — static exception surface.** What a function transitively
   `raise`s and where it's caught. "What can blow up if I call this." (now
   unblocked: `CallGraph` forward closure)
-- **#20 · `canonical` verb — blessed-helper frequency + untested public.** Rank
-  internal symbols by use to surface the repo's blessed helpers; plus public
-  surface ∩ no reaching test; plus a test inventory with markers.
-
 ### P5 — polish / big & separate
 - **#9 · Dynamic tier sidecar.** Bundled Python sidecar driven by the Rust CLI:
   `sys.addaudithook` (effect ledger), `sys.monitoring` (coverage + observed
@@ -150,6 +142,51 @@ completed work is logged at the bottom. `→ blocked by #N` marks a dependency.
   classes (non-`Test*` names) were missed by a name-only rule — fixed to detect
   `*TestCase` bases; root must be the package root or `pkg.sub` imports don't
   link (documented).
+- **#15 · `describe` verb — symbol signature + neighborhood.** One compact
+  context pack in a single envelope (the token-frugal "tell me about X"): the
+  definition facet — signature (params + return annotation; bases for a class),
+  decorators as written, first docstring line, def line-span — plus its
+  **immediate** callers and callees (depth-1 `CallGraph` both directions) and the
+  collected tests that reach it (reverse-closure test filter, reused from #13a).
+  Rows tagged `role` (`definition`/`caller`/`callee`/`test`). New `Def` fields
+  (`signature`/`decorators`/`doc`/`end_line`) extracted off the same parse —
+  signature/decorators are whitespace-normalized source slices (ruff's
+  `Parameters` range spans the parens), docstring is the body's leading string
+  literal. Inherits the call graph's dynamic-dispatch blind spot (flagged);
+  ambiguous names get one definition row per resolved def with a union
+  neighbourhood (flagged). *Named `describe` over the spec's `card`* for
+  discoverability — the `kubectl describe` mental model (attributes + relations)
+  is exactly this verb's shape.
+- **#20 · `canonical` verb — most-used helpers + untested public + test
+  inventory.** The project-level "tell me about this codebase," three facets in
+  one envelope, rows tagged `section`. **`most-used`**: internal callables
+  ranked by distinct caller count, counting only callers *defined outside the
+  test tree* — a new whole-project `CallGraph::caller_index` (one `outgoing_at`
+  sweep per node, accumulating the reverse of each resolved call edge; recursion
+  self-edges and third-party callees dropped). Floor of ≥2 non-test callers, top
+  30; candidates in the test tree or an entrypoint file (`scripts/`/`manage.py`/
+  migrations/management-commands, via `deadcode::is_entrypoint_file`) and dunders
+  excluded — glue, not reusable utilities (entrypoint *callers* still count).
+  **`untested-public`**: top-level non-`_` functions/classes outside the *tests'*
+  forward closure — the same `reachable_from` + override-edge machinery as
+  `deadcode`, seeded from the collected-test defs instead of entrypoints (so a
+  symbol reached only polymorphically from a test still counts tested); a class
+  counts tested if it or any of its methods is reached. Framework-driven symbols
+  are then subtracted via a new shared `deadcode::framework_entry_fqns`
+  (decorated handlers, external-base classes, entrypoint files, string-config
+  targets — `__all__` deliberately kept) so the list isn't swamped by
+  serializers/configs/migrations Django drives through dispatch — on real Django
+  repos this cut it ~80–90% (alice 835→89, scoring 1248→233) down to the plain
+  untested service/helper functions. Extracted `framework_managed_classes` +
+  `is_framework_entry` so `deadcode`'s root rule and this filter share one
+  definition. **`test`**: every collected test with markers parsed off its own and
+  its class's decorators (`pytest.mark.*`, class-level marks inherited). Factored
+  `def_anchors`/`override_edges` out of `deadcode` and a def-level
+  `is_collected_test_def` into `tests_map` so both verbs share one definition of
+  "reached" and "collected." Inherits the call graph's dynamic-dispatch blind
+  spot, which cuts both ways here (undercounts `most-used`, over-reports
+  `untested-public`) — flagged: "untested" = no *static* reaching test, not
+  "uncovered" (`change-coverage` is the runtime oracle).
 - **#18 · `mock-targets` verb.** Resolve every `mock.patch("a.b.c")` string
   against the project's module/symbol structure and flag *drifted* paths (the
   patch-where-looked-up gotcha — a silently-no-op patch). Built a focused
