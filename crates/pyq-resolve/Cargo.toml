@@ -8,6 +8,7 @@ license.workspace = true
 pyq-index.workspace = true
 ruff_text_size.workspace = true
 anyhow.workspace = true
+serde.workspace = true
 toml = "1"
 
 # The ty stack — pinned to the same ruff tag as the rest. All contact with ty is

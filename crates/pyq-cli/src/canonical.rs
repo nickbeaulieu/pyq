@@ -49,7 +49,7 @@ const MOST_USED_FLOOR: usize = 2;
 
 /// Build the canonical overview of the project at `root`.
 pub fn query(root: &str) -> anyhow::Result<Envelope> {
-    let files = walk::index_tree(root)?;
+    let (files, fingerprint) = crate::cache::indexed(root)?;
     let scope = walk::walked_py_files(root);
     let test_classes = tests_map::test_class_fqns(&files);
 
@@ -86,7 +86,7 @@ pub fn query(root: &str) -> anyhow::Result<Envelope> {
         }
     }
 
-    let graph = CallGraph::new(root, files.clone(), scope)?;
+    let graph = crate::cache::call_graph(root, &files, scope, &fingerprint)?;
     let hier = hierarchy::Hierarchy::build(&files, &graph);
 
     let most_used = most_used_rows(&graph, &info, &test_tree_fqns, &entrypoint_fqns);

@@ -23,19 +23,31 @@ accuracy thesis" and "The analysis cache."
   explicit `pyq analyze` pre-warm. Lockfile + atomic temp-then-rename for fan-out
   safety. Needs serde derives on the `pyq-resolve` graph types + a binary format
   (`bincode`/`postcard`). → enables #39, #40.
-  - **#38.1** fingerprint + manifest + stat/hash sweep + cache dir layout. *Partly
-    done:* per-file stat (`size`+`mtime_ns`) → `blake3` fingerprint, the `ParseCache`
+  - **#38.1** fingerprint + manifest + stat/hash sweep + cache dir layout. *Done.*
+    Per-file stat (`size`+`mtime_ns`) → `blake3` fingerprint, the `ParseCache`
     manifest, `~/.pyq/cache/<root-hash>/` layout (+ `PYQ_CACHE_DIR` override,
-    `PYQ_NO_CACHE` bypass), and atomic temp→rename writes all shipped in
-    `pyq-cli/src/cache.rs`. *Remaining:* the whole-tree fingerprint that keys the
-    graph/ledger layers (#38.3/#38.4).
+    `PYQ_NO_CACHE` bypass), atomic temp→rename writes, and the **whole-tree
+    fingerprint** (a `blake3` over every file's content hash, sorted) that keys
+    the graph layer — all in `pyq-cli/src/cache.rs`.
   - **#38.2** persist/load the parse layer (per-file, incremental). *Done.*
     `cache::index_tree` reuses unchanged files' `FileIndex` and re-parses only
     changed ones; drop-in for `walk::index_tree`, all parse call sites routed
     through it. Best-effort (any cache failure falls back to a full parse).
     `FileIndex` gained `Deserialize`. Tests: `pyq-cli/tests/cache.rs` (cold==warm,
     equal-size edit invalidation, add/remove).
-  - **#38.3** persist/load the graph layer (serialize ty-derived facts; cheap path never instantiates ty).
+  - **#38.3** persist/load the graph layer (serialize ty-derived facts; cheap path never instantiates ty). *Done.*
+    `CallGraph` now traverses against a `CallGraphTy` trait — either live ty
+    (`TyResolver`) or `ReplayTy` over a recorded `GraphRecording`. A cold run
+    builds the live graph, `record()`s its full ty-query surface (a worklist
+    closure over `outgoing`/`incoming` for every reachable callable offset, plus
+    `supertypes` per class and `resolve`/`incoming` per occurrence), and persists
+    it to `graph.bin` keyed by the tree fingerprint; a warm run replays with **no
+    ty**. All graph verbs (graph/effects/tests/describe/deadcode/canonical/
+    hierarchy) routed through `cache::call_graph`; `mock-targets` stays live (it's
+    the only `module_member` user). Validated byte-identical cold==warm==no-cache
+    across every graph verb (`tests/cache.rs`); ~50× warm speedup on the sample.
+    *v1 caveat:* a cold run records the whole graph (more work than one query),
+    and any source change rebuilds the whole recording — #38.5 incrementalizes.
   - **#38.4** persist/load the ledger layer; `pyq analyze` pre-warm + progress streaming.
   - **#38.5** v2 incremental: re-resolve only edges touching changed FQNs; re-run only tests the coverage map ties to changed lines.
 - **#39 · Per-row `confidence` in the envelope.** Structural provenance tag on every

@@ -22,18 +22,25 @@
 //! read-only `$HOME`).
 
 use std::collections::BTreeMap;
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
 use anyhow::Result;
 use pyq_index::FileIndex;
+use pyq_resolve::{CallGraph, GraphRecording};
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 use crate::walk;
 
-/// Bumped whenever the on-disk shape changes (a new `FileIndex` field, a format
-/// switch). A mismatch discards the cache rather than misreading it.
+/// Bumped whenever the on-disk parse shape changes (a new `FileIndex` field, a
+/// format switch). A mismatch discards the cache rather than misreading it.
 const SCHEMA_VERSION: u32 = 1;
+
+/// Independent version for the graph layer (the recorded ty edges). Bumped when
+/// the `GraphRecording` shape changes.
+const GRAPH_SCHEMA: u32 = 1;
 
 /// One cached file: the stat fingerprint that validates it plus the parsed
 /// facts. `hash` lets a touch-without-change (mtime moved, bytes identical)
@@ -67,24 +74,32 @@ impl Default for ParseCache {
 /// that haven't changed and re-parsing only the ones that have. Drop-in for
 /// [`walk::index_tree`]; identical results, cheaper on repeat.
 pub fn index_tree(root: &str) -> Result<Vec<FileIndex>> {
+    Ok(indexed(root)?.0)
+}
+
+/// Like [`index_tree`], but also returns the **whole-tree fingerprint** — a hash
+/// over every file's content hash, the key the graph and ledger layers validate
+/// against. Empty string when caching is off (`PYQ_NO_CACHE` or a fall-back
+/// parse), which downstream layers read as "don't cache."
+pub fn indexed(root: &str) -> Result<(Vec<FileIndex>, String)> {
     if std::env::var_os("PYQ_NO_CACHE").is_some() {
-        return walk::index_tree(root);
+        return Ok((walk::index_tree(root)?, String::new()));
     }
     // The cache is an optimization, never a correctness dependency: any failure
     // (no `$HOME`, unreadable cache dir, a deserialize miss) degrades to a full
-    // parse.
+    // parse with no fingerprint.
     match cached_index(root) {
-        Ok(files) => Ok(files),
-        Err(_) => walk::index_tree(root),
+        Ok(pair) => Ok(pair),
+        Err(_) => Ok((walk::index_tree(root)?, String::new())),
     }
 }
 
-fn cached_index(root: &str) -> Result<Vec<FileIndex>> {
+fn cached_index(root: &str) -> Result<(Vec<FileIndex>, String)> {
     let dir = cache_dir(root);
-    let mut prev = dir
+    let mut prev: ParseCache = dir
         .as_ref()
-        .and_then(|d| load(&d.join("parse.bin")))
-        .filter(|c| c.schema == SCHEMA_VERSION)
+        .and_then(|d| read_bin(&d.join("parse.bin")))
+        .filter(|c: &ParseCache| c.schema == SCHEMA_VERSION)
         .unwrap_or_default();
 
     let mut next: BTreeMap<String, CachedFile> = BTreeMap::new();
@@ -155,15 +170,28 @@ fn cached_index(root: &str) -> Result<Vec<FileIndex>> {
     if next.len() != prev.entries.len() {
         dirty = true;
     }
+
+    // Whole-tree fingerprint: a hash over every file's (path, content hash) in
+    // sorted order (`next` is a BTreeMap, so iteration is sorted). Identical
+    // parse output → identical fingerprint, independent of mtimes.
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(&SCHEMA_VERSION.to_le_bytes());
+    for (rel, cf) in &next {
+        hasher.update(rel.as_bytes());
+        hasher.update(&[0]);
+        hasher.update(&cf.hash);
+    }
+    let fingerprint = hasher.finalize().to_hex().to_string();
+
     prev.entries = next;
     prev.schema = SCHEMA_VERSION;
 
     if dirty {
         if let Some(dir) = dir {
-            let _ = store(&dir, &prev);
+            let _ = write_bin(&dir, "parse.bin", &prev);
         }
     }
-    Ok(out)
+    Ok((out, fingerprint))
 }
 
 /// `~/.pyq/cache/<root-hash>/` — global, namespaced per repo by a hash of the
@@ -181,20 +209,68 @@ fn cache_dir(root: &str) -> Option<PathBuf> {
     Some(base.join(key.as_str()))
 }
 
-fn load(path: &Path) -> Option<ParseCache> {
+/// The persisted graph layer: the recorded ty edges plus the fingerprint they
+/// were recorded against. A fingerprint mismatch means the source moved, so the
+/// recording is stale and rebuilt.
+#[derive(Serialize, Deserialize)]
+struct GraphCache {
+    schema: u32,
+    fingerprint: String,
+    recording: GraphRecording,
+}
+
+/// The transitive [`CallGraph`] over `root`, cache-backed: a warm run whose
+/// `fingerprint` matches the persisted recording replays it **without
+/// constructing ty**; a cold run (or a stale/empty fingerprint) builds the live
+/// graph, records its full ty-query surface, and persists it for next time.
+///
+/// `files`/`scope` are the same the caller would pass to [`CallGraph::new`].
+/// Recording on a cold run is extra work over answering a single query — the
+/// "first run pays" cost — but every run after is ty-free.
+pub fn call_graph(
+    root: &str,
+    files: &[FileIndex],
+    scope: HashSet<PathBuf>,
+    fingerprint: &str,
+) -> Result<CallGraph> {
+    let dir = cache_dir(root);
+
+    if !fingerprint.is_empty() {
+        if let Some(gc) = dir.as_ref().and_then(|d| read_bin::<GraphCache>(&d.join("graph.bin"))) {
+            if gc.schema == GRAPH_SCHEMA && gc.fingerprint == fingerprint {
+                return Ok(CallGraph::replay(files.to_vec(), gc.recording));
+            }
+        }
+    }
+
+    let graph = CallGraph::new(root, files.to_vec(), scope)?;
+    if !fingerprint.is_empty() {
+        if let Some(dir) = dir {
+            let cache = GraphCache {
+                schema: GRAPH_SCHEMA,
+                fingerprint: fingerprint.to_string(),
+                recording: graph.record(),
+            };
+            let _ = write_bin(&dir, "graph.bin", &cache);
+        }
+    }
+    Ok(graph)
+}
+
+fn read_bin<T: DeserializeOwned>(path: &Path) -> Option<T> {
     let bytes = std::fs::read(path).ok()?;
     bincode::deserialize(&bytes).ok()
 }
 
-/// Write the cache atomically: serialize to a pid-unique temp in the cache dir,
-/// then `rename` over `parse.bin`. The rename is atomic on the same filesystem,
+/// Write a cache blob atomically: serialize to a pid-unique temp in the cache
+/// dir, then `rename` over `name`. The rename is atomic on the same filesystem,
 /// so a concurrent reader never sees a torn file and concurrent writers at worst
 /// duplicate work (last writer wins, both products valid).
-fn store(dir: &Path, cache: &ParseCache) -> Result<()> {
+fn write_bin<T: Serialize>(dir: &Path, name: &str, value: &T) -> Result<()> {
     std::fs::create_dir_all(dir)?;
-    let bytes = bincode::serialize(cache)?;
-    let tmp = dir.join(format!("parse.bin.{}.tmp", std::process::id()));
+    let bytes = bincode::serialize(value)?;
+    let tmp = dir.join(format!("{name}.{}.tmp", std::process::id()));
     std::fs::write(&tmp, &bytes)?;
-    std::fs::rename(&tmp, dir.join("parse.bin"))?;
+    std::fs::rename(&tmp, dir.join(name))?;
     Ok(())
 }

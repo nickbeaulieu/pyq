@@ -54,7 +54,7 @@ struct Cli {
     #[arg(long, global = true)]
     pretty: bool,
 
-    /// Root directory to scan (defaults to the current directory).
+    /// Root directory to scan (defaults to the current dir).
     #[arg(long, global = true, default_value = ".")]
     root: String,
 }
@@ -274,15 +274,15 @@ fn help_menu(color: bool) -> String {
             ("tests", "<symbol>", "Which collected tests are call-wired to a symbol."),
             ("deadcode", "", "Callables reachable from no entrypoint (candidates)."),
         ]),
-        ("Whole-project surface", &[
+        ("Project surface", &[
             ("inputs", "", "Env vars, files, CLI args & settings the project reads."),
             ("mock-targets", "", "Resolve every mock.patch(...) and flag drifted targets."),
             ("canonical", "", "Most-used helpers, untested public surface, test inventory."),
         ]),
-        ("Dynamic — runs your test suite", &[
-            ("trace", "", "Side effects the suite actually performs at runtime."),
-            ("effect-diff", "", "Static effect surface vs. what the suite really does."),
-            ("change-coverage", "", "Which changed lines the suite covers (--base <ref>)."),
+        ("Dynamic", &[
+            ("trace", "", "Side effects actually performed at runtime."),
+            ("effect-diff", "", "Static effect surface vs. what code really executes."),
+            ("change-coverage", "", "Which changed lines the test suite covers (--base <ref>)."),
             ("shapes", "", "Concrete return types each callable produced at runtime."),
         ]),
     ];
@@ -297,7 +297,7 @@ fn help_menu(color: bool) -> String {
     }
     s += &format!("\n{h}Options{r}\n{{options}}\n");
     s += &format!("\n{d}pyq {} ({}){r}\n", env!("CARGO_PKG_VERSION"), env!("PYQ_GIT_SHA"));
-    s += &format!("{d}Run `pyq <command> --help` for the full description of any command.{r}\n");
+    s += &format!("\n{d}Run `pyq <command> --help` for the full description of any command.{r}");
     s
 }
 
@@ -448,9 +448,9 @@ fn query_graph(
     reverse: bool,
     depth: Option<usize>,
 ) -> anyhow::Result<Envelope> {
-    let files = cache::index_tree(&cli.root)?;
+    let (files, fingerprint) = cache::indexed(&cli.root)?;
     let scope = walk::walked_py_files(&cli.root);
-    let graph = CallGraph::new(&cli.root, files, scope)?;
+    let graph = cache::call_graph(&cli.root, &files, scope, &fingerprint)?;
     let dir = if reverse {
         Direction::Reverse
     } else {
@@ -488,13 +488,12 @@ fn query_graph(
 /// call-reachability lens for "which tests to run before this edit," not a
 /// coverage metric (dynamic dispatch is invisible; see `tests_map`).
 fn query_tests(cli: &Cli, symbol: &str) -> anyhow::Result<Envelope> {
-    let files = cache::index_tree(&cli.root)?;
+    let (files, fingerprint) = cache::indexed(&cli.root)?;
     let scope = walk::walked_py_files(&cli.root);
     // The classes pytest collects (Test*-named or *TestCase-subclassing) — built
-    // from the index before `files` is moved into the graph, since a graph node
-    // alone carries no base-class info.
+    // from the index up front, since a graph node alone carries no base-class info.
     let test_classes = tests_map::test_class_fqns(&files);
-    let graph = CallGraph::new(&cli.root, files, scope)?;
+    let graph = cache::call_graph(&cli.root, &files, scope, &fingerprint)?;
     let closure = graph.closure(symbol, Direction::Reverse, None);
 
     // A test may be a root (it reaches the symbol directly) only if the symbol
@@ -566,9 +565,9 @@ fn node_to_json(node: &GraphNode) -> serde_json::Value {
 /// symbol and everything it transitively calls (forward call closure), plus the
 /// import-time effects of every module that contributes a reachable callable.
 fn query_effects(cli: &Cli, symbol: &str) -> anyhow::Result<Envelope> {
-    let files = cache::index_tree(&cli.root)?;
+    let (files, fingerprint) = cache::indexed(&cli.root)?;
     let scope = walk::walked_py_files(&cli.root);
-    let graph = CallGraph::new(&cli.root, files.clone(), scope)?;
+    let graph = cache::call_graph(&cli.root, &files, scope, &fingerprint)?;
     let closure = graph.closure(symbol, Direction::Forward, None);
 
     // Everything reachable from the symbol, the roots included.
@@ -1050,9 +1049,9 @@ fn query_inputs(files: &[FileIndex]) -> Envelope {
 /// The class hierarchy of a symbol — supertypes, subclasses, and the override
 /// map. A projection of the resolved inheritance graph.
 fn query_hierarchy(cli: &Cli, symbol: &str) -> anyhow::Result<Envelope> {
-    let files = cache::index_tree(&cli.root)?;
+    let (files, fingerprint) = cache::indexed(&cli.root)?;
     let scope = walk::walked_py_files(&cli.root);
-    let graph = CallGraph::new(&cli.root, files.clone(), scope)?;
+    let graph = cache::call_graph(&cli.root, &files, scope, &fingerprint)?;
     let h = hierarchy::Hierarchy::build(&files, &graph);
 
     // FQN → display location, for classes and methods (the override targets).
@@ -1162,9 +1161,9 @@ fn fqn_names(fqn: &str, symbol: &str) -> bool {
 /// graph, seeds the entrypoint roots, and reports the callables the forward
 /// closure never reaches.
 fn query_deadcode(cli: &Cli) -> anyhow::Result<Envelope> {
-    let files = cache::index_tree(&cli.root)?;
+    let (files, fingerprint) = cache::indexed(&cli.root)?;
     let scope = walk::walked_py_files(&cli.root);
-    let graph = CallGraph::new(&cli.root, files.clone(), scope)?;
+    let graph = cache::call_graph(&cli.root, &files, scope, &fingerprint)?;
     let result = deadcode::find(&files, &graph, &cli.root);
 
     let results: Vec<serde_json::Value> = result

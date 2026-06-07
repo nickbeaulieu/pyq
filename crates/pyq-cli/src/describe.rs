@@ -18,13 +18,13 @@
 use crate::{plural, tests_map, walk};
 use pyq_index::{Def, DefKind, FileIndex};
 use pyq_output::Envelope;
-use pyq_resolve::{scope_fqn, CallGraph, Direction, GraphNode};
+use pyq_resolve::{scope_fqn, Direction, GraphNode};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 
 /// Build the description of `symbol` over the project at `root`.
 pub fn query(root: &str, symbol: &str) -> anyhow::Result<Envelope> {
-    let files = walk::index_tree(root)?;
+    let (files, fingerprint) = crate::cache::indexed(root)?;
     let scope = walk::walked_py_files(root);
     // The classes pytest collects, for the reaching-tests filter — built from the
     // index before `files` is cloned into the graph (a graph node carries no
@@ -43,7 +43,7 @@ pub fn query(root: &str, symbol: &str) -> anyhow::Result<Envelope> {
         }
     }
 
-    let graph = CallGraph::new(root, files.clone(), scope)?;
+    let graph = crate::cache::call_graph(root, &files, scope, &fingerprint)?;
     // Depth-1 callees; the full reverse closure (immediate callers are its
     // depth-1 nodes, reaching tests its test nodes at any depth) — two walks
     // cover all three neighbourhood facets.

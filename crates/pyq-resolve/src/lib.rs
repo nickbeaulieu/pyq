@@ -17,13 +17,17 @@ mod graph;
 mod ty_backed;
 mod unified;
 
-pub use graph::{scope_fqn, CallGraph, Closure, Direction, GraphNode};
+pub use graph::{
+    scope_fqn, CallGraph, CallGraphTy, Closure, Direction, GraphNode, GraphRecording, ReplayTy,
+};
+
+use serde::{Deserialize, Serialize};
 
 /// One immediate base class of a class, resolved by ty. `anchor` is the base's
 /// `(path, name offset)` when it's a first-party class in scope; `None` when the
 /// base is external (third-party/stdlib) or couldn't be resolved — the signal a
 /// class is framework-managed (it extends something pyq can't see into).
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SuperClass {
     pub name: String,
     pub anchor: Option<(String, u32)>,
