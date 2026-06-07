@@ -7,15 +7,17 @@
 
 mod deadcode;
 mod graph;
+mod hierarchy;
 mod mock;
 mod tests_map;
 mod walk;
 
 use clap::{Parser, Subcommand};
+use pyq_dynamic::{observed_effects, default_python, TraceOptions};
 use pyq_index::{extract, EffectKind, FileIndex, InputKind};
 use pyq_output::{Channel, Envelope};
 use pyq_resolve::{
-    scope_fqn, CallGraph, Direction, GraphNode, Loc, Resolver, TyResolver, UnifiedResolver,
+    scope_fqn, CallGraph, Direction, GraphNode, Loc, Resolver, UnifiedResolver,
 };
 use std::collections::{BTreeSet, HashSet};
 use serde_json::json;
@@ -79,6 +81,11 @@ enum Command {
     /// drifted paths — a patch whose target no longer exists silently does
     /// nothing, so the test passes while exercising the real code.
     MockTargets,
+    /// The class hierarchy of a symbol: its supertypes (bases, external marked)
+    /// and transitive subclasses, plus the override map — which base methods it
+    /// overrides and which subclasses override its methods. The OO-refactor
+    /// footgun, as data. Accepts a bare/qualified class name.
+    Hierarchy { symbol: String },
     /// Functions and classes reachable from no entrypoint — candidate dead code.
     /// Reachability runs forward from the roots an agent can't see are live:
     /// tests, dunders, decorated hooks, `__all__`, module-scope calls, framework
@@ -97,6 +104,19 @@ enum Command {
         /// Report import cycles among project modules.
         #[arg(long)]
         cycles: bool,
+    },
+    /// Run the project's test suite under the dynamic tier and report the side
+    /// effects it *actually* performs at runtime — the runtime oracle that
+    /// confirms/refutes the static `effects` verb on its dynamic-dispatch blind
+    /// spot. Keyed by the same FQNs, so the two join (effect-diff, #9.3). Runs
+    /// your tests: invoking it is consent, the same as typing `pytest`.
+    Trace {
+        /// Arguments passed through to pytest (test paths, `-k`, `-m`, …).
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        pytest_args: Vec<String>,
+        /// Python interpreter to drive (defaults to `$PYQ_PYTHON` or `python3`).
+        #[arg(long)]
+        python: Option<String>,
     },
 }
 
@@ -131,6 +151,7 @@ fn dispatch(cli: &Cli) -> anyhow::Result<Envelope> {
         | Command::Defs { symbol }
         | Command::Graph { symbol, .. }
         | Command::Tests { symbol }
+        | Command::Hierarchy { symbol }
         | Command::Effects { symbol } => Some(symbol.as_str()),
         _ => None,
     };
@@ -147,6 +168,7 @@ fn dispatch(cli: &Cli) -> anyhow::Result<Envelope> {
             query_inputs(&files)
         }
         Command::MockTargets => query_mock_targets(cli)?,
+        Command::Hierarchy { symbol } => query_hierarchy(cli, symbol)?,
         Command::Deadcode => query_deadcode(cli)?,
         Command::Imports {
             module,
@@ -166,6 +188,10 @@ fn dispatch(cli: &Cli) -> anyhow::Result<Envelope> {
         } => query_graph(cli, symbol, *reverse, *depth)?,
         Command::Effects { symbol } => query_effects(cli, symbol)?,
         Command::Tests { symbol } => query_tests(cli, symbol)?,
+        Command::Trace {
+            pytest_args,
+            python,
+        } => query_trace(cli, pytest_args, python.as_deref())?,
     };
 
     // Anchor every result to one resolved root, echoed in the query — so the
@@ -178,6 +204,21 @@ fn dispatch(cli: &Cli) -> anyhow::Result<Envelope> {
         obj.insert("root".to_string(), json!(root));
     }
     Ok(envelope)
+}
+
+/// The dynamic tier: run the suite under the bundled sidecar and report the
+/// effects observed at runtime. All interpreter/subprocess contact lives in
+/// `pyq-dynamic`; here we only translate flags and let the resulting envelope
+/// flow through the same rendering path as every static verb.
+fn query_trace(
+    cli: &Cli,
+    pytest_args: &[String],
+    python: Option<&str>,
+) -> anyhow::Result<Envelope> {
+    let mut opts = TraceOptions::new(cli.root.clone());
+    opts.python = python.map(str::to_string).unwrap_or_else(default_python);
+    opts.pytest_args = pytest_args.to_vec();
+    observed_effects(&opts)
 }
 
 /// Run one symbol query through the resolver and build the envelope. One engine,
@@ -477,6 +518,112 @@ fn query_inputs(files: &[FileIndex]) -> Envelope {
     Envelope::new(json!({ "kind": "inputs", "target": null }), results).with_summary(summary)
 }
 
+/// The class hierarchy of a symbol — supertypes, subclasses, and the override
+/// map. A projection of the resolved inheritance graph.
+fn query_hierarchy(cli: &Cli, symbol: &str) -> anyhow::Result<Envelope> {
+    let files = walk::index_tree(&cli.root)?;
+    let scope = walk::walked_py_files(&cli.root);
+    let graph = CallGraph::new(&cli.root, files.clone(), scope)?;
+    let h = hierarchy::Hierarchy::build(&files, &graph);
+
+    // FQN → display location, for classes and methods (the override targets).
+    let mut loc_of: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    for f in &files {
+        for d in &f.defs {
+            if matches!(d.kind, pyq_index::DefKind::Class | pyq_index::DefKind::Function) {
+                let mut scope = d.container.clone();
+                scope.push(d.name.clone());
+                loc_of.insert(
+                    scope_fqn(&f.path, &scope),
+                    format!("{}:{}:{}", f.path, d.pos.line, d.pos.col),
+                );
+            }
+        }
+    }
+
+    // Resolve the symbol to the class FQN(s) it names: exact, dotted-suffix, or
+    // bare leaf — the union, like the other symbol verbs.
+    let roots: Vec<String> = h
+        .class_fqns()
+        .filter(|fqn| fqn_names(fqn, symbol))
+        .cloned()
+        .collect();
+
+    let mut results = Vec::new();
+    for root in &roots {
+        let root_loc = loc_of.get(root).cloned().unwrap_or_default();
+        // Supertypes — first-party bases, then external (framework) bases.
+        for base in h.supers(root) {
+            results.push(json!({
+                "loc": loc_of.get(&base).cloned().unwrap_or_else(|| root_loc.clone()),
+                "label": format!("supertype {base}"),
+                "relation": "supertype", "fqn": base,
+            }));
+        }
+        for ext in h.external_bases(root) {
+            results.push(json!({
+                "loc": root_loc,
+                "label": format!("supertype {ext} (external)"),
+                "relation": "supertype-external", "fqn": ext,
+            }));
+        }
+        // Subclasses (transitive, first-party).
+        for sub in h.subclasses(root) {
+            results.push(json!({
+                "loc": loc_of.get(&sub).cloned().unwrap_or_else(|| root_loc.clone()),
+                "label": format!("subtype {sub}"),
+                "relation": "subtype", "fqn": sub,
+            }));
+        }
+        // Override map: methods of this class that override a base method, and
+        // methods overridden by a subclass.
+        if let Some(methods) = h.methods(root) {
+            let mut names: Vec<&String> = methods.iter().collect();
+            names.sort();
+            for m in names {
+                let mfqn = format!("{root}.{m}");
+                for base in h.overrides(root, m) {
+                    results.push(json!({
+                        "loc": loc_of.get(&mfqn).cloned().unwrap_or_else(|| root_loc.clone()),
+                        "label": format!("{mfqn} overrides {base}.{m}"),
+                        "relation": "overrides", "fqn": format!("{base}.{m}"),
+                    }));
+                }
+                for sub in h.overridden_by(root, m) {
+                    results.push(json!({
+                        "loc": loc_of.get(&format!("{sub}.{m}")).cloned().unwrap_or_else(|| root_loc.clone()),
+                        "label": format!("{sub}.{m} overrides {mfqn}"),
+                        "relation": "overridden-by", "fqn": format!("{sub}.{m}"),
+                    }));
+                }
+            }
+        }
+    }
+
+    let summary = if roots.is_empty() {
+        format!("no class named `{symbol}` found")
+    } else {
+        format!("{} {} for `{symbol}`", results.len(), plural(results.len(), "relation"))
+    };
+    let mut env = Envelope::new(
+        json!({ "kind": "hierarchy", "target": symbol, "roots": roots }),
+        results,
+    )
+    .with_summary(summary);
+    if roots.is_empty() {
+        env = env.with_warnings(vec![format!("no class named `{symbol}` found")]);
+    }
+    Ok(env)
+}
+
+/// Whether `fqn` is named by `symbol` — exact, dotted-suffix (source-root
+/// tolerant), or, when `symbol` is unqualified, by matching the leaf.
+fn fqn_names(fqn: &str, symbol: &str) -> bool {
+    fqn == symbol
+        || fqn.ends_with(&format!(".{symbol}"))
+        || (!symbol.contains('.') && fqn.rsplit('.').next() == Some(symbol))
+}
+
 /// Candidate dead code — callables reachable from no entrypoint. Builds the call
 /// graph, seeds the entrypoint roots, and reports the callables the forward
 /// closure never reaches.
@@ -524,17 +671,25 @@ fn query_deadcode(cli: &Cli) -> anyhow::Result<Envelope> {
 fn query_mock_targets(cli: &Cli) -> anyhow::Result<Envelope> {
     let files = walk::index_tree(&cli.root)?;
     let resolver = mock::PatchResolver::build(&files);
-    // ty lets the resolver follow an imported module into typeshed/site-packages
-    // to verify a tail attribute; best-effort, so a ty init failure just falls
-    // back to the syntactic answer (those cases stay `unverifiable`).
+    // ty (via the call graph) lets the resolver follow an imported module into
+    // typeshed/site-packages and resolve a method inherited from a project base;
+    // best-effort, so a ty init failure falls back to the syntactic answer (those
+    // cases stay `unverifiable`).
     let scope = walk::walked_py_files(&cli.root);
-    let ty = TyResolver::new(&cli.root, scope).ok();
+    let graph = CallGraph::new(&cli.root, files.clone(), scope).ok();
+    let hier = graph
+        .as_ref()
+        .map(|g| hierarchy::Hierarchy::build(&files, g));
+    let ctx = match (graph.as_ref(), hier.as_ref()) {
+        (Some(graph), Some(hier)) => Some(mock::Ctx { graph, hier }),
+        _ => None,
+    };
     let mut rows: Vec<(String, serde_json::Value)> = Vec::new();
     let mut warnings = Vec::new();
     let mut drifted = 0usize;
     for f in &files {
         for m in &f.mocks {
-            let status = resolver.resolve(m.target.as_deref(), ty.as_ref());
+            let status = resolver.resolve(m.target.as_deref(), ctx.as_ref());
             let loc = format!("{}:{}:{}", f.path, m.pos.line, m.pos.col);
             let shown = m.target.as_deref().unwrap_or("<dynamic>");
             let tag = status.tag();

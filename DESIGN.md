@@ -76,6 +76,19 @@ If yes, don't rebuild it — unless we can do it **deeper** (see below).
    and `[project.scripts]`. Over-approximate liveness, under-reports death; the
    residual false positives are genuinely dynamic (dotted-string config paths,
    callbacks-as-values, `getattr`, entry-point systems) and flagged.
+8. **Class hierarchy + override map** (`hierarchy`, shipped) — the inheritance
+   graph as data: supertypes, transitive subclasses, and the override map (which
+   base method each override overrides, and vice-versa). ty resolves immediate
+   bases across files; subclasses are the *inverted* supertype graph (ty's own
+   subtype search is unreliable). Beyond the verb, it's the seam that fixes the
+   dominant `deadcode` false positive: **override-aware reachability** (a
+   reachable base method pulls in its overrides — the polymorphic edge a
+   declared-type call graph misses) and an **external-ancestor** liveness signal
+   (a class whose inheritance chain reaches a base ty can't see is
+   framework-managed → its subtree is live), which together replaced the curated
+   framework-base-name list. `mock-targets` reuses it to resolve a method
+   inherited from a first-party base. The "change this base method — who breaks?"
+   refactor footgun, answered structurally.
 
 ## Worth building *deeper* than the existing tools (the exception to the filter)
 These exist elsewhere but a pyq-native version is better because it rides the

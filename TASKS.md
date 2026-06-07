@@ -47,10 +47,46 @@ completed work is logged at the bottom. `→ blocked by #N` marks a dependency.
   surface ∩ no reaching test; plus a test inventory with markers.
 
 ### P5 — polish / big & separate
-- **#9 · Spike: dynamic tier sidecar.** Bundled Python sidecar driven by the Rust
-  CLI, using `sys.addaudithook` (effect ledger), `sys.monitoring` (coverage +
-  observed shapes), import hooks. Feeds change-coverage + effect-diff. Large,
-  separate; static first.
+- **#9 · Dynamic tier sidecar.** Bundled Python sidecar driven by the Rust CLI:
+  `sys.addaudithook` (effect ledger), `sys.monitoring` (coverage + observed
+  shapes), import hooks. The runtime *oracle* that confirms/refutes the
+  over-approximate static verbs (`effects`/`tests`/`deadcode`) on their shared
+  blind spot — dynamic dispatch. Headline payoffs: **effect-diff** and
+  **change-coverage**. Settled: **pytest-first** drive (run the suite under the
+  hooks; arbitrary entrypoints later), **no opt-in flag** (invoking a dynamic
+  verb is consent, same as `pytest`). Phased:
+  - **#9.0 · Phase 0 — de-risk spike.** *Done — GO.* Proved (a) runtime
+    frame→static FQN join (`module_components(relpath)+co_qualname`, matching
+    `scope_fqn`; normalize `.<locals>.` away, credit observed `X.__init__` to
+    static class node `X`); (b) `sys.monitoring` coexists with coverage.py even
+    on `COVERAGE_CORE=sysmon` (coverage=id1, pyq=id3; re-runs need
+    `restart_events()`); (c) audit hook maps open→fs / socket.*→network with
+    correct project-frame attribution, negligible overhead via first-touch
+    `DISABLE`. Demonstrated the value prop: a getattr-only `greet` edge the
+    static graph can't see was observed.
+  - **#9.1 · Phase 1 — audit-hook effect ledger sidecar.** Standalone Python
+    package: `sys.addaudithook` → pyq's effect taxonomy, attributed to the
+    nearest project FQN. Pre-3.12 compatible. *Known gap:* audit covers
+    fs/network/subprocess/db(sqlite)/env-writes/import; env-reads/random/clock/
+    global are unaudited → flagged, deferred to the `sys.monitoring` seam.
+  - **#9.2 · Phase 2 — `pyq-dynamic` crate + pytest driver.** *Done.* Crate
+    embeds the sidecar (materialize-to-tempdir), runs `pytest -p
+    pyq_trace.pytest_plugin` via the resolved interpreter (`--python`/
+    `$PYQ_PYTHON`, default `python3`), collects the ledger, renders the standard
+    envelope. All subprocess contact confined here (mirrors `ty_backed`). New
+    `pyq trace [pytest args]` verb (no opt-in flag). Pytest stdout/stderr
+    forwarded to pyq's stderr so `--json` stdout stays pure; sidecar + project
+    root added to `PYTHONPATH` (prepend-mode flat-layout imports); pytest exit
+    threaded into `query.pytest_exit` (non-zero ≠ error — failing tests still
+    run code).
+  - **#9.3 · Phase 3 — effect-diff.** Join static `effects` closure vs the
+    observed ledger → confirmed / static-only / dynamic-only. Rides `--baseline`
+    (#4) when landed.
+  - **#9.4 · Phase 4 — change-coverage (`sys.monitoring`, 3.12+).** Per-line/
+    branch execution under the suite, joined to a diff. The oracle behind the
+    `tests` caveat; trims `deadcode` over-approximation. Gate + degrade.
+  - **#9.5 · Phase 5 — observed shapes + import hooks.** Feeds protocol surface
+    (#21) and real import-time effects / import graph. Long tail.
 - **#21 · Spike: convention extraction + protocol/concurrency surfaces.**
   Convention extraction (naming, import style, error-handling/logging idioms —
   scope tightly); protocol/structural conformance (what satisfies `Protocol P`);

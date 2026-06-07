@@ -17,7 +17,19 @@
 use std::collections::{HashMap, HashSet};
 
 use pyq_index::{DefKind, FileIndex};
-use pyq_resolve::{scope_fqn, MemberCheck, TyResolver};
+use pyq_resolve::{scope_fqn, CallGraph, MemberCheck};
+
+use crate::hierarchy::Hierarchy;
+
+/// ty-backed context enabling deeper patch-target resolution.
+pub struct Ctx<'a> {
+    /// Follows an imported module into typeshed/site-packages to check a tail
+    /// attribute, and resolves names to defs.
+    pub graph: &'a CallGraph,
+    /// Resolves a method inherited from a project base class, and flags classes
+    /// with an external base (where a missing member may be inherited).
+    pub hier: &'a Hierarchy,
+}
 
 /// The verdict for one patch target.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -136,11 +148,11 @@ impl PatchResolver {
         }
     }
 
-    /// Resolve a patch target (`None` = the argument wasn't a literal). `ty`, when
-    /// supplied, lets the resolver follow an imported module into typeshed /
-    /// site-packages to verify a tail attribute (`patch("m.time.sleep")`); without
-    /// it those stay `unverifiable`.
-    pub fn resolve(&self, target: Option<&str>, ty: Option<&TyResolver>) -> Status {
+    /// Resolve a patch target (`None` = the argument wasn't a literal). `ctx`,
+    /// when supplied, enables ty-backed depth: following an imported module into
+    /// typeshed/site-packages (`patch("m.time.sleep")`) and resolving a method
+    /// inherited from a project base class; without it those stay `unverifiable`.
+    pub fn resolve(&self, target: Option<&str>, ctx: Option<&Ctx>) -> Status {
         let Some(t) = target else {
             return Status::Dynamic;
         };
@@ -153,7 +165,7 @@ impl PatchResolver {
         for k in (1..=parts.len()).rev() {
             let prefix = parts[..k].join(".");
             if let Some(module) = self.canonical_module(&prefix) {
-                return self.resolve_attr(&module, &parts[k..], ty);
+                return self.resolve_attr(&module, &parts[k..], ctx);
             }
         }
         Status::External
@@ -177,7 +189,7 @@ impl PatchResolver {
         }
     }
 
-    fn resolve_attr(&self, module: &str, chain: &[&str], ty: Option<&TyResolver>) -> Status {
+    fn resolve_attr(&self, module: &str, chain: &[&str], ctx: Option<&Ctx>) -> Status {
         // Patching the module object itself.
         let Some(first) = chain.first() else {
             return Status::Valid;
@@ -209,10 +221,10 @@ impl PatchResolver {
             // (typeshed / site-packages) and check the single tail attribute —
             // `patch("m.time.sleep")` resolves `time`, looks up `sleep`.
             if chain.len() == 2 {
-                if let (Some(ty), Some((path, offset))) =
-                    (ty, self.import_bindings.get(&(module.to_string(), first.to_string())))
+                if let (Some(ctx), Some((path, offset))) =
+                    (ctx, self.import_bindings.get(&(module.to_string(), first.to_string())))
                 {
-                    match ty.module_member(path, *offset, chain[1]) {
+                    match ctx.graph.module_member(path, *offset, chain[1]) {
                         MemberCheck::Present => return Status::Valid,
                         MemberCheck::Absent => {
                             return Status::Drifted(format!(
@@ -237,9 +249,32 @@ impl PatchResolver {
             .get(&(module.to_string(), first.to_string()))
             .is_some_and(|m| m.contains(member));
         if !known {
-            // If the class extends a base we can't see into, the member may be
-            // inherited or framework-injected (Django `objects`, `_save_table`),
-            // so it isn't provably absent — don't flag it as drift.
+            let class_fqn = format!("{module}.{first}");
+            // With the hierarchy: resolve the member up the *project* base chain.
+            if let Some(ctx) = ctx {
+                let on_project_base = ctx
+                    .hier
+                    .supers(&class_fqn)
+                    .iter()
+                    .any(|b| ctx.hier.methods(b).is_some_and(|m| m.contains(member)));
+                if on_project_base {
+                    return Status::Valid; // inherited from a first-party base
+                }
+                // Extends a base ty can't see — anywhere up the chain (Django's
+                // `objects`/`save` come from `models.Model`, a transitive base):
+                // the member may be inherited or injected there, not provably absent.
+                if ctx.hier.has_external_ancestor(&class_fqn) {
+                    return Status::Unverifiable(format!(
+                        "`{member}` not declared on `{module}.{first}` (extends an external base — may be inherited)"
+                    ));
+                }
+                // First-party bases only and the member is on none of them: drift.
+                return Status::Drifted(format!(
+                    "`{member}` is not a member of `{module}.{first}` or its bases"
+                ));
+            }
+            // No hierarchy available — fall back to the conservative rule: a class
+            // with any base might inherit the member, so don't call it drift.
             if self.subclasses.contains(&(module.to_string(), first.to_string())) {
                 return Status::Unverifiable(format!(
                     "`{member}` not declared on `{module}.{first}`, but it extends a base — may be inherited"

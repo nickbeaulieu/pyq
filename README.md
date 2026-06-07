@@ -33,6 +33,7 @@ pyq graph User --reverse      # everything that transitively reaches `User`
 pyq effects handle_request    # side effects it transitively performs (io/net/db/…)
 pyq tests add                 # which tests are call-wired to `add` (run before editing)
 pyq mock-targets              # resolve every mock.patch("…") — flag drifted paths
+pyq hierarchy Animal          # supertypes, subclasses, and the override map
 pyq deadcode                  # callables reachable from no entrypoint (candidates)
 pyq inputs                    # the external input surface of the project
 pyq imports pkg.models --reverse   # who imports pkg.models (blast radius)
@@ -50,6 +51,7 @@ pyq imports --cycles          # import cycles among project modules
 | `effects <symbol>` | The transitive effect surface: which side effects (`fs`, `network`, `subprocess`, `env`, `db`, `random`, `clock`, `global`) the symbol and everything it transitively calls statically perform, plus import-time effects of the modules involved. "Is this pure / safe in a test." |
 | `tests <symbol>` | A call-reachability lens (**not** a coverage metric): which collected tests are structurally wired to a symbol via the reverse call graph, each with the call path (`via`) and `depth`. A test is a `test_*` function in `test_*.py`/`*_test.py`, or a `test_*` method on a collected class — `Test*`-named **or** `*TestCase`-subclassing (unittest/Django/DRF). For "which tests to run before this edit," not "what's my coverage." Blind to dynamic dispatch (attribute calls, framework routing, signals) — a 0 is "no *static* reaching test," not "untested." See [Tests](#tests). |
 | `mock-targets` | Resolve every `mock.patch("a.b.c")` target against the project and flag *drifted* paths — a patch whose looked-up name no longer exists silently no-ops, so the test passes while exercising the real code. |
+| `hierarchy <class>` | The class's supertypes (bases, external marked), transitive subclasses, and the override map — which base methods it overrides and which subclasses override its methods. Resolved across files by ty, subclasses computed by inverting the supertype graph. The OO-refactor footgun, as data. |
 | `deadcode` | Functions/classes reachable from **no** entrypoint — candidate dead code, via forward reachability over the call graph. Roots are everything the runtime/framework enters without a project call: tests, dunders, decorated hooks, `__all__`, module-scope calls, entrypoint files (`manage.py`/`wsgi.py`/`urls.py`/`migrations/`/`management/commands/`/…), framework base classes (`BaseCommand`/`*View`/`*Serializer`/…), and `[project.scripts]`. Over-approximate liveness (so it under-reports death); residual dynamic dispatch is flagged. See [Dead code](#dead-code). |
 | `inputs` | What the code needs to run: env vars, literal files opened, CLI args (argparse/click), pydantic settings fields. |
 | `imports [module]` | The import graph. No arg: every edge. With a module: what it imports; `--reverse`: who imports it (blast radius); `--cycles`: import cycles. Accepts a module name or a file path. |
@@ -237,6 +239,31 @@ without a dynamic `__getattr__`, so it never manufactures a false drift —
 verified across three real repos, where it moved ~60 patches from `unverifiable`
 to `valid` (e.g. `time.sleep`) and added zero new drifts.
 
+## Hierarchy
+
+`hierarchy <class>` resolves the project's class inheritance graph and answers
+the OO-refactor questions as data: the class's **supertypes** (bases, with
+external/framework bases flagged), its transitive **subclasses**, and the
+**override map** — which base methods it overrides, and which subclasses override
+its own methods. ty resolves each class's immediate bases across files and
+through imports; subclasses are computed by inverting that graph (ty's own
+subtype search is unreliable), so "change this base method — who's affected?" is
+one query.
+
+```console
+$ pyq hierarchy Animal
+7 relations for `Animal`
+animals.py:3:7   supertype ABC (external)
+animals.py:7:7   subtype animals.Dog
+animals.py:10:7  subtype animals.Puppy
+animals.py:8:9   animals.Dog.speak overrides animals.Animal.speak
+animals.py:11:9  animals.Puppy.speak overrides animals.Animal.speak
+```
+
+The same graph powers two other verbs: `deadcode` reads it for override-aware
+reachability and the external-base liveness signal (below), and `mock-targets`
+uses it to resolve a method inherited from a first-party base.
+
 ## Dead code
 
 `deadcode` runs the call graph *forward from the program's entrypoints* and
@@ -253,11 +280,23 @@ live (flagging a live route handler dead is the dangerous failure). Roots:
   resolved through ty;
 - everything in an entrypoint *file* (`manage.py`, `wsgi.py`/`asgi.py`,
   `urls.py`, `settings`, `conftest.py`, `migrations/`, `management/commands/`,
-  `scripts/`, `setup.py`) and the whole subtree of a framework base subclass
-  (`BaseCommand`, `*View`/`*ViewSet`, `*Serializer`, `*Form`, `*Admin`,
-  `*Model`, … — so a Django command's `handle`, a DRF serializer's `get_*`
-  methods, and inner `Meta`/`Config` classes are all live);
-- `[project.scripts]` / `[tool.poetry.scripts]` console entrypoints.
+  `scripts/`, `setup.py`);
+- the whole subtree (methods + inner `Meta`/`Config`) of any class that extends
+  an **external base** — one ty can't resolve to a first-party class, *anywhere
+  up the chain* — since the framework drives it. This generalizes the old
+  curated base-name list via the `hierarchy` graph: a Django command's `handle`,
+  a DRF serializer's `get_*`, a `BasePermission`'s `has_permission`, and a model
+  `Foo(TimeStampedModel)` (external `models.Model` is a *transitive* base) are
+  all live;
+- dotted-string config paths and `[project.scripts]` / `[tool.poetry.scripts]`
+  console entrypoints.
+
+It is also **override-aware** (the `hierarchy` payoff): a reachable base method
+makes its overrides reachable, recovering the polymorphic edge the call graph
+misses (a base-typed `x.method()` resolves to the base, not each concrete
+override). This is what eliminated the dominant false-positive class — overrides
+of framework interface methods (`has_permission`, `parse`, `label_from_instance`)
+that looked dead because nothing calls them *directly*.
 
 ```console
 $ pyq deadcode --root path/to/project

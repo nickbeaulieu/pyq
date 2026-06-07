@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/pyq-cli",
+    "crates/pyq-dynamic",
     "crates/pyq-index",
     "crates/pyq-output",
     "crates/pyq-resolve",
@@ -16,6 +17,7 @@ repository = "https://github.com/nickbeaulieu/pyq"
 
 [workspace.dependencies]
 # Internal
+pyq-dynamic = { path = "crates/pyq-dynamic" }
 pyq-index = { path = "crates/pyq-index" }
 pyq-output = { path = "crates/pyq-output" }
 pyq-resolve = { path = "crates/pyq-resolve" }
@@ -32,3 +34,4 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 ignore = "0.4"
 anyhow = "1"
+tempfile = "3"

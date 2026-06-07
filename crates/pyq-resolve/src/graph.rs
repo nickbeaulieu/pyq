@@ -165,6 +165,18 @@ impl CallGraph {
         Closure { roots, nodes }
     }
 
+    /// The immediate base classes of the class at `(path, offset)` — see
+    /// [`TyResolver::supertypes_at`]. Lets a caller build the inheritance graph.
+    pub fn supertypes_at(&self, path: &str, offset: u32) -> Vec<crate::SuperClass> {
+        self.ty.supertypes_at(path, offset)
+    }
+
+    /// Whether `member` is a top-level name of the module the binding at
+    /// `(path, offset)` resolves to — see [`TyResolver::module_member`].
+    pub fn module_member(&self, path: &str, offset: u32, member: &str) -> crate::MemberCheck {
+        self.ty.module_member(path, offset, member)
+    }
+
     /// Resolve the use at `(path, offset)` to its definition's `(path, name
     /// offset)` anchor, following imports — `None` if it doesn't resolve to an
     /// in-scope project def. Lets a caller seed reachability from a *use site*
@@ -178,18 +190,31 @@ impl CallGraph {
     /// for whole-program reachability (dead-code) where per-root attribution and
     /// depth aren't needed, so it returns just the reachable set and never
     /// re-walks an overlapping subgraph.
-    pub fn reachable_from(&self, seeds: &[(String, u32)]) -> HashSet<String> {
+    ///
+    /// `extra_edges` adds non-call successors: when the walk reaches a node whose
+    /// FQN is a key, the mapped anchors are enqueued too. Dead-code uses this for
+    /// override edges (a reached base method pulls its overrides in), folding the
+    /// polymorphic propagation into the single BFS instead of a re-run fixpoint.
+    pub fn reachable_from(
+        &self,
+        seeds: &[(String, u32)],
+        extra_edges: &HashMap<String, Vec<(String, u32)>>,
+    ) -> HashSet<String> {
         let mut visited: HashSet<String> = HashSet::new();
         let mut queue: VecDeque<(String, u32, String)> = VecDeque::new();
+        let enqueue =
+            |path: String, offset: u32, fqn: String, visited: &mut HashSet<String>, queue: &mut VecDeque<_>| {
+                if visited.insert(fqn.clone()) {
+                    queue.push_back((path, offset, fqn));
+                }
+            };
         for (path, offset) in seeds {
             let fqn = self
                 .fqn_by_anchor
                 .get(&(path.clone(), *offset))
                 .cloned()
                 .unwrap_or_else(|| scope_fqn(path, &[]));
-            if visited.insert(fqn.clone()) {
-                queue.push_back((path.clone(), *offset, fqn));
-            }
+            enqueue(path.clone(), *offset, fqn, &mut visited, &mut queue);
         }
         while let Some((path, offset, fqn)) = queue.pop_front() {
             for nb in self.neighbours(&path, offset, &fqn, Direction::Forward) {
@@ -198,8 +223,17 @@ impl CallGraph {
                     .get(&(nb.path.clone(), nb.offset))
                     .cloned()
                     .unwrap_or_else(|| fallback_fqn(&nb.path, &nb.name, nb.kind));
-                if visited.insert(nfqn.clone()) {
-                    queue.push_back((nb.path, nb.offset, nfqn));
+                enqueue(nb.path, nb.offset, nfqn, &mut visited, &mut queue);
+            }
+            // Override edges: a reached base method makes its overrides reachable.
+            if let Some(overrides) = extra_edges.get(&fqn) {
+                for (opath, ooffset) in overrides {
+                    let ofqn = self
+                        .fqn_by_anchor
+                        .get(&(opath.clone(), *ooffset))
+                        .cloned()
+                        .unwrap_or_else(|| scope_fqn(opath, &[]));
+                    enqueue(opath.clone(), *ooffset, ofqn, &mut visited, &mut queue);
                 }
             }
         }

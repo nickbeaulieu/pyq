@@ -8,8 +8,8 @@ use ruff_text_size::{TextRange, TextSize};
 use std::collections::HashSet;
 use std::path::PathBuf;
 use ty_ide::{
-    find_references, goto_definition, incoming_calls, outgoing_calls, workspace_symbols,
-    CallHierarchyItem, SymbolKind,
+    find_references, goto_definition, incoming_calls, outgoing_calls, type_hierarchy_supertypes,
+    workspace_symbols, CallHierarchyItem, SymbolKind,
 };
 use ty_project::metadata::options::{EnvironmentOptions, Options, ProjectOptionsOverrides};
 use ty_project::metadata::value::RelativePathBuf;
@@ -213,6 +213,29 @@ impl TyResolver {
             }
         }
         out
+    }
+
+    /// The immediate base classes of the class at `(rel_path, offset)`, resolved
+    /// by ty's type hierarchy. Each carries its name and — when it's a
+    /// first-party class in scope — its `(path, name offset)` anchor; an external
+    /// or unresolved base has `anchor: None`. `object` is not reported (ty omits
+    /// the implicit base), so an empty result means "no explicit base."
+    pub fn supertypes_at(&self, rel_path: &str, offset: u32) -> Vec<crate::SuperClass> {
+        let Some(file) = self.file_at(rel_path) else {
+            return Vec::new();
+        };
+        type_hierarchy_supertypes(&self.db, file, TextSize::from(offset))
+            .into_iter()
+            .map(|item| {
+                let anchor = self
+                    .rel_path(item.file)
+                    .map(|p| (p, item.selection_range.start().to_u32()));
+                crate::SuperClass {
+                    name: item.name.as_str().to_string(),
+                    anchor,
+                }
+            })
+            .collect()
     }
 
     /// Resolve the binding referenced at `offset` in `rel_path` to its

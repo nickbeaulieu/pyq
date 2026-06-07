@@ -19,6 +19,16 @@ mod unified;
 
 pub use graph::{scope_fqn, CallGraph, Closure, Direction, GraphNode};
 
+/// One immediate base class of a class, resolved by ty. `anchor` is the base's
+/// `(path, name offset)` when it's a first-party class in scope; `None` when the
+/// base is external (third-party/stdlib) or couldn't be resolved — the signal a
+/// class is framework-managed (it extends something pyq can't see into).
+#[derive(Clone, Debug)]
+pub struct SuperClass {
+    pub name: String,
+    pub anchor: Option<(String, u32)>,
+}
+
 /// Whether a name is a top-level member of a resolved module — the answer to
 /// "does `patch("pkg.mod.time.sleep")` point at something real," for the case
 /// where the tail attribute sits on an imported *module* (ty resolves the import

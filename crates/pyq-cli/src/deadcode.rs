@@ -56,16 +56,23 @@ pub struct DeadCode {
 pub fn find(files: &[FileIndex], graph: &CallGraph, root: &str) -> DeadCode {
     let test_classes = test_class_fqns(files);
     let console = console_script_targets(root);
+    let hier = crate::hierarchy::Hierarchy::build(files, graph);
 
     // Classes whose every method is framework-invoked (so a method's presence in
-    // the call graph isn't required for it to be live).
+    // the call graph isn't required for it to be live): a class in an entrypoint
+    // file, a collected test class, or — the general signal — one that extends a
+    // base ty can't resolve to a first-party class (Django/DRF/stdlib/uninstalled).
+    // The last subsumes the old curated suffix list AND a project's own
+    // framework usage, and is what fixes the polymorphic-override false positives
+    // (a `BasePermission` subclass's `has_permission` is live by inheritance).
     let mut entry_classes: HashSet<String> = test_classes.clone();
     for f in files {
         for d in &f.defs {
-            if d.kind == DefKind::Class
-                && (is_entrypoint_file(&f.path) || d.bases.iter().any(|b| is_framework_base(b)))
-            {
-                entry_classes.insert(scope_fqn(&f.path, &class_scope(d)));
+            if d.kind == DefKind::Class {
+                let fqn = scope_fqn(&f.path, &class_scope(d));
+                if is_entrypoint_file(&f.path) || hier.has_external_ancestor(&fqn) {
+                    entry_classes.insert(fqn);
+                }
             }
         }
     }
@@ -138,8 +145,29 @@ pub fn find(files: &[FileIndex], graph: &CallGraph, root: &str) -> DeadCode {
         }
     }
 
+    // Override edges: a reachable base method makes its overrides reachable — the
+    // polymorphic call the graph misses (a base-typed `x.method()` resolves to
+    // the base, not each concrete override). Keyed base-method FQN → the
+    // overriding methods' anchors; the BFS folds them in as extra successors.
+    let mut override_edges: HashMap<String, Vec<(String, u32)>> = HashMap::new();
+    for class_fqn in hier.class_fqns() {
+        if let Some(ms) = hier.methods(class_fqn) {
+            for m in ms {
+                let Some(anchor) = def_anchor.get(&format!("{class_fqn}.{m}")) else {
+                    continue;
+                };
+                for base in hier.overrides(class_fqn, m) {
+                    override_edges
+                        .entry(format!("{base}.{m}"))
+                        .or_default()
+                        .push(anchor.clone());
+                }
+            }
+        }
+    }
+
     let seed_vec: Vec<(String, u32)> = seeds.into_iter().collect();
-    let reachable = graph.reachable_from(&seed_vec);
+    let reachable = graph.reachable_from(&seed_vec, &override_edges);
 
     // A callable is dead if its FQN isn't reachable. Suppress a method whose
     // enclosing class is itself dead — the class subsumes it (less noise).
@@ -253,29 +281,6 @@ fn is_entrypoint_file(path: &str) -> bool {
 /// Whether `a` is immediately followed by `b` in `comps` (a path subsequence).
 fn windowed_contains(comps: &[&str], a: &str, b: &str) -> bool {
     comps.windows(2).any(|w| w[0] == a && w[1] == b)
-}
-
-/// Whether a base-class dotted name marks a framework class whose subclass's
-/// methods are framework-invoked (so none of them are dead). Suffix-based to
-/// follow the import spelling.
-fn is_framework_base(base: &str) -> bool {
-    let leaf = base.rsplit('.').next().unwrap_or(base);
-    leaf.ends_with("Command")
-        || leaf.ends_with("AppConfig")
-        || leaf == "Migration"
-        || leaf.ends_with("Middleware")
-        || leaf.ends_with("Consumer")
-        || leaf.ends_with("View")
-        || leaf.ends_with("ViewSet")
-        || leaf.ends_with("TestCase")
-        // DRF / Django / pydantic / marshmallow classes the framework drives:
-        // their methods (`get_*`/`validate_*`/`clean_*`/`save`) and inner config
-        // classes are invoked by convention, not by a project call.
-        || leaf.ends_with("Serializer")
-        || leaf.ends_with("Form")
-        || leaf.ends_with("Admin")
-        || leaf.ends_with("Schema")
-        || leaf.ends_with("Model")
 }
 
 /// Whether a console-script target (`module.func`, as written in pyproject)

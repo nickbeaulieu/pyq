@@ -772,6 +772,65 @@ fn deadcode_flags_only_the_unreachable_and_respects_entrypoints() {
         .contains("over-approximate")));
 }
 
+// `hierarchy` reports a class's supertypes (external marked), transitive
+// subclasses, and the override map — resolved across files by ty, inverted for
+// subclasses (which ty's own subtype search misses).
+#[test]
+fn hierarchy_reports_supers_subclasses_and_overrides() {
+    let root = fixture("hierarchy");
+    let (env, ok) = run_json_in(&root, &["hierarchy", "Animal"]);
+    assert!(ok);
+    assert_eq!(env["query"]["kind"], "hierarchy");
+    assert_eq!(env["query"]["roots"][0], "animals.Animal");
+
+    let rels: std::collections::HashSet<(&str, &str)> = env["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| (r["relation"].as_str().unwrap(), r["fqn"].as_str().unwrap()))
+        .collect();
+    // External base flagged; transitive subclasses found (Puppy via Dog).
+    assert!(rels.contains(&("supertype-external", "ABC")), "{env}");
+    assert!(rels.contains(&("subtype", "animals.Dog")), "{env}");
+    assert!(rels.contains(&("subtype", "animals.Puppy")), "{env}");
+    // Override map: `speak` is overridden in both subclasses.
+    assert!(rels.contains(&("overridden-by", "animals.Dog.speak")), "{env}");
+    assert!(rels.contains(&("overridden-by", "animals.Puppy.speak")), "{env}");
+
+    // From a subclass, the upward view: Dog's super is Animal, and Dog.speak
+    // overrides Animal.speak.
+    let (dog, ok) = run_json_in(&root, &["hierarchy", "Dog"]);
+    assert!(ok);
+    let dog_rels: std::collections::HashSet<(&str, &str)> = dog["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| (r["relation"].as_str().unwrap(), r["fqn"].as_str().unwrap()))
+        .collect();
+    assert!(dog_rels.contains(&("supertype", "animals.Animal")), "{dog}");
+    assert!(dog_rels.contains(&("overrides", "animals.Animal.speak")), "{dog}");
+}
+
+// deadcode override-awareness (the `hierarchy` payoff): a method override
+// reached only polymorphically — `total(s: Shape)` calls `s.area()`, which ty
+// resolves to the *base* `Shape.area` — must not be flagged dead. `Circle.area`
+// (the override) and `_pi_helper` (reached only through it) stay live because a
+// reachable base method propagates to its overrides.
+#[test]
+fn deadcode_keeps_polymorphic_overrides_live() {
+    let root = fixture("deadcode_override");
+    let (env, ok) = run_json_in(&root, &["deadcode"]);
+    assert!(ok);
+    let dead: std::collections::HashSet<&str> = env["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["fqn"].as_str().unwrap())
+        .collect();
+    assert!(!dead.contains("app.poly.Circle.area"), "override must stay live: {dead:?}");
+    assert!(!dead.contains("app.poly._pi_helper"), "callee of the override: {dead:?}");
+}
+
 #[test]
 fn imports_lists_edges_and_marks_external() {
     let (env, ok) = run_json(&["imports"]);
