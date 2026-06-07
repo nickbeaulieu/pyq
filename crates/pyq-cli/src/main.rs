@@ -5,6 +5,7 @@
 //! about code-as-graph. This is the first slice — symbol/reference queries over
 //! a directory of Python files, single-file name resolution.
 
+mod cache;
 mod canonical;
 mod change_cov;
 mod deadcode;
@@ -15,7 +16,7 @@ mod mock;
 mod tests_map;
 mod walk;
 
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 use pyq_dynamic::{
     default_python, observed_coverage, observed_effects, observed_shapes, TraceOptions,
 };
@@ -26,52 +27,20 @@ use pyq_resolve::{
 };
 use std::collections::{BTreeSet, HashSet};
 use serde_json::json;
+use std::io::IsTerminal;
 use std::process::ExitCode;
 
 #[derive(Parser)]
 #[command(
     name = "pyq",
-    version,
-    about = "Queryable static index for Python",
-    // clap has no native subcommand grouping, so the menu is a curated template.
-    // Per-command detail still comes from each variant's doc comment
-    // (`pyq <command> --help`) — this only shapes the top-level overview.
-    help_template = "\
-{about}
-
-Usage: {usage}
-
-Find & describe a symbol
-  refs <symbol>       Every reference (reads, writes, calls) to a symbol, cross-file.
-  callers <symbol>    Every call site of a symbol.
-  defs <symbol>       Every definition (function / class / variable / import).
-  describe <symbol>   Signature, callers, callees & reaching tests — one pack.
-
-Graph & relationships
-  graph <symbol>      Transitive call graph: callees, or callers with --reverse.
-  hierarchy <class>   Supertypes, subclasses, and the override map.
-  imports [module]    Import graph: edges, reverse deps (--reverse), or --cycles.
-
-Effects, tests & dead code
-  effects <symbol>    Side effects it transitively performs (fs / net / db / …).
-  tests <symbol>      Which collected tests are call-wired to a symbol.
-  deadcode            Callables reachable from no entrypoint (candidates).
-
-Whole-project surface
-  inputs              Env vars, files, CLI args & settings the project reads.
-  mock-targets        Resolve every mock.patch(...) and flag drifted targets.
-  canonical           Most-used helpers, untested public surface, test inventory.
-
-Dynamic — runs your test suite
-  trace               Side effects the suite actually performs at runtime.
-  effect-diff         Static effect surface vs. what the suite really does.
-  change-coverage     Which changed lines the suite covers (--base <ref>).
-  shapes              Concrete return types each callable produced at runtime.
-
-Options:
-{options}
-Run `pyq <command> --help` for the full description of any command.
-"
+    // Version carries the build's short commit sha (captured in build.rs), so
+    // `pyq --version` pins exactly which build is running.
+    version = concat!(env!("CARGO_PKG_VERSION"), " (", env!("PYQ_GIT_SHA"), ")"),
+    about = "A queryable code graph for Python — who-calls, what-resolves, what-it-touches.",
+    // The grouped, colorized top-level menu is assembled at runtime (see
+    // `help_template`): clap has no native subcommand grouping, and color must be
+    // gated on the terminal. Per-command detail still comes from each variant's
+    // doc comment, shown by `pyq <command> --help`.
 )]
 struct Cli {
     #[command(subcommand)]
@@ -224,7 +193,19 @@ enum Command {
 }
 
 fn main() -> ExitCode {
-    let cli = Cli::parse();
+    // Parse through a command carrying the runtime-built menu, so `--help`
+    // renders the grouped, color-gated overview (color must be decided here, not
+    // baked into a static template).
+    let command = Cli::command().help_template(help_menu(use_color()));
+    let cli = match command.try_get_matches() {
+        Ok(matches) => match Cli::from_arg_matches(&matches) {
+            Ok(cli) => cli,
+            Err(e) => e.exit(),
+        },
+        // clap exits 0 for --help/--version, non-zero for a usage error, after
+        // printing the right thing — preserve that behavior.
+        Err(e) => e.exit(),
+    };
     let channel = if cli.json {
         Channel::Json
     } else if cli.pretty {
@@ -243,6 +224,81 @@ fn main() -> ExitCode {
 
     println!("{}", envelope.render(channel).trim_end());
     ExitCode::SUCCESS
+}
+
+/// Whether to colorize the help menu: only when stdout is a real terminal and
+/// the user hasn't opted out via `NO_COLOR` or a `dumb` terminal — so piped or
+/// redirected help stays plain text.
+fn use_color() -> bool {
+    std::io::stdout().is_terminal()
+        && std::env::var_os("NO_COLOR").is_none()
+        && std::env::var("TERM").map(|t| t != "dumb").unwrap_or(true)
+}
+
+/// The grouped, bun-inspired top-level `--help` menu: a tagline, usage, the
+/// verbs bucketed by use-case, the global flags, and a footer pinning the exact
+/// build (version + commit sha). `clap` substitutes `{about}`/`{usage}`/
+/// `{options}`; the rest is curated here so the menu reads top-to-bottom.
+fn help_menu(color: bool) -> String {
+    // (heading, command, dim, reset) — all empty when color is off, so the menu
+    // degrades to clean plain text. ANSI codes are zero-width, so the literal
+    // column padding still lines up.
+    let (h, c, d, r) = if color {
+        ("\x1b[1;36m", "\x1b[1m", "\x1b[2m", "\x1b[0m")
+    } else {
+        ("", "", "", "")
+    };
+
+    // One command row, its description aligned to a shared column.
+    let row = |name: &str, args: &str, desc: &str| {
+        let visible = name.chars().count() + if args.is_empty() { 0 } else { 1 + args.chars().count() };
+        let gap = " ".repeat(20usize.saturating_sub(visible).max(2));
+        let args = if args.is_empty() { String::new() } else { format!(" {args}") };
+        format!("  {c}{name}{r}{args}{gap}{d}{desc}{r}\n")
+    };
+
+    let groups: [(&str, &[(&str, &str, &str)]); 5] = [
+        ("Find & describe a symbol", &[
+            ("refs", "<symbol>", "Every reference (reads, writes, calls) to a symbol, cross-file."),
+            ("callers", "<symbol>", "Every call site of a symbol."),
+            ("defs", "<symbol>", "Every definition (function / class / variable / import)."),
+            ("describe", "<symbol>", "Signature, callers, callees & reaching tests — one pack."),
+        ]),
+        ("Graph & relationships", &[
+            ("graph", "<symbol>", "Transitive call graph: callees, or callers with --reverse."),
+            ("hierarchy", "<class>", "Supertypes, subclasses, and the override map."),
+            ("imports", "[module]", "Import graph: edges, reverse deps (--reverse), or --cycles."),
+        ]),
+        ("Effects, tests & dead code", &[
+            ("effects", "<symbol>", "Side effects it transitively performs (fs / net / db / …)."),
+            ("tests", "<symbol>", "Which collected tests are call-wired to a symbol."),
+            ("deadcode", "", "Callables reachable from no entrypoint (candidates)."),
+        ]),
+        ("Whole-project surface", &[
+            ("inputs", "", "Env vars, files, CLI args & settings the project reads."),
+            ("mock-targets", "", "Resolve every mock.patch(...) and flag drifted targets."),
+            ("canonical", "", "Most-used helpers, untested public surface, test inventory."),
+        ]),
+        ("Dynamic — runs your test suite", &[
+            ("trace", "", "Side effects the suite actually performs at runtime."),
+            ("effect-diff", "", "Static effect surface vs. what the suite really does."),
+            ("change-coverage", "", "Which changed lines the suite covers (--base <ref>)."),
+            ("shapes", "", "Concrete return types each callable produced at runtime."),
+        ]),
+    ];
+
+    let mut s = String::from("{about}\n\n");
+    s += &format!("{d}Usage:{r} {{usage}}\n");
+    for (heading, rows) in groups {
+        s += &format!("\n{h}{heading}{r}\n");
+        for (name, args, desc) in rows {
+            s += &row(name, args, desc);
+        }
+    }
+    s += &format!("\n{h}Options{r}\n{{options}}\n");
+    s += &format!("\n{d}pyq {} ({}){r}\n", env!("CARGO_PKG_VERSION"), env!("PYQ_GIT_SHA"));
+    s += &format!("{d}Run `pyq <command> --help` for the full description of any command.{r}\n");
+    s
 }
 
 fn dispatch(cli: &Cli) -> anyhow::Result<Envelope> {
@@ -268,7 +324,7 @@ fn dispatch(cli: &Cli) -> anyhow::Result<Envelope> {
     // cross-file) with the syntactic scan (ty's blind spots) into one answer.
     let mut envelope = match &cli.command {
         Command::Inputs => {
-            let files = walk::index_tree(&cli.root)?;
+            let files = cache::index_tree(&cli.root)?;
             query_inputs(&files)
         }
         Command::MockTargets => query_mock_targets(cli)?,
@@ -280,7 +336,7 @@ fn dispatch(cli: &Cli) -> anyhow::Result<Envelope> {
             reverse,
             cycles,
         } => {
-            let files = walk::index_tree(&cli.root)?;
+            let files = cache::index_tree(&cli.root)?;
             query_imports(&files, module.as_deref(), *reverse, *cycles)
         }
         Command::Refs { symbol } => resolve(cli, symbol, "refs", |r, s| r.references(s))?,
@@ -348,7 +404,7 @@ fn resolve(
     kind: &str,
     query: fn(&dyn Resolver, &str) -> anyhow::Result<Vec<Loc>>,
 ) -> anyhow::Result<Envelope> {
-    let files = walk::index_tree(&cli.root)?;
+    let files = cache::index_tree(&cli.root)?;
     let scope = walk::walked_py_files(&cli.root);
     let resolver = UnifiedResolver::new(&cli.root, files, scope)?;
     let locs = query(&resolver, symbol)?;
@@ -392,7 +448,7 @@ fn query_graph(
     reverse: bool,
     depth: Option<usize>,
 ) -> anyhow::Result<Envelope> {
-    let files = walk::index_tree(&cli.root)?;
+    let files = cache::index_tree(&cli.root)?;
     let scope = walk::walked_py_files(&cli.root);
     let graph = CallGraph::new(&cli.root, files, scope)?;
     let dir = if reverse {
@@ -432,7 +488,7 @@ fn query_graph(
 /// call-reachability lens for "which tests to run before this edit," not a
 /// coverage metric (dynamic dispatch is invisible; see `tests_map`).
 fn query_tests(cli: &Cli, symbol: &str) -> anyhow::Result<Envelope> {
-    let files = walk::index_tree(&cli.root)?;
+    let files = cache::index_tree(&cli.root)?;
     let scope = walk::walked_py_files(&cli.root);
     // The classes pytest collects (Test*-named or *TestCase-subclassing) — built
     // from the index before `files` is moved into the graph, since a graph node
@@ -510,7 +566,7 @@ fn node_to_json(node: &GraphNode) -> serde_json::Value {
 /// symbol and everything it transitively calls (forward call closure), plus the
 /// import-time effects of every module that contributes a reachable callable.
 fn query_effects(cli: &Cli, symbol: &str) -> anyhow::Result<Envelope> {
-    let files = walk::index_tree(&cli.root)?;
+    let files = cache::index_tree(&cli.root)?;
     let scope = walk::walked_py_files(&cli.root);
     let graph = CallGraph::new(&cli.root, files.clone(), scope)?;
     let closure = graph.closure(symbol, Direction::Forward, None);
@@ -641,7 +697,7 @@ fn query_effect_diff(
 ) -> anyhow::Result<Envelope> {
     // Static side: every effect site across the project, keyed (owner, cat),
     // keeping one representative location for the report.
-    let files = walk::index_tree(&cli.root)?;
+    let files = cache::index_tree(&cli.root)?;
     let mut static_map: std::collections::BTreeMap<(String, &'static str), String> =
         std::collections::BTreeMap::new();
     for f in &files {
@@ -994,7 +1050,7 @@ fn query_inputs(files: &[FileIndex]) -> Envelope {
 /// The class hierarchy of a symbol — supertypes, subclasses, and the override
 /// map. A projection of the resolved inheritance graph.
 fn query_hierarchy(cli: &Cli, symbol: &str) -> anyhow::Result<Envelope> {
-    let files = walk::index_tree(&cli.root)?;
+    let files = cache::index_tree(&cli.root)?;
     let scope = walk::walked_py_files(&cli.root);
     let graph = CallGraph::new(&cli.root, files.clone(), scope)?;
     let h = hierarchy::Hierarchy::build(&files, &graph);
@@ -1106,7 +1162,7 @@ fn fqn_names(fqn: &str, symbol: &str) -> bool {
 /// graph, seeds the entrypoint roots, and reports the callables the forward
 /// closure never reaches.
 fn query_deadcode(cli: &Cli) -> anyhow::Result<Envelope> {
-    let files = walk::index_tree(&cli.root)?;
+    let files = cache::index_tree(&cli.root)?;
     let scope = walk::walked_py_files(&cli.root);
     let graph = CallGraph::new(&cli.root, files.clone(), scope)?;
     let result = deadcode::find(&files, &graph, &cli.root);
@@ -1149,7 +1205,7 @@ fn query_deadcode(cli: &Cli) -> anyhow::Result<Envelope> {
 /// project. Drifted targets (a real project module, missing the looked-up name)
 /// are the actionable signal — surfaced as warnings as well as results.
 fn query_mock_targets(cli: &Cli) -> anyhow::Result<Envelope> {
-    let files = walk::index_tree(&cli.root)?;
+    let files = cache::index_tree(&cli.root)?;
     let resolver = mock::PatchResolver::build(&files);
     // ty (via the call graph) lets the resolver follow an imported module into
     // typeshed/site-packages and resolve a method inherited from a project base;

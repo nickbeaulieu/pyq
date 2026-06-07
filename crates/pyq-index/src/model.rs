@@ -5,17 +5,17 @@
 //! qualified names) is the next layer and will live alongside this without
 //! changing these types.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 /// 1-based line/column. Columns are UTF-8 character columns, not byte offsets.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Pos {
     pub line: usize,
     pub col: usize,
 }
 
 /// What kind of binding a definition is.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum DefKind {
     Function,
@@ -25,7 +25,7 @@ pub enum DefKind {
 }
 
 /// A name binding introduced in this file.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Def {
     pub name: String,
     pub kind: DefKind,
@@ -68,7 +68,7 @@ pub struct Def {
 }
 
 /// A use of a name in this file.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Ref {
     pub name: String,
     pub pos: Pos,
@@ -88,7 +88,7 @@ pub struct Ref {
 /// An external input the module depends on — part of "what does this need to
 /// run." Syntactic and over-approximate by design (computed keys/paths are
 /// bucketed or omitted, never guessed).
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Input {
     pub kind: InputKind,
     /// The literal name/path, or `<dynamic>` when the key/path is computed.
@@ -96,7 +96,7 @@ pub struct Input {
     pub pos: Pos,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum InputKind {
     /// An environment variable read (`os.getenv`, `os.environ[...]`, `.get`).
@@ -113,7 +113,7 @@ pub enum InputKind {
 /// over-approximate by design (matched on call-site shape, alias-following), so
 /// a hit means "statically appears to" — the basis for "is this pure / safe in
 /// a test / will it hit the network."
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum EffectKind {
     /// Filesystem: `open`, `Path.read_text`/`write_text`, `os.remove`, `shutil.*`.
@@ -136,7 +136,7 @@ pub enum EffectKind {
 }
 
 /// One side effect a piece of code statically appears to perform.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Effect {
     pub kind: EffectKind,
     /// The matched API or signal (`requests.get`, `os.environ`, `global x`).
@@ -154,7 +154,7 @@ pub struct Effect {
 
 /// When an import executes — distinguishes the module-load-time edges that form
 /// real import cycles from the ones good code uses to *break* them.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ImportContext {
     /// Module scope, not under a `TYPE_CHECKING` guard — runs at import time.
@@ -168,7 +168,7 @@ pub enum ImportContext {
 /// An import statement's module target — an edge in the dependency graph.
 /// Captures the written module and relative-import depth; name binding is
 /// already recorded separately as an [`Import`](DefKind::Import) def.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ImportStmt {
     /// The dotted module as written (`pkg.models`). Empty for `from . import x`,
     /// where the targets are the imported `names` under the resolved package.
@@ -189,14 +189,14 @@ pub struct ImportStmt {
 /// paths: a patch whose target no longer exists silently does nothing, and the
 /// test passes while testing the real code. `target` is `None` when the first
 /// argument isn't a string literal (computed → not statically verifiable).
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct MockTarget {
     pub target: Option<String>,
     pub pos: Pos,
 }
 
 /// All facts extracted from one Python module.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct FileIndex {
     pub path: String,
     pub defs: Vec<Def>,

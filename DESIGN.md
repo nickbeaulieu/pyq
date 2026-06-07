@@ -145,8 +145,70 @@ index we already build:
   (`callers` via ty's `call_hierarchy`, labelling each call site with its
   enclosing function); `inputs`/`imports` are pure syntactic facts.
 
-## Still open
-- **Dynamic tier.** Python's clean seams are `sys.addaudithook` (effect ledger,
-  free in CPython), `sys.monitoring` (3.12+, coverage + observed-shape), and
-  import hooks. Would ship as a bundled Python sidecar the Rust CLI drives.
-  Separate, larger commitment; static first.
+## The accuracy thesis — automatic verification
+Every verb returns *the most accurate answer currently knowable*, with no flag and
+no unlabeled guess. Two truths force the shape:
+- Static analysis of Python can't be exact *and* sound at once (Rice's theorem,
+  made vicious by `getattr`/`eval`/`importlib`/metaclasses/monkeypatching) — it
+  must over- or under-approximate.
+- Dynamic analysis is exact only for the paths that actually ran — it
+  under-approximates to whatever the suite exercised.
+
+So there is no single oracle that yields one true answer, and "100% accuracy" is
+the wrong target. What we *can* eliminate is **unqualified** approximation: every
+result carries a structural `confidence` — `proven` (statically decidable, exact),
+`observed` (ran this suite run), `confirmed` (predicted *and* observed), `predicted`
+(static reach, may be a phantom edge or miss a dynamic one), `refuted` (static said
+so, runtime contradicted it), `unverifiable` (undecidable for this evidence). The
+over-approximate verbs (`effects`/`tests`/`deadcode`/`canonical`/reverse `graph`)
+fuse the runtime ledger **automatically** and relabel each row; the already-exact
+verbs (`defs`/`refs`/`callers`/forward `graph`/`imports`) are `proven` and never run
+the suite. The irreducible residue — code with zero test coverage, statically
+undecidable inputs (`<dynamic>` keys) — is *named* `unverifiable`, not hidden: that
+label tells the agent exactly which file to open.
+
+Consequence: **the dynamic verbs dissolve into their static counterparts.** They
+were only separate because you had to opt into running the suite; remove that and
+`effect-diff` is just what `effects` returns, observed return types fold into
+`describe`/`defs` (declared next to observed), `change-coverage` is `tests` seeded
+from a diff, and `trace` demotes to an internal ledger dump. Fewer verbs, each more
+accurate. Degrade to static `predicted` (never error, never hang) when there's no
+interpreter / no pytest / no collected tests / a pre-3.12 runtime.
+
+## The analysis cache — first run pays, every run after is dirt cheap
+pyq today recomputes everything per invocation (re-walk the tree, re-parse every
+file, cold ty Salsa DB). The cache makes the *first* verb expensive and the rest
+near-free by persisting a content-addressed snapshot under `~/.pyq/` — a global,
+per-repo-namespaced store (`~/.pyq/cache/<canonical-root-hash>/`, with room for
+config/logs later). Three layers share one fingerprint:
+- **parse** — per-file `FileIndex` (defs/refs/effects/inputs), keyed by each file's
+  content hash; only changed files re-parse.
+- **graph** — the ty-*derived* facts (resolved call edges forward+reverse, override
+  map, hierarchy, `resolves_to`), keyed by the whole-tree fingerprint. We cache the
+  derived relations, **not ty's Salsa DB** (0.0.x, not durably serializable) — so
+  the cheap path never starts the parser or ty; it operates purely on the
+  materialized graph. The cache *is* the code-as-graph this whole tool exposes.
+- **ledger** — runtime effects/coverage/shapes/call-edges by FQN, keyed by the tree
+  fingerprint; from one instrumented suite run (audit hook + `sys.monitoring` tool
+  ids coexist, proven in the Phase 0 spike).
+
+Validation is the load-bearing part: a `stat` sweep (`size` + `mtime_ns`) reusing
+the ignore-walk we already do, with a `blake3` content hash only on files whose stat
+moved — a clean repo hashes nothing, so a warm verb is a stat sweep plus an `mmap`
+deserialize. Build-on-miss is lazy and automatic; an explicit `pyq analyze`
+pre-warms all three layers (the one front-load call, and where suite output streams).
+Writes are lockfile-guarded with atomic temp-then-rename so a fanned-out agent never
+races a torn cache. v1 rebuilds graph+ledger wholesale on any change (reusing
+unchanged parses); v2 incrementalizes — re-resolve only edges touching changed FQNs,
+and re-run only the tests the coverage map ties to changed lines (the ledger already
+records that map). The bigger-but-faster alternative — a resident daemon holding the
+graph in memory (the rust-analyzer model) — buys microsecond repeats at the cost of
+IPC + lifecycle + a live ty DB; the cache-backed CLI gets ~95% of the win at ~20% of
+the cost and is the right first build.
+
+## Shipped, formerly open
+- **Dynamic tier (#9).** Bundled Python sidecar (`crates/pyq-dynamic/`) driven by the
+  Rust CLI over `sys.addaudithook` (effect ledger), `sys.monitoring` (coverage +
+  observed shapes), pytest-first. Shipped the `trace`/`effect-diff`/`change-coverage`/
+  `shapes` verbs; the FQN join (runtime frame → static `scope_fqn`) is proven exact.
+  The automatic-verification work above folds these into the static verbs.

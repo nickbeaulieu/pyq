@@ -9,8 +9,11 @@ use pyq_index::FileIndex;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
-pub fn index_tree(root: &str) -> Result<Vec<FileIndex>> {
-    let mut files = Vec::new();
+/// The Python files under `root` as `(rel, abs)` pairs, honoring the same
+/// `.gitignore`/hidden-dir discipline as the rest of the tool. The single
+/// discovery definition both [`index_tree`] and the analysis cache walk.
+pub fn py_files(root: &str) -> Vec<(String, PathBuf)> {
+    let mut out = Vec::new();
     for entry in WalkBuilder::new(root).build() {
         let entry = match entry {
             Ok(e) => e,
@@ -20,15 +23,26 @@ pub fn index_tree(root: &str) -> Result<Vec<FileIndex>> {
         if !is_python(path) {
             continue;
         }
-        let source = match std::fs::read_to_string(path) {
-            Ok(s) => s,
-            Err(_) => continue,
-        };
         let rel = path
             .strip_prefix(root)
             .unwrap_or(path)
             .to_string_lossy()
             .into_owned();
+        out.push((rel, path.to_path_buf()));
+    }
+    out
+}
+
+/// Parse every Python file under `root` into a [`FileIndex`], uncached. The
+/// cache-aware entry point is [`crate::cache::index_tree`]; this is the
+/// primitive it falls back to and rebuilds misses with.
+pub fn index_tree(root: &str) -> Result<Vec<FileIndex>> {
+    let mut files = Vec::new();
+    for (rel, abs) in py_files(root) {
+        let source = match std::fs::read_to_string(&abs) {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
         files.push(crate::extract_file(&rel, &source));
     }
     Ok(files)

@@ -7,6 +7,50 @@ completed work is logged at the bottom. `→ blocked by #N` marks a dependency.
 
 ## Open
 
+### P1 — accuracy + cache (the current direction)
+The unifying move: every verb returns *the most accurate answer currently knowable*,
+automatically (no flag), and repeat runs are dirt cheap. See DESIGN.md — "The
+accuracy thesis" and "The analysis cache."
+- **#38 · Analysis cache (`~/.pyq/`).** Content-addressed snapshot so the first verb
+  pays and the rest are near-free. Store at `~/.pyq/cache/<canonical-root-hash>/`
+  (global, per-repo-namespaced, room for config/logs later). Three layers sharing one
+  fingerprint — **parse** (per-file `FileIndex`, content-hash keyed, only changed
+  files re-parse), **graph** (ty-*derived* edges/override-map/hierarchy/`resolves_to`,
+  tree-fingerprint keyed — cache the derived relations, *not* ty's Salsa DB, so the
+  cheap path never starts the parser or ty), **ledger** (runtime effects/coverage/
+  shapes/call-edges by FQN, tree-keyed). Validation = `stat` sweep (`size`+`mtime_ns`)
+  with `blake3` only on moved files (clean repo hashes nothing). Lazy build-on-miss +
+  explicit `pyq analyze` pre-warm. Lockfile + atomic temp-then-rename for fan-out
+  safety. Needs serde derives on the `pyq-resolve` graph types + a binary format
+  (`bincode`/`postcard`). → enables #39, #40.
+  - **#38.1** fingerprint + manifest + stat/hash sweep + cache dir layout. *Partly
+    done:* per-file stat (`size`+`mtime_ns`) → `blake3` fingerprint, the `ParseCache`
+    manifest, `~/.pyq/cache/<root-hash>/` layout (+ `PYQ_CACHE_DIR` override,
+    `PYQ_NO_CACHE` bypass), and atomic temp→rename writes all shipped in
+    `pyq-cli/src/cache.rs`. *Remaining:* the whole-tree fingerprint that keys the
+    graph/ledger layers (#38.3/#38.4).
+  - **#38.2** persist/load the parse layer (per-file, incremental). *Done.*
+    `cache::index_tree` reuses unchanged files' `FileIndex` and re-parses only
+    changed ones; drop-in for `walk::index_tree`, all parse call sites routed
+    through it. Best-effort (any cache failure falls back to a full parse).
+    `FileIndex` gained `Deserialize`. Tests: `pyq-cli/tests/cache.rs` (cold==warm,
+    equal-size edit invalidation, add/remove).
+  - **#38.3** persist/load the graph layer (serialize ty-derived facts; cheap path never instantiates ty).
+  - **#38.4** persist/load the ledger layer; `pyq analyze` pre-warm + progress streaming.
+  - **#38.5** v2 incremental: re-resolve only edges touching changed FQNs; re-run only tests the coverage map ties to changed lines.
+- **#39 · Per-row `confidence` in the envelope.** Structural provenance tag on every
+  result — `proven`/`observed`/`confirmed`/`predicted`/`refuted`/`unverifiable` —
+  replacing free-text caveats so an agent can machine-filter. `pyq-output` gains the
+  field + renders it (human + JSON). The already-exact verbs are `proven`; the
+  irreducible residue is named `unverifiable`, not hidden.
+- **#40 · Automatic verification — fold the dynamic verbs into the static ones.**
+  Over-approximate verbs (`effects`/`tests`/`deadcode`/`canonical`/reverse `graph`)
+  auto-fuse the cached ledger and relabel rows; already-exact verbs stay `proven` and
+  never run the suite. Folds: `effect-diff`→`effects`, `shapes`→`describe`/`defs`
+  (declared next to observed), `change-coverage`→`tests --base`, `trace`→internal dump.
+  Degrade to static `predicted` (never error/hang) when no interpreter/pytest/tests or
+  pre-3.12. → blocked by #38, #39.
+
 ### P2 — highest leverage
 - **#12 · `hierarchy` verb — class tree + override map.** Subclasses / supers /
   MRO, abstract methods left unimplemented, and for a base method every override
