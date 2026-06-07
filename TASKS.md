@@ -48,7 +48,11 @@ accuracy thesis" and "The analysis cache."
     across every graph verb (`tests/cache.rs`); ~50× warm speedup on the sample.
     *v1 caveat:* a cold run records the whole graph (more work than one query),
     and any source change rebuilds the whole recording — #38.5 incrementalizes.
-  - **#38.4** persist/load the ledger layer; `pyq analyze` pre-warm + progress streaming.
+  - **#38.4** persist/load the ledger layer; pre-warm + progress streaming.
+    *Prewarm shipped as the `index` verb:* `pyq index` builds the parse + graph
+    layers up front (idempotent — replays when the tree is unchanged), `pyq index
+    clean` wipes this repo's cache dir. *Remaining:* the ledger layer + streaming
+    progress during the cold build.
   - **#38.5** v2 incremental: re-resolve only edges touching changed FQNs; re-run only tests the coverage map ties to changed lines.
 - **#39 · Per-row `confidence` in the envelope.** Structural provenance tag on every
   result — `proven`/`observed`/`confirmed`/`predicted`/`refuted`/`unverifiable` —

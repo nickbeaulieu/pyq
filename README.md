@@ -40,6 +40,8 @@ pyq canonical                 # most-used helpers, untested public surface, test
 pyq inputs                    # the external input surface of the project
 pyq imports pkg.models --reverse   # who imports pkg.models (blast radius)
 pyq imports --cycles          # import cycles among project modules
+pyq index                     # prewarm the cache so later verbs are dirt cheap
+pyq index clean               # wipe this repo's cached index
 ```
 
 ### Verbs
@@ -59,6 +61,7 @@ pyq imports --cycles          # import cycles among project modules
 | `canonical` | The repo's canonical surface in one pass: the **most-used** helpers (internal callables ranked by how many distinct non-test callers reach them — what to reach for, not reinvent), the **untested-public** surface (top-level public functions/classes no collected test statically reaches), and the **test** inventory (every collected test with its markers). Rows carry a `section`. The project-level "tell me about this codebase." Same dynamic-dispatch blind spot as the call graph (it cuts both ways). See [Canonical](#canonical). |
 | `inputs` | What the code needs to run: env vars, literal files opened, CLI args (argparse/click), pydantic settings fields. |
 | `imports [module]` | The import graph. No arg: every edge. With a module: what it imports; `--reverse`: who imports it (blast radius); `--cycles`: import cycles. Accepts a module name or a file path. |
+| `index` | Build the analysis cache for this repo up front (parse + call graph) so later verbs replay from `~/.pyq` instead of reconstructing ty — the first run pays, the rest are dirt cheap. Idempotent. `index clean` removes this repo's cached index. |
 
 ### Flags
 

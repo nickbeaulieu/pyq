@@ -33,9 +33,13 @@ use std::process::ExitCode;
 #[derive(Parser)]
 #[command(
     name = "pyq",
-    // Version carries the build's short commit sha (captured in build.rs), so
-    // `pyq --version` pins exactly which build is running.
-    version = concat!(env!("CARGO_PKG_VERSION"), " (", env!("PYQ_GIT_SHA"), ")"),
+    // Version carries the channel, build date, and short commit sha (captured
+    // in build.rs), so `pyq --version` pins exactly which build is running and
+    // `pyq upgrade` knows what it's comparing against.
+    version = concat!(
+        env!("CARGO_PKG_VERSION"),
+        " (", env!("PYQ_CHANNEL"), " ", env!("PYQ_BUILD_DATE"), " ", env!("PYQ_GIT_SHA"), ")"
+    ),
     about = "A queryable code graph for Python — who-calls, what-resolves, what-it-touches.",
     // The grouped, colorized top-level menu is assembled at runtime (see
     // `help_template`): clap has no native subcommand grouping, and color must be
@@ -190,6 +194,20 @@ enum Command {
         #[arg(long)]
         python: Option<String>,
     },
+    /// Build the analysis cache for this repo up front — parse every file and
+    /// record the full call graph now, so later verbs replay from `~/.pyq`
+    /// without constructing ty. The "pay the first-run cost on demand" control.
+    /// `index clean` removes this repo's cached index entirely.
+    Index {
+        #[command(subcommand)]
+        action: Option<IndexAction>,
+    },
+}
+
+#[derive(Subcommand)]
+enum IndexAction {
+    /// Remove this repo's cached index from `~/.pyq` (forces a fresh build next time).
+    Clean,
 }
 
 fn main() -> ExitCode {
@@ -296,7 +314,13 @@ fn help_menu(color: bool) -> String {
         }
     }
     s += &format!("\n{h}Options{r}\n{{options}}\n");
-    s += &format!("\n{d}pyq {} ({}){r}\n", env!("CARGO_PKG_VERSION"), env!("PYQ_GIT_SHA"));
+    s += &format!(
+        "\n{d}pyq {} ({} {} {}){r}\n",
+        env!("CARGO_PKG_VERSION"),
+        env!("PYQ_CHANNEL"),
+        env!("PYQ_BUILD_DATE"),
+        env!("PYQ_GIT_SHA")
+    );
     s += &format!("\n{d}Run `pyq <command> --help` for the full description of any command.{r}");
     s
 }
@@ -367,6 +391,10 @@ fn dispatch(cli: &Cli) -> anyhow::Result<Envelope> {
             pytest_args,
             python,
         } => query_shapes(cli, pytest_args, python.as_deref())?,
+        Command::Index { action } => match action {
+            Some(IndexAction::Clean) => query_index_clean(cli)?,
+            None => query_index(cli)?,
+        },
     };
 
     // Anchor every result to one resolved root, echoed in the query — so the
@@ -1380,6 +1408,65 @@ fn plural(n: usize, word: &str) -> String {
     } else {
         format!("{word}s")
     }
+}
+
+/// Prewarm the analysis cache: parse every file and record the full call graph
+/// now, so subsequent verbs replay from `~/.pyq` without constructing ty. This
+/// pays the "first run" cost on demand (the cold record is the expensive part);
+/// it's idempotent — a re-run with an unchanged tree replays instead of
+/// rebuilding. Reports how much it indexed and where.
+fn query_index(cli: &Cli) -> anyhow::Result<Envelope> {
+    let (files, fingerprint) = cache::indexed(&cli.root)?;
+    let n = files.len();
+    let scope = walk::walked_py_files(&cli.root);
+    // Building the graph records its full ty-query surface and persists it
+    // (`call_graph` is a no-op rebuild when the fingerprint already matches).
+    let _ = cache::call_graph(&cli.root, &files, scope, &fingerprint)?;
+
+    // An empty fingerprint means caching is unavailable (`PYQ_NO_CACHE`, or no
+    // resolvable home) — say so rather than implying we persisted anything.
+    if fingerprint.is_empty() {
+        return Ok(Envelope::new(
+            json!({ "kind": "index", "files": n, "cached": false }),
+            vec![],
+        )
+        .with_summary(format!("parsed {} (caching disabled — nothing persisted)", plural_files(n)))
+        .with_warnings(vec![
+            "no cache was written (PYQ_NO_CACHE is set, or no home directory could be resolved)"
+                .to_string(),
+        ]));
+    }
+
+    let loc = cache::location(&cli.root)
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "<unavailable>".to_string());
+    Ok(Envelope::new(
+        json!({ "kind": "index", "files": n, "cached": true, "cache": loc }),
+        vec![],
+    )
+    .with_summary(format!(
+        "indexed {}; call graph recorded → {loc}",
+        plural_files(n)
+    )))
+}
+
+/// Remove this repo's cached index. Idempotent — reports plainly when there was
+/// nothing to remove.
+fn query_index_clean(cli: &Cli) -> anyhow::Result<Envelope> {
+    let removed = cache::clean(&cli.root)?;
+    Ok(match removed {
+        Some(path) => {
+            let p = path.to_string_lossy().into_owned();
+            Envelope::new(json!({ "kind": "index-clean", "removed": p.clone() }), vec![])
+                .with_summary(format!("removed cached index → {p}"))
+        }
+        None => Envelope::new(json!({ "kind": "index-clean", "removed": null }), vec![])
+            .with_summary("no cached index to remove".to_string()),
+    })
+}
+
+fn plural_files(n: usize) -> String {
+    format!("{n} {}", plural(n, "file"))
 }
 
 /// Re-export for the walk module.

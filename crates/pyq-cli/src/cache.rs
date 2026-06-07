@@ -209,6 +209,26 @@ fn cache_dir(root: &str) -> Option<PathBuf> {
     Some(base.join(key.as_str()))
 }
 
+/// The cache directory for `root`, if one can be resolved — so the `index` verb
+/// can report where it wrote and `index clean` knows what to remove.
+pub fn location(root: &str) -> Option<PathBuf> {
+    cache_dir(root)
+}
+
+/// Remove this repo's entire cache directory. Returns the path removed, or
+/// `None` when there was nothing to remove (or no cache dir could be resolved).
+pub fn clean(root: &str) -> Result<Option<PathBuf>> {
+    let Some(dir) = cache_dir(root) else {
+        return Ok(None);
+    };
+    if dir.exists() {
+        std::fs::remove_dir_all(&dir)?;
+        Ok(Some(dir))
+    } else {
+        Ok(None)
+    }
+}
+
 /// The persisted graph layer: the recorded ty edges plus the fingerprint they
 /// were recorded against. A fingerprint mismatch means the source moved, so the
 /// recording is stale and rebuilt.

@@ -185,3 +185,43 @@ fn graph_verbs_replay_identically_cold_and_warm() {
         .any(|e| e.path().join("graph.bin").exists());
     assert!(has_graph_bin, "a graph.bin recording should be persisted");
 }
+
+/// `pyq index` prewarms both layers; `pyq index clean` wipes this repo's cache.
+#[test]
+fn index_verb_prewarms_and_clean_wipes() {
+    let root = sample_root();
+    let cache = TempDir::new().unwrap();
+
+    // `index` writes both the parse and graph layers under one per-root dir.
+    let out = run(&root, cache.path(), &["index"]);
+    assert!(out.contains("indexed"), "index reports what it did: {out}");
+    let repo_dir = std::fs::read_dir(cache.path())
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .find(|p| p.join("parse.bin").exists())
+        .expect("index should create a per-root cache dir");
+    assert!(repo_dir.join("graph.bin").exists(), "index records the graph");
+
+    // After indexing, a graph verb matches a from-scratch (no-cache) run.
+    let warm = run(&root, cache.path(), &["deadcode", "--json"]);
+    let nocache = {
+        let o = Command::new(env!("CARGO_BIN_EXE_pyq"))
+            .args(["deadcode", "--json", "--root"])
+            .arg(&root)
+            .env("PYQ_NO_CACHE", "1")
+            .output()
+            .unwrap();
+        String::from_utf8(o.stdout).unwrap()
+    };
+    assert_eq!(warm, nocache, "indexed run must match live ty");
+
+    // `index clean` removes the repo's cache dir.
+    let cleaned = run(&root, cache.path(), &["index", "clean"]);
+    assert!(cleaned.contains("removed"), "clean reports removal: {cleaned}");
+    assert!(!repo_dir.exists(), "clean wipes the per-root dir");
+
+    // Cleaning again is a no-op, reported plainly.
+    let again = run(&root, cache.path(), &["index", "clean"]);
+    assert!(again.contains("no cached index"), "second clean is a no-op: {again}");
+}
