@@ -21,7 +21,7 @@ jobs:
   check:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -33,7 +33,7 @@ jobs:
       # a real pytest run; its tests self-skip when pytest is absent, so without
       # this the whole tier would go unexercised. 3.12 specifically because
       # `shapes`/`change-coverage` need `sys.monitoring` (3.12+).
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: '3.12'
 

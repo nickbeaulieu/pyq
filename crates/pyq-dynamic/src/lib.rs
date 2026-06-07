@@ -71,22 +71,38 @@ pub fn observed_effects(opts: &TraceOptions) -> Result<Envelope> {
     parse_envelope(&raw, run.exit_code)
 }
 
-/// Run the suite collecting per-test line coverage as well as effects (3.12+).
-/// Returns the parsed coverage; if the interpreter is pre-3.12 the coverage's
-/// `monitoring_available` is false and the caller degrades.
-pub fn observed_coverage(opts: &TraceOptions) -> Result<Coverage> {
-    let run = drive(opts, Collect::COVERAGE).context("running the coverage trace")?;
-    let path = run.coverage_out.as_ref().expect("coverage path");
-    let raw = std::fs::read_to_string(path).context("reading the coverage data")?;
-    Coverage::parse(&raw, run.exit_code)
+/// Everything one instrumented suite run observes: the effect ledger, per-test
+/// line coverage, and return-type shapes. The audit hook (effects) works on any
+/// interpreter; coverage/shapes need `sys.monitoring` (3.12+) and degrade
+/// (`monitoring_available: false`) otherwise.
+pub struct Observed {
+    pub effects: Envelope,
+    pub coverage: Coverage,
+    pub shapes: Shapes,
 }
 
-/// Run the suite collecting observed return-type shapes (3.12+).
-pub fn observed_shapes(opts: &TraceOptions) -> Result<Shapes> {
-    let run = drive(opts, Collect::SHAPES).context("running the shape trace")?;
-    let path = run.shapes_out.as_ref().expect("shapes path");
-    let raw = std::fs::read_to_string(path).context("reading the shape data")?;
-    Shapes::parse(&raw, run.exit_code)
+/// Run the suite **once** with every collector active and return all three
+/// ledgers — so `effects`, `describe`, and `tests --base` share a single pytest
+/// run instead of one apiece (#38.4). The three `sys.monitoring` tool ids and
+/// the audit hook coexist (proven in the Phase 0 spike).
+pub fn observed_all(opts: &TraceOptions) -> Result<Observed> {
+    let run = drive(opts, Collect::ALL).context("running the dynamic trace")?;
+    let effects_raw = std::fs::read_to_string(&run.effects_out).context("reading the ledger")?;
+    let effects = parse_envelope(&effects_raw, run.exit_code)?;
+
+    let cov_path = run.coverage_out.as_ref().expect("coverage path");
+    let coverage = Coverage::parse(
+        &std::fs::read_to_string(cov_path).context("reading the coverage data")?,
+        run.exit_code,
+    )?;
+
+    let sh_path = run.shapes_out.as_ref().expect("shapes path");
+    let shapes = Shapes::parse(
+        &std::fs::read_to_string(sh_path).context("reading the shape data")?,
+        run.exit_code,
+    )?;
+
+    Ok(Observed { effects, coverage, shapes })
 }
 
 /// Which optional artifacts a run collects (the effect ledger is always on).
@@ -98,8 +114,7 @@ struct Collect {
 
 impl Collect {
     const EFFECTS: Collect = Collect { coverage: false, shapes: false };
-    const COVERAGE: Collect = Collect { coverage: true, shapes: false };
-    const SHAPES: Collect = Collect { coverage: false, shapes: true };
+    const ALL: Collect = Collect { coverage: true, shapes: true };
 }
 
 /// The artifacts of one driven pytest run.
@@ -206,6 +221,7 @@ fn parse_envelope(raw: &str, exit_code: Option<i32>) -> Result<Envelope> {
 }
 
 /// Per-test line coverage from one suite run (`sys.monitoring`, 3.12+).
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct Coverage {
     /// Interpreter version string (`3.12.5`).
     pub python: String,
@@ -289,6 +305,7 @@ impl Coverage {
 }
 
 /// Observed return-type shapes from one suite run (`sys.monitoring`, 3.12+).
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct Shapes {
     pub python: String,
     pub monitoring_available: bool,

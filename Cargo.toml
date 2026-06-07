@@ -15,6 +15,15 @@ rust-version = "1.80"
 license = "MIT"
 repository = "https://github.com/nickbeaulieu/pyq"
 
+# The hot path is the ruff/ty parse + salsa stack, spread across many crates.
+# Cross-crate inlining (thin LTO) and a single codegen unit tighten that inner
+# loop. (No `panic = "abort"`: ty relies on `catch_unwind` to turn a per-file
+# panic into a diagnostic, so unwinding must stay — one bad file degrades
+# gracefully instead of aborting the run.) Costs build time only.
+[profile.release]
+lto = "thin"
+codegen-units = 1
+
 [workspace.dependencies]
 # Internal
 pyq-dynamic = { path = "crates/pyq-dynamic" }

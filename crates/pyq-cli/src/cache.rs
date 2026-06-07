@@ -22,6 +22,7 @@
 //! read-only `$HOME`).
 
 use std::collections::BTreeMap;
+use std::collections::HashMap;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
@@ -39,8 +40,8 @@ use crate::walk;
 const SCHEMA_VERSION: u32 = 2;
 
 /// Independent version for the graph layer (the recorded ty edges). Bumped when
-/// the `GraphRecording` shape changes.
-const GRAPH_SCHEMA: u32 = 1;
+/// the `GraphRecording` shape or how it's built changes.
+const GRAPH_SCHEMA: u32 = 3;
 
 /// One cached file: the stat fingerprint that validates it plus the parsed
 /// facts. `hash` lets a touch-without-change (mtime moved, bytes identical)
@@ -229,13 +230,15 @@ pub fn clean(root: &str) -> Result<Option<PathBuf>> {
     }
 }
 
-/// The persisted graph layer: the recorded ty edges plus the fingerprint they
-/// were recorded against. A fingerprint mismatch means the source moved, so the
-/// recording is stale and rebuilt.
+/// The persisted graph layer: the recorded ty edges, the whole-tree fingerprint
+/// they were recorded against (a hit replays as-is), and a per-file content hash
+/// so a *mismatch* can be repaired incrementally — re-recording only the files
+/// that changed and their import neighbours, not the whole tree (#38.5).
 #[derive(Serialize, Deserialize)]
 struct GraphCache {
     schema: u32,
     fingerprint: String,
+    file_hashes: BTreeMap<String, [u8; 32]>,
     recording: GraphRecording,
 }
 
@@ -253,72 +256,179 @@ pub fn call_graph(
     scope: HashSet<PathBuf>,
     fingerprint: &str,
 ) -> Result<CallGraph> {
-    let dir = cache_dir(root);
+    call_graph_with_progress(root, files, scope, fingerprint, &|_, _| {})
+}
 
-    if !fingerprint.is_empty() {
-        if let Some(gc) = dir.as_ref().and_then(|d| read_bin::<GraphCache>(&d.join("graph.bin"))) {
-            if gc.schema == GRAPH_SCHEMA && gc.fingerprint == fingerprint {
-                return Ok(CallGraph::replay(files.to_vec(), gc.recording));
+/// Like [`call_graph`], reporting record progress (for `pyq index`'s bar).
+///
+/// Every path answers from a [`GraphRecording`], cached or not: a fingerprint
+/// hit replays the persisted one; otherwise we build it live, persist it (when
+/// caching is on), and replay from it. Routing the uncached path through the
+/// recording too means a `PYQ_NO_CACHE` run gives the *identical* answer to a
+/// warm one — the recording, not raw ty, is the single source of truth.
+pub fn call_graph_with_progress(
+    root: &str,
+    files: &[FileIndex],
+    scope: HashSet<PathBuf>,
+    fingerprint: &str,
+    progress: &dyn Fn(pyq_resolve::RecordPhase, usize),
+) -> Result<CallGraph> {
+    // Caching off (`PYQ_NO_CACHE`): build live, record, replay — never touch disk.
+    if fingerprint.is_empty() {
+        let graph = CallGraph::new(root, files.to_vec(), scope)?;
+        let recording = graph.record_with_progress(progress);
+        return Ok(CallGraph::replay(files.to_vec(), recording));
+    }
+
+    let dir = cache_dir(root);
+    let prev = dir.as_ref().and_then(|d| read_bin::<GraphCache>(&d.join("graph.bin")));
+    let prev = prev.filter(|gc| gc.schema == GRAPH_SCHEMA);
+
+    // Warm: the whole-tree fingerprint matches → replay the recording as-is.
+    if let Some(gc) = &prev {
+        if gc.fingerprint == fingerprint {
+            return Ok(CallGraph::replay(files.to_vec(), gc.recording.clone()));
+        }
+    }
+
+    let cur_hashes = file_hashes(files);
+    let graph = CallGraph::new(root, files.to_vec(), scope)?;
+    let recording = match prev {
+        // Have a prior recording but the tree moved → re-record only the files
+        // that changed and their import component (#38.5), reusing the rest.
+        Some(gc) => {
+            let changed = changed_files(&gc.file_hashes, &cur_hashes);
+            let import_adj = file_import_adjacency(files);
+            graph.record_incremental(gc.recording, &changed, &import_adj, progress)
+        }
+        // No prior recording → full record.
+        None => graph.record_with_progress(progress),
+    };
+
+    if let Some(dir) = dir {
+        let cache = GraphCache {
+            schema: GRAPH_SCHEMA,
+            fingerprint: fingerprint.to_string(),
+            file_hashes: cur_hashes,
+            recording: recording.clone(),
+        };
+        let _ = write_bin(&dir, "graph.bin", &cache);
+    }
+    Ok(CallGraph::replay(files.to_vec(), recording))
+}
+
+/// A per-file content hash keyed by path — the blake3 of each file's serialized
+/// `FileIndex`, so it changes exactly when the file's parse does. The basis for
+/// the incremental graph diff (which files moved since the recording).
+fn file_hashes(files: &[FileIndex]) -> BTreeMap<String, [u8; 32]> {
+    files
+        .iter()
+        .map(|f| {
+            let bytes = bincode::serialize(f).unwrap_or_default();
+            (f.path.clone(), *blake3::hash(&bytes).as_bytes())
+        })
+        .collect()
+}
+
+/// Files whose hash differs between two snapshots — modified, added, or removed.
+fn changed_files(
+    prev: &BTreeMap<String, [u8; 32]>,
+    cur: &BTreeMap<String, [u8; 32]>,
+) -> HashSet<String> {
+    let mut changed = HashSet::new();
+    for (path, hash) in cur {
+        if prev.get(path) != Some(hash) {
+            changed.insert(path.clone());
+        }
+    }
+    for path in prev.keys() {
+        if !cur.contains_key(path) {
+            changed.insert(path.clone());
+        }
+    }
+    changed
+}
+
+/// The project's **undirected** file-level import adjacency: `A ↔ B` when file
+/// `A` imports a module whose file is `B`. The incremental recorder walks this to
+/// find the component of changed files — every cross-file ty dependency (a call
+/// resolving into another module, a base class, a caller) rides an import edge.
+fn file_import_adjacency(files: &[FileIndex]) -> HashMap<String, Vec<String>> {
+    let g = crate::graph::Graph::build(files);
+    let mut adj: HashMap<String, Vec<String>> = HashMap::new();
+    for e in &g.edges {
+        if let Some(target_file) = g.file_of(&e.target) {
+            if target_file != e.importer_file {
+                adj.entry(e.importer_file.clone()).or_default().push(target_file.to_string());
+                adj.entry(target_file.to_string()).or_default().push(e.importer_file.clone());
             }
         }
     }
-
-    let graph = CallGraph::new(root, files.to_vec(), scope)?;
-    if !fingerprint.is_empty() {
-        if let Some(dir) = dir {
-            let cache = GraphCache {
-                schema: GRAPH_SCHEMA,
-                fingerprint: fingerprint.to_string(),
-                recording: graph.record(),
-            };
-            let _ = write_bin(&dir, "graph.bin", &cache);
-        }
-    }
-    Ok(graph)
+    adj
 }
 
-/// Independent version for the runtime-ledger layer (observed effects from a
-/// suite run). Bumped when the stored shape changes.
-const LEDGER_SCHEMA: u32 = 1;
+/// Version for the runtime-ledger layer. One instrumented suite run feeds
+/// effects + coverage + shapes together (#38.4); bumped when the stored shape
+/// changes.
+const LEDGER_SCHEMA: u32 = 2;
 
-/// The persisted runtime ledger: the `(owner FQN, effect category)` pairs the
-/// suite actually performed, keyed by the tree fingerprint it was observed
-/// against.
+/// The persisted runtime ledger: everything one suite run observed, keyed by the
+/// tree fingerprint. One file, one run — `effects`, `describe`, and `tests
+/// --base` all read from it instead of each running pytest.
 #[derive(Serialize, Deserialize)]
 struct LedgerCache {
     schema: u32,
     fingerprint: String,
     effects: Vec<(String, String)>,
+    coverage: pyq_dynamic::Coverage,
+    shapes: BTreeMap<String, Vec<String>>,
     pytest_exit: Option<i64>,
     warnings: Vec<String>,
 }
 
-/// What a suite run observed — or why it couldn't. `available` is false when the
-/// suite was skipped (`PYQ_NO_SUITE`) or couldn't run (no interpreter/pytest);
-/// callers degrade to static `predicted` rather than erroring.
-pub struct ObservedEffects {
-    pub pairs: HashSet<(String, String)>,
+/// What one instrumented suite run observed — or why it couldn't. `available` is
+/// false when the suite was skipped (`PYQ_NO_SUITE`) or couldn't run (no
+/// interpreter/pytest); callers degrade rather than erroring. `effects` is the
+/// `(owner, category)` set, `shapes` is observed return types by FQN, and
+/// `coverage` is per-test line coverage (its own `monitoring_available` gates
+/// the 3.12+ collectors; the audit-hook `effects` work on any interpreter).
+pub struct Ledger {
     pub available: bool,
+    pub effects: HashSet<(String, String)>,
+    pub shapes: BTreeMap<String, Vec<String>>,
+    pub coverage: pyq_dynamic::Coverage,
     pub pytest_exit: Option<i64>,
     pub warnings: Vec<String>,
 }
 
-/// The observed effect ledger for `root`: served from `ledger.bin` when its
-/// fingerprint matches, otherwise the suite is **run on demand** and the result
-/// cached. Set `PYQ_NO_SUITE` to skip the run entirely (CI, sandboxes, or when
-/// the static prediction is enough). A failed run degrades to `available:false`
-/// and is not cached, so the next call retries.
-pub fn ledger_effects(root: &str, fingerprint: &str, python: &str) -> ObservedEffects {
-    let unavailable = |warning: String| ObservedEffects {
-        pairs: HashSet::new(),
+fn empty_coverage() -> pyq_dynamic::Coverage {
+    pyq_dynamic::Coverage {
+        python: String::new(),
+        monitoring_available: false,
+        tests: BTreeMap::new(),
+        files: BTreeMap::new(),
+        pytest_exit: None,
+    }
+}
+
+/// The runtime ledger for `root`: served from `ledger.bin` on a fingerprint
+/// match, otherwise the suite is **run once** with every collector active and
+/// the result cached — so `effects`, `describe`, and `tests --base` share a
+/// single pytest run rather than one apiece. `PYQ_NO_SUITE` skips it; a failed
+/// run degrades to `available:false` and isn't cached (retry next call).
+pub fn ledger(root: &str, fingerprint: &str, python: &str) -> Ledger {
+    let unavailable = |warning: String| Ledger {
         available: false,
+        effects: HashSet::new(),
+        shapes: BTreeMap::new(),
+        coverage: empty_coverage(),
         pytest_exit: None,
         warnings: vec![warning],
     };
 
     if std::env::var_os("PYQ_NO_SUITE").is_some() {
         return unavailable(
-            "suite run skipped (PYQ_NO_SUITE set) — effects are static predictions".to_string(),
+            "suite run skipped (PYQ_NO_SUITE set) — results are static predictions".to_string(),
         );
     }
 
@@ -326,9 +436,11 @@ pub fn ledger_effects(root: &str, fingerprint: &str, python: &str) -> ObservedEf
     if !fingerprint.is_empty() {
         if let Some(lc) = dir.as_ref().and_then(|d| read_bin::<LedgerCache>(&d.join("ledger.bin"))) {
             if lc.schema == LEDGER_SCHEMA && lc.fingerprint == fingerprint {
-                return ObservedEffects {
-                    pairs: lc.effects.into_iter().collect(),
+                return Ledger {
                     available: true,
+                    effects: lc.effects.into_iter().collect(),
+                    shapes: lc.shapes,
+                    coverage: lc.coverage,
                     pytest_exit: lc.pytest_exit,
                     warnings: lc.warnings,
                 };
@@ -336,39 +448,43 @@ pub fn ledger_effects(root: &str, fingerprint: &str, python: &str) -> ObservedEf
         }
     }
 
-    // Cache miss → run the suite under the dynamic tier.
+    // Cache miss → one instrumented suite run for all three ledgers.
     let mut opts = pyq_dynamic::TraceOptions::new(root.to_string());
     opts.python = python.to_string();
-    let env = match pyq_dynamic::observed_effects(&opts) {
-        Ok(env) => env,
+    let observed = match pyq_dynamic::observed_all(&opts) {
+        Ok(o) => o,
         Err(e) => {
             return unavailable(format!(
-                "could not run the test suite ({e}) — effects are static predictions"
+                "could not run the test suite ({e}) — results are static predictions"
             ))
         }
     };
 
-    let mut pairs = HashSet::new();
-    for r in &env.results {
+    let mut effects = HashSet::new();
+    for r in &observed.effects.results {
         if let (Some(owner), Some(cat)) = (
             r.get("owner").and_then(|v| v.as_str()),
             r.get("effect").and_then(|v| v.as_str()),
         ) {
             // `import` is a load event, not one of the static effect categories.
             if cat != "import" {
-                pairs.insert((owner.to_string(), cat.to_string()));
+                effects.insert((owner.to_string(), cat.to_string()));
             }
         }
     }
-    let pytest_exit = env.query.get("pytest_exit").and_then(|v| v.as_i64());
-    let warnings = env.warnings.clone();
+    let pytest_exit = observed.effects.query.get("pytest_exit").and_then(|v| v.as_i64());
+    let warnings = observed.effects.warnings.clone();
+    let shapes = observed.shapes.returns;
+    let coverage = observed.coverage;
 
     if !fingerprint.is_empty() {
         if let Some(dir) = dir {
             let lc = LedgerCache {
                 schema: LEDGER_SCHEMA,
                 fingerprint: fingerprint.to_string(),
-                effects: pairs.iter().cloned().collect(),
+                effects: effects.iter().cloned().collect(),
+                coverage: coverage.clone(),
+                shapes: shapes.clone(),
                 pytest_exit,
                 warnings: warnings.clone(),
             };
@@ -376,70 +492,13 @@ pub fn ledger_effects(root: &str, fingerprint: &str, python: &str) -> ObservedEf
         }
     }
 
-    ObservedEffects {
-        pairs,
+    Ledger {
         available: true,
+        effects,
+        shapes,
+        coverage,
         pytest_exit,
         warnings,
-    }
-}
-
-/// Independent version for the observed-shapes layer (runtime return types).
-const SHAPES_SCHEMA: u32 = 1;
-
-#[derive(Serialize, Deserialize)]
-struct ShapesCache {
-    schema: u32,
-    fingerprint: String,
-    returns: Vec<(String, Vec<String>)>,
-}
-
-/// The runtime return types each callable produced, keyed by FQN. Empty when the
-/// suite was skipped/failed or the interpreter is pre-3.12 (`sys.monitoring`
-/// absent) — callers simply omit the observed column in that case.
-pub struct ObservedShapes {
-    pub returns: BTreeMap<String, Vec<String>>,
-}
-
-/// The observed-shapes ledger for `root`: served from `shapes.bin` on a
-/// fingerprint match, else the suite is run on demand and cached. `PYQ_NO_SUITE`
-/// skips it; a pre-3.12 / failed run yields an empty map and isn't cached (so a
-/// later capable interpreter retries).
-pub fn ledger_shapes(root: &str, fingerprint: &str, python: &str) -> ObservedShapes {
-    let empty = || ObservedShapes {
-        returns: BTreeMap::new(),
-    };
-    if std::env::var_os("PYQ_NO_SUITE").is_some() {
-        return empty();
-    }
-    let dir = cache_dir(root);
-    if !fingerprint.is_empty() {
-        if let Some(sc) = dir.as_ref().and_then(|d| read_bin::<ShapesCache>(&d.join("shapes.bin"))) {
-            if sc.schema == SHAPES_SCHEMA && sc.fingerprint == fingerprint {
-                return ObservedShapes {
-                    returns: sc.returns.into_iter().collect(),
-                };
-            }
-        }
-    }
-    let mut opts = pyq_dynamic::TraceOptions::new(root.to_string());
-    opts.python = python.to_string();
-    let shapes = match pyq_dynamic::observed_shapes(&opts) {
-        Ok(s) if s.monitoring_available => s,
-        _ => return empty(),
-    };
-    if !fingerprint.is_empty() {
-        if let Some(dir) = dir {
-            let sc = ShapesCache {
-                schema: SHAPES_SCHEMA,
-                fingerprint: fingerprint.to_string(),
-                returns: shapes.returns.clone().into_iter().collect(),
-            };
-            let _ = write_bin(&dir, "shapes.bin", &sc);
-        }
-    }
-    ObservedShapes {
-        returns: shapes.returns,
     }
 }
 

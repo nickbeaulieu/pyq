@@ -313,6 +313,87 @@ pub fn framework_entry_fqns(
     out
 }
 
+/// Why a reverse-reachability answer for a symbol is framework-driven — the
+/// reason the call graph can't see all of its callers.
+pub enum DispatchKind {
+    /// Decorated — a route/task/fixture/signal/CLI hook the framework calls.
+    Decorated,
+    /// A method on a class that extends a non-project base (Django/DRF/stdlib),
+    /// so the framework drives it polymorphically.
+    FrameworkBase,
+    /// Entered by convention/config: an entrypoint file, a module-scope
+    /// registry reference, or a dotted-string config path.
+    FrameworkEntry,
+}
+
+impl DispatchKind {
+    /// A short clause naming the reason, for a one-line note.
+    pub fn reason(&self) -> &'static str {
+        match self {
+            DispatchKind::Decorated => "decorated, so the framework calls it",
+            DispatchKind::FrameworkBase => {
+                "a method on a framework-driven class (extends a non-project base)"
+            }
+            DispatchKind::FrameworkEntry => {
+                "entered by convention/config (entrypoint file, registry, or a dotted-string path)"
+            }
+        }
+    }
+}
+
+/// Evidence that reverse reachability for `roots` is **incomplete** because the
+/// symbol is framework-driven — entered without a direct project call, so
+/// callers/tests that reach it only through that dispatch aren't in the call
+/// graph. Returns `None` when there's no such evidence, so consumers
+/// (`tests`/`callers`/`graph --reverse`) fire the caveat *only when it applies*
+/// rather than as a blanket disclaimer — turning a misleading `0` into a
+/// specific, trustworthy note. Reuses the same liveness signals as `deadcode`.
+pub fn dispatch_caveat(
+    roots: &[String],
+    files: &[FileIndex],
+    graph: &CallGraph,
+    hier: &Hierarchy,
+    root: &str,
+) -> Option<(String, DispatchKind)> {
+    if roots.is_empty() {
+        return None;
+    }
+    let root_set: HashSet<&str> = roots.iter().map(String::as_str).collect();
+    let test_classes = test_class_fqns(files);
+    let entry_classes = framework_managed_classes(files, hier, &test_classes);
+
+    // Classify the queried def(s) directly — gives a specific reason.
+    for f in files {
+        let entry_file = is_entrypoint_file(&f.path);
+        for d in &f.defs {
+            let fqn = scope_fqn(&f.path, &def_scope(d));
+            if !root_set.contains(fqn.as_str()) {
+                continue;
+            }
+            if d.decorated {
+                return Some((fqn, DispatchKind::Decorated));
+            }
+            let in_entry_class = (1..=d.container.len())
+                .any(|k| entry_classes.contains(&scope_fqn(&f.path, &d.container[..k])));
+            let is_entry_class = d.kind == DefKind::Class && entry_classes.contains(&fqn);
+            if in_entry_class || is_entry_class {
+                return Some((fqn, DispatchKind::FrameworkBase));
+            }
+            if entry_file {
+                return Some((fqn, DispatchKind::FrameworkEntry));
+            }
+        }
+    }
+    // Fallback: a module-scope reference or dotted-string config names a root
+    // (a view in a URL table, a handler in settings) — framework-driven, even
+    // though the def itself carries no local marker.
+    let entry = framework_entry_fqns(files, graph, hier, root);
+    roots
+        .iter()
+        .find(|f| entry.contains(*f))
+        .map(|f| (f.clone(), DispatchKind::FrameworkEntry))
+}
+
 /// FQN → `(path, name offset)` for every first-party callable (function/class)
 /// in the tree — the anchor a graph walk seeds from, and the lookup a
 /// dotted-string config path or override edge resolves against. Shared by

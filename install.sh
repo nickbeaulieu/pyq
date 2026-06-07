@@ -114,7 +114,16 @@ detect_target() {
         *) die "unsupported architecture: $arch" ;;
     esac
     case "$os" in
-        Darwin) echo "$arch-apple-darwin" ;;
+        Darwin)
+            # Only Apple Silicon is published; there's no prebuilt Intel-mac
+            # binary, and an arm64 build won't run on Intel (Rosetta is the other
+            # direction). Point Intel users at a source build rather than letting
+            # them hit a bare "no asset for x86_64-apple-darwin".
+            if [ "$arch" = "x86_64" ]; then
+                die "no prebuilt binary for Intel macOS (x86_64) — only Apple Silicon (arm64) is published. Build from source: clone the repo and run \`cargo build --release\`."
+            fi
+            echo "$arch-apple-darwin"
+            ;;
         Linux)
             if [ "$arch" = "aarch64" ]; then
                 echo "aarch64-unknown-linux-gnu"

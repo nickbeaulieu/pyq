@@ -10,6 +10,10 @@ ruff_text_size.workspace = true
 anyhow.workspace = true
 serde.workspace = true
 toml = "1"
+# Parallelize the per-anchor ty queries when recording the graph — the cold
+# index's dominant cost. ty's own checker uses rayon over the same db, so
+# concurrent reads on a cloned handle are supported.
+rayon = "1"
 
 # The ty stack — pinned to the same ruff tag as the rest. All contact with ty is
 # confined to this crate (the insulation layer): if ty's API churns, the blast

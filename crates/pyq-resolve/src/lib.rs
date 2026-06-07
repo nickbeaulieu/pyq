@@ -18,7 +18,8 @@ mod ty_backed;
 mod unified;
 
 pub use graph::{
-    scope_fqn, CallGraph, CallGraphTy, Closure, Direction, GraphNode, GraphRecording, ReplayTy,
+    scope_fqn, CallGraph, CallGraphTy, Closure, Direction, GraphNode, GraphRecording, RecordPhase,
+    ReplayTy,
 };
 
 use serde::{Deserialize, Serialize};

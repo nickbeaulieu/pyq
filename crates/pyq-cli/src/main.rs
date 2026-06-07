@@ -5,6 +5,11 @@
 //! about code-as-graph. This is the first slice — symbol/reference queries over
 //! a directory of Python files, single-file name resolution.
 
+// The ruff/ty parse + salsa analysis stack allocates heavily across rayon
+// threads; mimalloc outperforms the platform default (notably musl's) there.
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 mod cache;
 mod canonical;
 mod change_cov;
@@ -19,7 +24,7 @@ mod upgrade;
 mod walk;
 
 use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
-use pyq_dynamic::{default_python, observed_coverage, observed_effects, TraceOptions};
+use pyq_dynamic::{default_python, observed_effects, TraceOptions};
 use pyq_index::{extract, EffectKind, FileIndex, InputKind};
 use pyq_output::{Channel, Envelope};
 use pyq_resolve::{
@@ -293,6 +298,7 @@ fn help_menu(color: bool) -> String {
             ("inputs", "[script]", "App env/config & settings; a script name for its own inputs."),
             ("mock-targets", "", "Resolve every mock.patch(...) and flag drifted targets."),
             ("canonical", "", "Most-used helpers, untested public surface, test inventory."),
+            ("index", "", "Prewarm the ~/.pyq cache (index clean wipes it)."),
         ]),
         ("Distribution", &[
             ("channel", "[name]", "Show or switch the release channel (stable / canary)."),
@@ -357,7 +363,7 @@ fn dispatch(cli: &Cli) -> anyhow::Result<Envelope> {
             query_imports(&files, module.as_deref(), *reverse, *cycles)
         }
         Command::Refs { symbol } => resolve(cli, symbol, "refs", |r, s| r.references(s))?,
-        Command::Callers { symbol } => resolve(cli, symbol, "callers", |r, s| r.callers(s))?,
+        Command::Callers { symbol } => query_callers(cli, symbol)?,
         Command::Defs { symbol } => resolve(cli, symbol, "defs", |r, s| r.definitions(s))?,
         Command::Graph {
             symbol,
@@ -369,7 +375,7 @@ fn dispatch(cli: &Cli) -> anyhow::Result<Envelope> {
         Command::Tests { symbol, base } => match (base, symbol) {
             // `--base` is the absorbed change-coverage (runtime line coverage of
             // the diff); a bare symbol is the static reaching-tests map.
-            (Some(base), _) => query_change_cov(cli, base, &[], None)?,
+            (Some(base), _) => query_change_cov(cli, base)?,
             (None, Some(symbol)) => query_tests(cli, symbol)?,
             (None, None) => anyhow::bail!(
                 "`tests` needs a symbol (reaching tests) or `--base <ref>` (changed-line coverage)"
@@ -431,6 +437,47 @@ fn resolve(
     Ok(Envelope::new(json!({ "kind": kind, "target": symbol }), results).with_summary(summary))
 }
 
+/// `callers` — every call site of a symbol, from the ty-backed resolver, with
+/// the same framework-dispatch caveat as `tests`/`graph --reverse`: a method a
+/// framework drives (a view, a signal handler) can show zero direct callers
+/// while being called constantly, so a `0` here must say why. The resolver
+/// gives the precise call sites; the call graph + hierarchy supply the caveat.
+fn query_callers(cli: &Cli, symbol: &str) -> anyhow::Result<Envelope> {
+    let (files, fingerprint) = cache::indexed(&cli.root)?;
+    let scope = walk::walked_py_files(&cli.root);
+    let graph = cache::call_graph(&cli.root, &files, scope.clone(), &fingerprint)?;
+    // Resolve the symbol to its durable FQN(s) without walking (depth 0), then
+    // ask whether those are framework-driven.
+    let roots = graph.closure(symbol, Direction::Reverse, Some(0)).roots;
+    let caveat = if roots.is_empty() {
+        None
+    } else {
+        let hier = hierarchy::Hierarchy::build(&files, &graph);
+        deadcode::dispatch_caveat(&roots, &files, &graph, &hier, &cli.root)
+    };
+
+    let resolver = UnifiedResolver::new(&cli.root, files, scope)?;
+    let locs = resolver.callers(symbol)?;
+    let results = locs.iter().map(loc_to_json).collect::<Vec<_>>();
+    let summary = format!("{} {} of `{symbol}`", results.len(), plural(results.len(), "caller"));
+    let exhaustive = caveat.is_none();
+    let query = json!({
+        "kind": "callers",
+        "target": symbol,
+        "exhaustive": exhaustive,
+        "caveat": caveat.as_ref().map(|_| "framework-dispatch"),
+    });
+    let mut envelope = Envelope::new(query, results).with_summary(summary);
+    if let Some((fqn, kind)) = &caveat {
+        envelope = envelope.with_warnings(vec![format!(
+            "`{}` is framework-dispatched ({}) — callers that reach it only through that dispatch aren't shown, so a 0 here is not \"uncalled\".",
+            leaf(fqn),
+            kind.reason()
+        )]);
+    }
+    Ok(envelope)
+}
+
 fn loc_to_json(loc: &Loc) -> serde_json::Value {
     // Group by kind (the classifier that used to repeat on every line); the body
     // is just the resolved target when the use is ambiguous, else nothing — so a
@@ -479,10 +526,23 @@ fn query_graph(
     let results = closure.nodes.iter().map(node_to_json).collect::<Vec<_>>();
     let n = results.len();
     let summary = if reverse {
-        format!("{n} {} transitively reach `{symbol}`", plural(n, "node"))
+        format!("{n} {} statically reach `{symbol}`", plural(n, "node"))
     } else {
         format!("{n} {} reachable from `{symbol}`", plural(n, "node"))
     };
+
+    // The forward closure reads each def's own body, so it's exhaustive; the
+    // reverse closure misses callers reached through dynamic dispatch — caveat
+    // it, but only when the symbol is framework-driven (so the note is evidence,
+    // not boilerplate).
+    let caveat = if reverse && !closure.roots.is_empty() {
+        let hier = hierarchy::Hierarchy::build(&files, &graph);
+        deadcode::dispatch_caveat(&closure.roots, &files, &graph, &hier, &cli.root)
+    } else {
+        None
+    };
+    let exhaustive = !reverse || (!closure.roots.is_empty() && caveat.is_none());
+
     // Echo the resolved FQN roots: the durable handle(s) the symbol mapped to,
     // re-queryable after edits even when line numbers move.
     let query = json!({
@@ -490,6 +550,8 @@ fn query_graph(
         "mode": if reverse { "reverse" } else { "forward" },
         "target": symbol,
         "roots": closure.roots,
+        "exhaustive": exhaustive,
+        "caveat": caveat.as_ref().map(|_| "framework-dispatch"),
     });
     let mut envelope = Envelope::new(query, results).with_summary(summary);
     // No root means the symbol named no function or class — a 0-result graph
@@ -497,6 +559,12 @@ fn query_graph(
     if closure.roots.is_empty() {
         envelope = envelope
             .with_warnings(vec![format!("no function or class named `{symbol}` found")]);
+    } else if let Some((fqn, kind)) = &caveat {
+        envelope = envelope.with_warnings(vec![format!(
+            "`{}` is framework-dispatched ({}) — callers that reach it only through that dispatch aren't followed, so a 0 here is not \"unreached\".",
+            leaf(fqn),
+            kind.reason()
+        )]);
     }
     Ok(envelope)
 }
@@ -542,26 +610,36 @@ fn query_tests(cli: &Cli, symbol: &str) -> anyhow::Result<Envelope> {
         .collect();
 
     let summary = tests_map::summary(symbol, closure.roots.is_empty(), results.len());
+
+    // Fire the dynamic-dispatch caveat only when there's evidence it applies to
+    // *this* symbol (it's framework-driven), so a `0` from a Django view or a
+    // Celery task says why — instead of a blanket disclaimer on every query.
+    let caveat = if closure.roots.is_empty() {
+        None
+    } else {
+        let hier = hierarchy::Hierarchy::build(&files, &graph);
+        deadcode::dispatch_caveat(&closure.roots, &files, &graph, &hier, &cli.root)
+    };
+    let exhaustive = !closure.roots.is_empty() && caveat.is_none();
     let query = json!({
         "kind": "tests",
         "target": symbol,
         "roots": closure.roots,
+        "exhaustive": exhaustive,
+        "caveat": caveat.as_ref().map(|_| "framework-dispatch"),
     });
     let mut envelope = Envelope::new(query, results).with_summary(summary);
 
-    let mut warnings = Vec::new();
     if closure.roots.is_empty() {
-        warnings.push(format!("no function or class named `{symbol}` found"));
-    } else {
-        // Honest boundary: reachability is the call graph's static
-        // over-approximation (dynamic/attribute dispatch not followed), and test
-        // collection uses pytest's default naming/location rules — custom
-        // `python_files`/`python_classes` config is not read.
-        warnings.push(
-            "static over-approximation: tests reaching via dynamic/attribute dispatch are not followed; test collection uses pytest naming + unittest/TestCase-inheritance rules (custom python_files/python_classes config not read)".to_string(),
-        );
+        envelope = envelope
+            .with_warnings(vec![format!("no function or class named `{symbol}` found")]);
+    } else if let Some((fqn, kind)) = &caveat {
+        envelope = envelope.with_warnings(vec![format!(
+            "`{}` is framework-dispatched ({}) — tests that reach it only through that dispatch aren't followed, so a 0 here is not \"untested\". Confirm runtime coverage with `pyq tests --base`.",
+            leaf(fqn),
+            kind.reason()
+        )]);
     }
-    envelope = envelope.with_warnings(warnings);
     Ok(envelope)
 }
 
@@ -660,11 +738,11 @@ fn query_effects(cli: &Cli, symbol: Option<&str>) -> anyhow::Result<Envelope> {
     }
 
     // --- Runtime ledger (cached, or the suite run on demand) ---
-    let observed = cache::ledger_effects(&cli.root, &fingerprint, &default_python());
+    let observed = cache::ledger(&cli.root, &fingerprint, &default_python());
     let static_keys: HashSet<(String, String)> =
         sites.iter().map(|s| (s.owner.clone(), s.cat.to_string())).collect();
     let confidence = |owner: &str, cat: &str| -> &'static str {
-        if observed.available && observed.pairs.contains(&(owner.to_string(), cat.to_string())) {
+        if observed.available && observed.effects.contains(&(owner.to_string(), cat.to_string())) {
             "confirmed"
         } else if AUDITABLE.contains(&cat) {
             "predicted"
@@ -724,7 +802,7 @@ fn query_effects(cli: &Cli, symbol: Option<&str>) -> anyhow::Result<Envelope> {
     // edges); project-wide keeps them all.
     if observed.available {
         let mut dyn_only: Vec<&(String, String)> = observed
-            .pairs
+            .effects
             .iter()
             .filter(|(owner, cat)| {
                 !static_keys.contains(&(owner.clone(), cat.clone()))
@@ -821,18 +899,14 @@ const AUDITABLE: &[&str] = &["fs", "network", "subprocess", "db"];
 /// out. On a pre-3.12 interpreter (`sys.monitoring` absent) we report the
 /// changed lines with unknown coverage and say so, rather than implying they're
 /// all untested.
-fn query_change_cov(
-    cli: &Cli,
-    base: &str,
-    pytest_args: &[String],
-    python: Option<&str>,
-) -> anyhow::Result<Envelope> {
+fn query_change_cov(cli: &Cli, base: &str) -> anyhow::Result<Envelope> {
     let changed = change_cov::changed_lines(&cli.root, base)?;
 
-    let mut opts = TraceOptions::new(cli.root.clone());
-    opts.python = python.map(str::to_string).unwrap_or_else(default_python);
-    opts.pytest_args = pytest_args.to_vec();
-    let cov = observed_coverage(&opts)?;
+    // Per-test line coverage comes from the shared runtime ledger — one suite run
+    // for effects/shapes/coverage, run on a cache miss (`PYQ_NO_SUITE` skips).
+    let (_files, fingerprint) = cache::indexed(&cli.root)?;
+    let led = cache::ledger(&cli.root, &fingerprint, &default_python());
+    let cov = &led.coverage;
 
     let total_changed: usize = changed.values().map(|s| s.len()).sum();
     let query = json!({
@@ -842,7 +916,9 @@ fn query_change_cov(
         "pytest_exit": cov.pytest_exit,
     });
 
-    // Pre-3.12: no line coverage. Report what changed, flag the gap, don't lie.
+    // No coverage — either the suite couldn't run (no pytest / `PYQ_NO_SUITE`) or
+    // the interpreter is pre-3.12. Report what changed, flag the real reason,
+    // don't imply the lines are untested.
     if !cov.monitoring_available {
         let results: Vec<serde_json::Value> = changed
             .iter()
@@ -851,22 +927,29 @@ fn query_change_cov(
                     json!({
                         "loc": format!("{file}:{ln}"),
                         "status": "unknown",
-                        "label": format!("unknown {file}:{ln} (line coverage needs Python 3.12+)"),
+                        "label": format!("unknown {file}:{ln} (no line coverage)"),
                         "group": "unknown", "cols": [],
                     })
                 })
             })
             .collect();
-        return Ok(Envelope::new(query, results)
-            .with_summary(format!(
-                "{total_changed} changed line(s); coverage unavailable on Python {}",
-                cov.python
-            ))
-            .with_warnings(vec![format!(
+        // The suite ran but is pre-3.12 → name the version; it didn't run at all
+        // → carry the ledger's own reason (no pytest / skipped).
+        let warning = if led.available {
+            format!(
                 "per-line coverage needs the `sys.monitoring` API (Python 3.12+); \
                  ran under {} — changed lines reported with unknown coverage",
                 cov.python
-            )]));
+            )
+        } else {
+            led.warnings.join("; ")
+        };
+        return Ok(Envelope::new(query, results)
+            .with_summary(format!(
+                "{total_changed} changed line(s); coverage unavailable{}",
+                if led.available { format!(" on Python {}", cov.python) } else { String::new() }
+            ))
+            .with_warnings(vec![warning]));
     }
 
     let mut results: Vec<serde_json::Value> = Vec::new();
@@ -1407,13 +1490,98 @@ fn plural(n: usize, word: &str) -> String {
 /// pays the "first run" cost on demand (the cold record is the expensive part);
 /// it's idempotent — a re-run with an unchanged tree replays instead of
 /// rebuilding. Reports how much it indexed and where.
+/// A two-phase progress bar for `pyq index`'s call-graph record. The phases run
+/// **sequentially** — `Edges` (walk every callable) fully completes before
+/// `Resolve` (resolve occurrences) — so a single reused bar shows them in turn:
+/// no second [`indicatif::ProgressBar`] competing for the terminal's live line
+/// (two standalone bars clobber each other; one leaves the other orphaned at 0).
+/// Hidden unless drawing to a terminal, so piped / `--json` output stays clean.
+struct IndexProgress {
+    bar: indicatif::ProgressBar,
+    edges_total: u64,
+    resolve_total: u64,
+    on_resolve: std::sync::atomic::AtomicBool,
+}
+
+impl IndexProgress {
+    fn new(edges_total: u64, resolve_total: u64, want: bool) -> Self {
+        let bar = if want && std::io::stderr().is_terminal() {
+            indicatif::ProgressBar::new(edges_total)
+        } else {
+            indicatif::ProgressBar::hidden()
+        };
+        bar.set_style(
+            indicatif::ProgressStyle::with_template("  {msg:<11} [{bar:30}] {pos}/{len}")
+                .unwrap_or_else(|_| indicatif::ProgressStyle::default_bar())
+                .progress_chars("=> "),
+        );
+        bar.set_message("call graph");
+        IndexProgress {
+            bar,
+            edges_total,
+            resolve_total,
+            on_resolve: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    fn tick(&self, phase: pyq_resolve::RecordPhase, count: u64) {
+        match phase {
+            pyq_resolve::RecordPhase::Edges => {
+                // The worklist can discover a few nodes past the def-anchor count;
+                // grow the bar rather than pin at 100%.
+                if count > self.bar.length().unwrap_or(0) {
+                    self.bar.set_length(count);
+                }
+                self.bar.set_position(count);
+            }
+            pyq_resolve::RecordPhase::Resolve => {
+                // First resolve tick: finish the edge phase at full, then reuse the
+                // same line for the resolve phase (new label, length, position).
+                if !self.on_resolve.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    self.bar.set_position(self.bar.length().unwrap_or(self.edges_total));
+                    self.bar.set_message("resolving");
+                    self.bar.set_length(self.resolve_total);
+                }
+                self.bar.set_position(count);
+            }
+        }
+    }
+
+    fn finish(&self) {
+        if let Some(len) = self.bar.length() {
+            self.bar.set_position(len);
+        }
+        self.bar.finish();
+    }
+}
+
 fn query_index(cli: &Cli) -> anyhow::Result<Envelope> {
     let (files, fingerprint) = cache::indexed(&cli.root)?;
     let n = files.len();
     let scope = walk::walked_py_files(&cli.root);
-    // Building the graph records its full ty-query surface and persists it
-    // (`call_graph` is a no-op rebuild when the fingerprint already matches).
-    let _ = cache::call_graph(&cli.root, &files, scope, &fingerprint)?;
+
+    // A two-phase progress bar for the call-graph record — the slow part on a big
+    // tree. Totals come straight from the parsed facts (def anchors to walk for
+    // edges; occurrences to resolve). Drawn only on a TTY; silent when piped or
+    // under `--json`, so machine consumers see clean output.
+    let edges_total = files
+        .iter()
+        .flat_map(|f| f.defs.iter())
+        .filter(|d| matches!(d.kind, pyq_index::DefKind::Function | pyq_index::DefKind::Class))
+        .count() as u64;
+    let resolve_total = files
+        .iter()
+        .map(|f| {
+            (f.refs.len() + f.defs.iter().filter(|d| d.kind == pyq_index::DefKind::Import).count())
+                as u64
+        })
+        .sum::<u64>()
+        .max(1);
+    let progress = IndexProgress::new(edges_total, resolve_total, !cli.json && !cli.pretty);
+    cache::call_graph_with_progress(&cli.root, &files, scope, &fingerprint, &|phase, count| {
+        progress.tick(phase, count as u64);
+    })?;
+    progress.finish();
 
     // An empty fingerprint means caching is unavailable (`PYQ_NO_CACHE`, or no
     // resolvable home) — say so rather than implying we persisted anything.

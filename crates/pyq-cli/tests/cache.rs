@@ -186,6 +186,64 @@ fn graph_verbs_replay_identically_cold_and_warm() {
     assert!(has_graph_bin, "a graph.bin recording should be persisted");
 }
 
+/// Incremental graph invalidation (#38.5): after a warm graph cache, an edit /
+/// add / delete must repair the recording so the result is byte-identical to a
+/// from-scratch (`PYQ_NO_CACHE`) build — only cheaper. Uses pure-graph verbs
+/// (`graph`/`deadcode`/`canonical`) so no test suite runs.
+#[test]
+fn graph_cache_repairs_incrementally_and_matches_from_scratch() {
+    let proj = TempDir::new().unwrap();
+    let cache = TempDir::new().unwrap();
+    let p = proj.path();
+    std::fs::create_dir_all(p.join("pkg")).unwrap();
+    std::fs::write(p.join("pkg/__init__.py"), "").unwrap();
+    // a and b independent; c imports a.
+    std::fs::write(p.join("pkg/a.py"), "def a1():\n    return 1\n").unwrap();
+    std::fs::write(p.join("pkg/b.py"), "def b1():\n    return 2\n").unwrap();
+    std::fs::write(p.join("pkg/c.py"), "from pkg.a import a1\ndef c1():\n    return a1()\n").unwrap();
+
+    // Compare every graph verb between the (warm, incrementally-repaired) cache
+    // and a from-scratch build, asserting byte-equality.
+    let verbs: &[&[&str]] = &[
+        &["graph", "c1", "--json"],
+        &["graph", "a1", "--reverse", "--json"],
+        &["graph", "b1", "--reverse", "--json"],
+        &["deadcode", "--json"],
+        &["canonical", "--json"],
+    ];
+    let assert_matches = |cache_dir: &Path, label: &str| {
+        for v in verbs {
+            let incremental = run(p, cache_dir, v);
+            let scratch = {
+                let out = Command::new(env!("CARGO_BIN_EXE_pyq"))
+                    .args(*v)
+                    .arg("--root")
+                    .arg(p)
+                    .env("PYQ_NO_CACHE", "1")
+                    .output()
+                    .unwrap();
+                String::from_utf8(out.stdout).unwrap()
+            };
+            assert_eq!(incremental, scratch, "{label}: `{}`", v.join(" "));
+        }
+    };
+
+    // Warm the cache, then exercise each kind of change.
+    run(p, cache.path(), &["graph", "c1", "--json"]);
+
+    std::fs::write(p.join("pkg/b.py"), "def b2():\n    return 3\ndef b1():\n    return b2()\n").unwrap();
+    assert_matches(cache.path(), "edit");
+
+    std::fs::write(p.join("pkg/c.py"), "from pkg.b import b1\ndef c1():\n    return b1()\n").unwrap();
+    assert_matches(cache.path(), "cross-file edge change");
+
+    std::fs::write(p.join("pkg/d.py"), "from pkg.c import c1\ndef d1():\n    return c1()\n").unwrap();
+    assert_matches(cache.path(), "add file");
+
+    std::fs::remove_file(p.join("pkg/d.py")).unwrap();
+    assert_matches(cache.path(), "delete file");
+}
+
 /// `pyq index` prewarms both layers; `pyq index clean` wipes this repo's cache.
 #[test]
 fn index_verb_prewarms_and_clean_wipes() {

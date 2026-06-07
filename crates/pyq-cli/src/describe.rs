@@ -45,9 +45,10 @@ pub fn query(root: &str, symbol: &str) -> anyhow::Result<Envelope> {
     }
 
     // Observed return types (the absorbed `shapes`): runtime evidence next to
-    // ty's declared signature. Runs the suite on a cache miss; absent (no column)
-    // when it can't (pre-3.12, no pytest, or `PYQ_NO_SUITE`).
-    let shapes = crate::cache::ledger_shapes(root, &fingerprint, &default_python());
+    // ty's declared signature. Reads the shared runtime ledger — runs the suite
+    // on a cache miss; absent (no column) when it can't (pre-3.12, no pytest, or
+    // `PYQ_NO_SUITE`).
+    let ledger = crate::cache::ledger(root, &fingerprint, &default_python());
 
     let graph = crate::cache::call_graph(root, &files, scope, &fingerprint)?;
     // Depth-1 callees; the full reverse closure (immediate callers are its
@@ -63,7 +64,7 @@ pub fn query(root: &str, symbol: &str) -> anyhow::Result<Envelope> {
     // return type appended when the shapes ledger has one for that FQN.
     for root_fqn in roots {
         if let Some((f, d)) = def_by_fqn.get(root_fqn) {
-            let observed = shapes.returns.get(root_fqn).map(|v| v.join(" | "));
+            let observed = ledger.shapes.get(root_fqn).map(|v| v.join(" | "));
             results.push(definition_row(root_fqn, f, d, observed.as_deref()));
         }
     }

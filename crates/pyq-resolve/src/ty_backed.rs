@@ -7,6 +7,7 @@ use ruff_db::system::{OsSystem, SystemPath, SystemPathBuf};
 use ruff_text_size::{TextRange, TextSize};
 use std::collections::HashSet;
 use std::path::PathBuf;
+use std::sync::Arc;
 use ty_ide::{
     find_references, goto_definition, incoming_calls, outgoing_calls, type_hierarchy_supertypes,
     workspace_symbols, CallHierarchyItem, SymbolKind,
@@ -17,6 +18,11 @@ use ty_project::{ProjectDatabase, ProjectMetadata};
 
 use crate::{Loc, Neighbor, Resolver};
 
+/// `Clone` is cheap — `ProjectDatabase` is an `Arc`-backed salsa handle and
+/// `scope` is shared behind an `Arc` — so the recording can hand each rayon
+/// task its own clone (ty's databases aren't `Sync`, but a per-thread clone
+/// gives the same shared storage with independent query state).
+#[derive(Clone)]
 pub struct TyResolver {
     db: ProjectDatabase,
     /// Canonical absolute project root; every emitted path is relative to it.
@@ -25,7 +31,8 @@ pub struct TyResolver {
     /// for correctness, but only results in this set are *reported* — so the
     /// output honors `--root` and `.gitignore`/hidden filtering, and a nested
     /// worktree copy can't double-count. Empty = report everything (no filter).
-    scope: HashSet<PathBuf>,
+    /// `Arc` so a per-task clone is a refcount bump, not a set copy.
+    scope: Arc<HashSet<PathBuf>>,
 }
 
 impl TyResolver {
@@ -72,7 +79,7 @@ impl TyResolver {
         Ok(TyResolver {
             db,
             root_canon,
-            scope,
+            scope: Arc::new(scope),
         })
     }
 

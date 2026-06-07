@@ -22,6 +22,11 @@ blake3.workspace = true
 dirs.workspace = true
 bincode.workspace = true
 toml = "1"
+# Global allocator — the ruff/ty parse + salsa stack is allocation-heavy and
+# parallel; mimalloc beats the default (and musl's especially) on that profile.
+mimalloc = "0.1"
+# `pyq index` progress bars — only drawn on a TTY (silent when piped / --json).
+indicatif = "0.17"
 # `pyq upgrade`: query the GitHub releases API, verify the sha256 of the
 # downloaded asset, and atomically replace the running binary. ureq is a small
 # blocking HTTP client (rustls, no async runtime); self-replace handles the

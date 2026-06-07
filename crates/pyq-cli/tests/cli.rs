@@ -538,6 +538,40 @@ fn graph_reverse_crosses_imports_without_merging_same_named() {
     assert_eq!(env["count"].as_u64().unwrap(), 1, "{env}");
 }
 
+// The reverse closure must be *complete* — it captures every real caller,
+// across the three edge forms that each single source of truth misses on its
+// own (the union the recording builds):
+//   - a direct call (the property getter that calls the target);
+//   - a property *access* (`doc.label`, not a call) — invisible to a transpose
+//     of `outgoing`, recovered from ty's `incoming`;
+//   - a class-body call through an aliased import — invisible to ty's
+//     def-anchored `incoming`, recovered from the transpose / module sweep.
+// Missing any reads as "fewer callers than exist," the dangerous direction.
+#[test]
+fn graph_reverse_closure_is_complete_across_edge_forms() {
+    let root = fixture("reverse_union");
+    let (env, ok) = run_json_in(&root, &["graph", "reverse_choices", "--reverse"]);
+    assert!(ok);
+    let fqns: std::collections::HashSet<&str> = env["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["fqn"].as_str().unwrap())
+        .collect();
+    // direct caller: the property getter that calls the target.
+    assert!(fqns.contains("models.Doc.label"), "direct caller missing: {env}");
+    // property ACCESS caller (no call site) — the transpose alone can't see it.
+    assert!(
+        fqns.contains("views.render"),
+        "property-access caller missing (ty-incoming gap): {env}"
+    );
+    // class-body aliased caller — ty's def-anchored incoming alone can't see it.
+    assert!(
+        fqns.contains("config") || fqns.contains("config.Settings"),
+        "class-body aliased caller missing (transpose/sweep gap): {env}"
+    );
+}
+
 // A symbol that names no callable is roots-empty with a warning — distinct from
 // a real callable that simply reaches nothing (roots-present, count 0). The
 // query still exits 0.
@@ -831,6 +865,83 @@ fn deadcode_flags_only_the_unreachable_and_respects_entrypoints() {
         .as_str()
         .unwrap()
         .contains("over-approximate")));
+}
+
+// The reverse-reachability verbs (`callers`, `graph --reverse`, `tests`) carry a
+// dynamic-dispatch caveat *only when there's evidence the queried symbol is
+// framework-driven* — so a `0` from a DRF serializer method says why, while a
+// plain function's `0` stays clean (no blanket disclaimer). `WidgetSerializer`
+// extends a framework base, so `get_label` is dispatched, not called directly.
+fn has_framework_warning(env: &serde_json::Value) -> bool {
+    env["warnings"]
+        .as_array()
+        .map(|ws| {
+            ws.iter()
+                .any(|w| w.as_str().unwrap_or("").contains("framework-dispatched"))
+        })
+        .unwrap_or(false)
+}
+
+#[test]
+fn callers_caveat_fires_only_for_framework_dispatched_symbols() {
+    let root = fixture("deadcode");
+
+    // A framework-driven method: zero static callers, but the envelope says why.
+    let (fw, ok) = run_json_in(&root, &["callers", "WidgetSerializer.get_label"]);
+    assert!(ok);
+    assert_eq!(fw["query"]["exhaustive"], false, "{fw}");
+    assert_eq!(fw["query"]["caveat"], "framework-dispatch", "{fw}");
+    assert!(has_framework_warning(&fw), "expected a framework note: {fw}");
+
+    // A plain helper with a real caller: complete, and silent.
+    let (plain, ok) = run_json_in(&root, &["callers", "_helper"]);
+    assert!(ok);
+    assert_eq!(plain["query"]["exhaustive"], true, "{plain}");
+    assert!(plain["query"]["caveat"].is_null(), "{plain}");
+    assert!(!has_framework_warning(&plain), "plain symbol must stay clean: {plain}");
+}
+
+#[test]
+fn graph_reverse_caveats_framework_dispatch_but_forward_is_exhaustive() {
+    let root = fixture("deadcode");
+
+    // Reverse over a framework-driven method: incomplete, and flagged.
+    let (rev, ok) = run_json_in(&root, &["graph", "WidgetSerializer.get_label", "--reverse"]);
+    assert!(ok);
+    assert_eq!(rev["query"]["exhaustive"], false, "{rev}");
+    assert_eq!(rev["query"]["caveat"], "framework-dispatch", "{rev}");
+    assert!(has_framework_warning(&rev), "{rev}");
+
+    // The forward closure reads each body, so it's always exhaustive — no caveat
+    // even on the same framework symbol.
+    let (fwd, ok) = run_json_in(&root, &["graph", "WidgetSerializer.get_label"]);
+    assert!(ok);
+    assert_eq!(fwd["query"]["exhaustive"], true, "{fwd}");
+    assert!(fwd["query"]["caveat"].is_null(), "{fwd}");
+    assert!(!has_framework_warning(&fwd), "forward closure has no dispatch gap: {fwd}");
+}
+
+#[test]
+fn tests_verb_caveats_framework_method_and_says_statically() {
+    let root = fixture("deadcode");
+
+    // A framework method no test reaches statically — the caveat explains the 0.
+    let (fw, ok) = run_json_in(&root, &["tests", "WidgetSerializer.get_label"]);
+    assert!(ok);
+    assert_eq!(fw["query"]["exhaustive"], false, "{fw}");
+    assert_eq!(fw["query"]["caveat"], "framework-dispatch", "{fw}");
+    assert!(has_framework_warning(&fw), "{fw}");
+
+    // A plain symbol: the summary is honest about being a *static* lens, and
+    // there's no framework caveat.
+    let (plain, ok) = run_json_in(&root, &["tests", "_helper"]);
+    assert!(ok);
+    assert!(
+        plain["summary"].as_str().unwrap().contains("statically"),
+        "tests summary must say `statically`: {plain}"
+    );
+    assert_eq!(plain["query"]["exhaustive"], true, "{plain}");
+    assert!(plain["query"]["caveat"].is_null(), "{plain}");
 }
 
 // `hierarchy` reports a class's supertypes (external marked), transitive

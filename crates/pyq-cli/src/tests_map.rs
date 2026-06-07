@@ -135,6 +135,6 @@ pub fn summary(symbol: &str, roots_empty: bool, n: usize) -> String {
     } else if n == 0 {
         format!("no test statically reaches `{symbol}`")
     } else {
-        format!("{n} {} reach `{symbol}`", plural(n, "test"))
+        format!("{n} {} statically reach `{symbol}`", plural(n, "test"))
     }
 }
