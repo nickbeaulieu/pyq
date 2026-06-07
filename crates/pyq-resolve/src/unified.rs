@@ -156,7 +156,7 @@ impl UnifiedResolver {
                 }
             }
         }
-        out.sort_by(|a, b| a.key().cmp(&b.key()));
+        out.sort_by_key(|l| l.key());
         out
     }
 }
@@ -215,7 +215,7 @@ impl Resolver for UnifiedResolver {
                 }
             }
         }
-        defs.sort_by(|a, b| a.key().cmp(&b.key()));
+        defs.sort_by_key(|l| l.key());
         defs.dedup_by(|a, b| a.key() == b.key());
         Ok(defs)
     }
