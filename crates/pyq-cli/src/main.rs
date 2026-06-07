@@ -5,6 +5,7 @@
 //! about code-as-graph. This is the first slice — symbol/reference queries over
 //! a directory of Python files, single-file name resolution.
 
+mod change_cov;
 mod deadcode;
 mod graph;
 mod hierarchy;
@@ -13,7 +14,9 @@ mod tests_map;
 mod walk;
 
 use clap::{Parser, Subcommand};
-use pyq_dynamic::{observed_effects, default_python, TraceOptions};
+use pyq_dynamic::{
+    default_python, observed_coverage, observed_effects, observed_shapes, TraceOptions,
+};
 use pyq_index::{extract, EffectKind, FileIndex, InputKind};
 use pyq_output::{Channel, Envelope};
 use pyq_resolve::{
@@ -118,6 +121,47 @@ enum Command {
         #[arg(long)]
         python: Option<String>,
     },
+    /// Join the static effect surface against what the suite actually performs
+    /// at runtime: `confirmed` (both), `dynamic-only` (runtime did it, static
+    /// missed the edge — the dynamic-dispatch blind spot), `static-only` (static
+    /// predicted it, runtime didn't — over-approximation or unexercised), and
+    /// `unverifiable` (a category the audit hook can't see). Runs your tests.
+    EffectDiff {
+        /// Arguments passed through to pytest (test paths, `-k`, `-m`, …).
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        pytest_args: Vec<String>,
+        /// Python interpreter to drive (defaults to `$PYQ_PYTHON` or `python3`).
+        #[arg(long)]
+        python: Option<String>,
+    },
+    /// Which lines changed since `--base` are exercised by the test suite, and
+    /// by which tests — the runtime oracle behind the `tests` verb's "a static
+    /// 0 is not 'untested'" caveat. Joins `git diff` against per-test line
+    /// coverage (`sys.monitoring`, Python 3.12+; degrades on older). Runs your
+    /// tests.
+    ChangeCoverage {
+        /// Git ref to diff against (default: `HEAD`, i.e. uncommitted changes).
+        #[arg(long, default_value = "HEAD")]
+        base: String,
+        /// Arguments passed through to pytest (test paths, `-k`, `-m`, …).
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        pytest_args: Vec<String>,
+        /// Python interpreter to drive (defaults to `$PYQ_PYTHON` or `python3`).
+        #[arg(long)]
+        python: Option<String>,
+    },
+    /// The concrete return type each callable actually produced at runtime —
+    /// runtime evidence complementing ty's static inference, for spotting
+    /// missing/loose annotations. Needs Python 3.12+ (`sys.monitoring`); runs
+    /// your tests.
+    Shapes {
+        /// Arguments passed through to pytest (test paths, `-k`, `-m`, …).
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        pytest_args: Vec<String>,
+        /// Python interpreter to drive (defaults to `$PYQ_PYTHON` or `python3`).
+        #[arg(long)]
+        python: Option<String>,
+    },
 }
 
 fn main() -> ExitCode {
@@ -192,6 +236,19 @@ fn dispatch(cli: &Cli) -> anyhow::Result<Envelope> {
             pytest_args,
             python,
         } => query_trace(cli, pytest_args, python.as_deref())?,
+        Command::EffectDiff {
+            pytest_args,
+            python,
+        } => query_effect_diff(cli, pytest_args, python.as_deref())?,
+        Command::ChangeCoverage {
+            base,
+            pytest_args,
+            python,
+        } => query_change_cov(cli, base, pytest_args, python.as_deref())?,
+        Command::Shapes {
+            pytest_args,
+            python,
+        } => query_shapes(cli, pytest_args, python.as_deref())?,
     };
 
     // Anchor every result to one resolved root, echoed in the query — so the
@@ -468,6 +525,319 @@ fn query_effects(cli: &Cli, symbol: &str) -> anyhow::Result<Envelope> {
     }
     envelope = envelope.with_warnings(warnings);
     Ok(envelope)
+}
+
+/// Effect categories the runtime audit hook can actually observe, so a
+/// disagreement with the static surface is meaningful. `env` (writes only),
+/// `random`, `clock`, and `global` have no audit event — a static-only finding
+/// there is "the dynamic tier can't see it," not "the static tier over-reached."
+const AUDITABLE: &[&str] = &["fs", "network", "subprocess", "db"];
+
+/// effect-diff (#9.3): join the static effect surface against what the suite
+/// actually performed at runtime, into three buckets —
+///   `confirmed`     static predicted it, runtime did it;
+///   `dynamic-only`  runtime did it, static missed it (the dynamic-dispatch
+///                   blind spot — the finding that makes the dynamic tier worth
+///                   running);
+///   `static-only`   static predicted it, runtime didn't — over-approximation
+///                   or simply not exercised by the suite (distinguishing the
+///                   two wants change-coverage, #9.4); in an unaudited category
+///                   it is instead `unverifiable`.
+/// Both tiers key effects on the same `(owner FQN, category)`, so the join is
+/// exact.
+fn query_effect_diff(
+    cli: &Cli,
+    pytest_args: &[String],
+    python: Option<&str>,
+) -> anyhow::Result<Envelope> {
+    // Static side: every effect site across the project, keyed (owner, cat),
+    // keeping one representative location for the report.
+    let files = walk::index_tree(&cli.root)?;
+    let mut static_map: std::collections::BTreeMap<(String, &'static str), String> =
+        std::collections::BTreeMap::new();
+    for f in &files {
+        for e in &f.effects {
+            let owner = scope_fqn(&f.path, &e.scope);
+            let cat = effect_kind_str(e.kind);
+            let loc = format!("{}:{}:{}", f.path, e.pos.line, e.pos.col);
+            static_map.entry((owner, cat)).or_insert(loc);
+        }
+    }
+
+    // Dynamic side: run the suite under the ledger; collect observed (owner,
+    // cat), dropping `import` (a load event, not one of the static effect
+    // categories).
+    let mut opts = TraceOptions::new(cli.root.clone());
+    opts.python = python.map(str::to_string).unwrap_or_else(default_python);
+    opts.pytest_args = pytest_args.to_vec();
+    let observed = observed_effects(&opts)?;
+    let pytest_exit = observed.query.get("pytest_exit").cloned();
+    let mut dynamic_set: BTreeSet<(String, String)> = BTreeSet::new();
+    for r in &observed.results {
+        let (owner, cat) = match (r.get("owner").and_then(|v| v.as_str()),
+                                  r.get("effect").and_then(|v| v.as_str())) {
+            (Some(o), Some(c)) if c != "import" => (o.to_string(), c.to_string()),
+            _ => continue,
+        };
+        dynamic_set.insert((owner, cat));
+    }
+
+    let static_keys: BTreeSet<(String, String)> = static_map
+        .keys()
+        .map(|(o, c)| (o.clone(), c.to_string()))
+        .collect();
+
+    let mut results: Vec<serde_json::Value> = Vec::new();
+    let (mut n_confirmed, mut n_dynamic, mut n_static, mut n_unverif) = (0, 0, 0, 0);
+
+    // confirmed + static-only/unverifiable, walking the static surface.
+    for ((owner, cat), loc) in &static_map {
+        let key = (owner.clone(), cat.to_string());
+        if dynamic_set.contains(&key) {
+            n_confirmed += 1;
+            results.push(json!({
+                "status": "confirmed", "effect": cat, "owner": owner, "loc": loc,
+                "label": format!("confirmed {cat}  {owner}"),
+            }));
+        } else if AUDITABLE.contains(cat) {
+            n_static += 1;
+            results.push(json!({
+                "status": "static-only", "effect": cat, "owner": owner, "loc": loc,
+                "label": format!("static-only {cat}  {owner} (over-approx or unexercised)"),
+            }));
+        } else {
+            n_unverif += 1;
+            results.push(json!({
+                "status": "unverifiable", "effect": cat, "owner": owner, "loc": loc,
+                "label": format!("unverifiable {cat}  {owner} (category not audited)"),
+            }));
+        }
+    }
+    // dynamic-only: observed effects the static surface never predicted.
+    for (owner, cat) in &dynamic_set {
+        if !static_keys.contains(&(owner.clone(), cat.clone())) {
+            n_dynamic += 1;
+            results.push(json!({
+                "status": "dynamic-only", "effect": cat, "owner": owner,
+                "label": format!("dynamic-only {cat}  {owner} (static missed this edge)"),
+            }));
+        }
+    }
+
+    // Stable order: status bucket, then category, then owner.
+    let bucket_rank = |s: &str| match s {
+        "dynamic-only" => 0,
+        "confirmed" => 1,
+        "static-only" => 2,
+        _ => 3,
+    };
+    results.sort_by(|a, b| {
+        let sa = a["status"].as_str().unwrap_or("");
+        let sb = b["status"].as_str().unwrap_or("");
+        bucket_rank(sa)
+            .cmp(&bucket_rank(sb))
+            .then(a["effect"].as_str().cmp(&b["effect"].as_str()))
+            .then(a["owner"].as_str().cmp(&b["owner"].as_str()))
+    });
+
+    let summary = format!(
+        "effect-diff: {n_dynamic} dynamic-only, {n_confirmed} confirmed, \
+         {n_static} static-only, {n_unverif} unverifiable"
+    );
+    let mut query = json!({ "kind": "effect-diff" });
+    if let (Some(obj), Some(exit)) = (query.as_object_mut(), pytest_exit) {
+        obj.insert("pytest_exit".to_string(), exit);
+    }
+
+    let mut warnings = vec![
+        "dynamic-only effects are the dynamic-dispatch edges the static surface \
+         can't see — the reason to run this."
+            .to_string(),
+        "static-only ≠ over-approximation: the suite may simply not exercise that \
+         path. change-coverage (#9.4) will separate the two."
+            .to_string(),
+    ];
+    // Carry through the ledger's own caveats (unaudited categories, dropped
+    // non-project hits) so they aren't lost in the join.
+    warnings.extend(observed.warnings.iter().cloned());
+
+    Ok(Envelope::new(query, results)
+        .with_summary(summary)
+        .with_warnings(warnings))
+}
+
+/// change-coverage (#9.4): join the lines changed since `base` against per-test
+/// runtime line coverage. Each changed line is `covered` (with the tests that
+/// executed it) or `uncovered`; a changed file no test reaches at all is called
+/// out. On a pre-3.12 interpreter (`sys.monitoring` absent) we report the
+/// changed lines with unknown coverage and say so, rather than implying they're
+/// all untested.
+fn query_change_cov(
+    cli: &Cli,
+    base: &str,
+    pytest_args: &[String],
+    python: Option<&str>,
+) -> anyhow::Result<Envelope> {
+    let changed = change_cov::changed_lines(&cli.root, base)?;
+
+    let mut opts = TraceOptions::new(cli.root.clone());
+    opts.python = python.map(str::to_string).unwrap_or_else(default_python);
+    opts.pytest_args = pytest_args.to_vec();
+    let cov = observed_coverage(&opts)?;
+
+    let total_changed: usize = changed.values().map(|s| s.len()).sum();
+    let query = json!({
+        "kind": "change-coverage",
+        "base": base,
+        "python": cov.python,
+        "pytest_exit": cov.pytest_exit,
+    });
+
+    // Pre-3.12: no line coverage. Report what changed, flag the gap, don't lie.
+    if !cov.monitoring_available {
+        let results: Vec<serde_json::Value> = changed
+            .iter()
+            .flat_map(|(file, lines)| {
+                lines.iter().map(move |ln| {
+                    json!({
+                        "loc": format!("{file}:{ln}"),
+                        "status": "unknown",
+                        "label": format!("unknown {file}:{ln} (line coverage needs Python 3.12+)"),
+                    })
+                })
+            })
+            .collect();
+        return Ok(Envelope::new(query, results)
+            .with_summary(format!(
+                "{total_changed} changed line(s); coverage unavailable on Python {}",
+                cov.python
+            ))
+            .with_warnings(vec![format!(
+                "per-line coverage needs the `sys.monitoring` API (Python 3.12+); \
+                 ran under {} — changed lines reported with unknown coverage",
+                cov.python
+            )]));
+    }
+
+    let mut results: Vec<serde_json::Value> = Vec::new();
+    let (mut covered, mut uncovered) = (0usize, 0usize);
+    let mut files_with_no_cover: Vec<String> = Vec::new();
+
+    for (file, lines) in &changed {
+        let mut any_covered = false;
+        for &ln in lines {
+            if cov.is_covered(file, ln) {
+                any_covered = true;
+                covered += 1;
+                let mut tests = cov.covering_tests(file, ln);
+                tests.sort();
+                results.push(json!({
+                    "loc": format!("{file}:{ln}"),
+                    "status": "covered",
+                    "tests": tests,
+                    "label": format!("covered {file}:{ln}  ({} test{})",
+                        tests.len(), if tests.len() == 1 { "" } else { "s" }),
+                }));
+            } else {
+                uncovered += 1;
+                results.push(json!({
+                    "loc": format!("{file}:{ln}"),
+                    "status": "uncovered",
+                    "label": format!("uncovered {file}:{ln}"),
+                }));
+            }
+        }
+        if !any_covered && !lines.is_empty() {
+            files_with_no_cover.push(file.clone());
+        }
+    }
+
+    // uncovered first (the actionable rows), then by location.
+    results.sort_by(|a, b| {
+        let rank = |s: &str| if s == "uncovered" { 0 } else { 1 };
+        rank(a["status"].as_str().unwrap_or(""))
+            .cmp(&rank(b["status"].as_str().unwrap_or("")))
+            .then(a["loc"].as_str().cmp(&b["loc"].as_str()))
+    });
+
+    let summary = format!(
+        "change-coverage vs {base}: {covered}/{total_changed} changed lines covered, \
+         {uncovered} uncovered across {} file(s)",
+        changed.len()
+    );
+    let mut warnings = Vec::new();
+    if !files_with_no_cover.is_empty() {
+        warnings.push(format!(
+            "{} changed file(s) have no covered changed line: {}",
+            files_with_no_cover.len(),
+            files_with_no_cover.join(", ")
+        ));
+    }
+    warnings.push(
+        "coverage is per static line execution; dynamic dispatch is followed (it's \
+         the runtime), but a line not run by *this* suite is 'uncovered', not 'dead'."
+            .to_string(),
+    );
+
+    Ok(Envelope::new(query, results)
+        .with_summary(summary)
+        .with_warnings(warnings))
+}
+
+/// observed shapes (#9.5): the concrete return types each callable produced at
+/// runtime. Runtime evidence next to ty's static inference — a callable that
+/// only ever returned `int` while annotated `-> Any`, or no annotation at all,
+/// is a candidate to tighten. Needs 3.12+; degrades with a warning otherwise.
+fn query_shapes(
+    cli: &Cli,
+    pytest_args: &[String],
+    python: Option<&str>,
+) -> anyhow::Result<Envelope> {
+    let mut opts = TraceOptions::new(cli.root.clone());
+    opts.python = python.map(str::to_string).unwrap_or_else(default_python);
+    opts.pytest_args = pytest_args.to_vec();
+    let shapes = observed_shapes(&opts)?;
+
+    let query = json!({
+        "kind": "shapes",
+        "python": shapes.python,
+        "pytest_exit": shapes.pytest_exit,
+    });
+
+    if !shapes.monitoring_available {
+        return Ok(Envelope::new(query, Vec::new())
+            .with_summary(format!(
+                "observed shapes need Python 3.12+; ran under {}",
+                shapes.python
+            ))
+            .with_warnings(vec![format!(
+                "return-type observation needs the `sys.monitoring` API (Python \
+                 3.12+); ran under {} — no shapes collected",
+                shapes.python
+            )]));
+    }
+
+    let results: Vec<serde_json::Value> = shapes
+        .returns
+        .iter()
+        .map(|(fqn, types)| {
+            json!({
+                "owner": fqn,
+                "returns": types,
+                "label": format!("{fqn} -> {}", types.join(" | ")),
+            })
+        })
+        .collect();
+
+    let summary = format!(
+        "observed return shapes for {} callable(s)",
+        results.len()
+    );
+    Ok(Envelope::new(query, results).with_summary(summary).with_warnings(vec![
+        "runtime evidence from this suite only — a type never seen here may still \
+         occur; absence is not proof. Static inference (ty) remains the oracle."
+            .to_string(),
+    ]))
 }
 
 /// The owner FQN of a def (`module + container + name`) — the call-graph node id.

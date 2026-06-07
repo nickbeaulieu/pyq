@@ -18,3 +18,6 @@ serde_json.workspace = true
 ignore.workspace = true
 anyhow.workspace = true
 toml = "1"
+
+[dev-dependencies]
+tempfile.workspace = true

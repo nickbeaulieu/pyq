@@ -1288,6 +1288,7 @@ dependencies = [
  "pyq-output",
  "pyq-resolve",
  "serde_json",
+ "tempfile",
  "toml",
 ]
 

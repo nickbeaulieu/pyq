@@ -34,9 +34,31 @@ interpreter) embeds this package, materializes it to a temp dir, and runs the
 suite under the pytest plugin:
 
 ```bash
-pyq --root <project> trace [pytest args...]      # human view
-pyq --json --root <project> trace -q             # machine envelope on stdout
+pyq --root <project> trace [pytest args...]            # observed effects (Phase 1/2)
+pyq --json --root <project> trace -q                   # machine envelope on stdout
+pyq --root <project> effect-diff [pytest args]         # static vs runtime (Phase 3)
+pyq --root <project> change-coverage [--base REF] ...  # changed lines × tests (Phase 4)
+pyq --root <project> shapes [pytest args]              # observed return types (Phase 5)
 ```
+
+`change-coverage` (#9.4) joins `git diff --unified=0 <base>` against per-test
+line coverage (`sys.monitoring` LINE events, 3.12+): each changed line is
+`covered` (naming the pytest nodeids that ran it) or `uncovered`, and changed
+files no test reaches are flagged. Pre-3.12 degrades to `unknown` (the audit
+effect ledger still works). `shapes` (#9.5) records the concrete return type
+each callable produced (`PY_RETURN`, 3.12+), unioned per FQN — runtime evidence
+alongside ty's static inference, the first slice of the protocol surface (#21).
+
+`effect-diff` (#9.3) joins the project-wide static effect surface against this
+ledger on `(owner FQN, category)`:
+
+- **confirmed** — static predicted it, runtime did it.
+- **dynamic-only** — runtime did it, the syntactic static surface couldn't match
+  it (e.g. an effect behind a `getattr`-built callee). The reason to run this.
+- **static-only** — static predicted it, runtime didn't: over-approximation or a
+  path the suite never exercised (change-coverage, #9.4, separates the two).
+- **unverifiable** — a category the audit hook can't see (env-read/random/clock/
+  global); reported, never treated as over-approximation.
 
 `pyq_trace/pytest_plugin.py` installs the ledger in `pytest_configure` (before
 collection, so target import-time effects are captured) and writes the envelope

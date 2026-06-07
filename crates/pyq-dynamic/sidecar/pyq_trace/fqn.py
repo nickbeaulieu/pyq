@@ -79,6 +79,21 @@ def frame_fqn(co_filename: str, co_qualname: str, root: str) -> Optional[str]:
     return f"{module}.{qual}" if module else qual
 
 
+def relpath_under_root(co_filename: str, root: str) -> Optional[str]:
+    """The project-relative path of a code object's file (`pkg/models.py`), or
+    None if it lives outside `root`. Symlink-robust, like `frame_fqn`. Used by
+    line coverage, which keys on (file, line) rather than FQN."""
+    if not _looks_like_source(co_filename):
+        return None
+    try:
+        rel = os.path.relpath(_real(co_filename), _real(root))
+    except ValueError:
+        return None
+    if rel.startswith(".."):
+        return None
+    return rel.replace("\\", "/")
+
+
 def class_node_of(fqn: str) -> str:
     """Fold an observed constructor FQN onto its call-graph node.
 

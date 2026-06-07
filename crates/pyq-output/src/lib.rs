@@ -102,6 +102,35 @@ fn render_result_line(r: &Value) -> String {
     match (loc, label) {
         (Some(loc), Some(label)) => format!("{loc}  {label}"),
         (Some(loc), None) => loc.to_string(),
+        // A result with no source location (e.g. an effect observed only at
+        // runtime) still renders its human label rather than dumping JSON.
+        (None, Some(label)) => label.to_string(),
         _ => serde_json::to_string(r).unwrap_or_default(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn renders_loc_and_label() {
+        let r = json!({"loc": "a.py:1:1", "label": "fs open"});
+        assert_eq!(render_result_line(&r), "a.py:1:1  fs open");
+    }
+
+    #[test]
+    fn renders_label_without_loc() {
+        // A runtime-only observation has no source location but still reads as
+        // its label, not a JSON dump.
+        let r = json!({"label": "dynamic-only subprocess  pkg.ops.f", "owner": "pkg.ops.f"});
+        assert_eq!(render_result_line(&r), "dynamic-only subprocess  pkg.ops.f");
+    }
+
+    #[test]
+    fn falls_back_to_json_without_label() {
+        let r = json!({"owner": "pkg.ops.f"});
+        assert_eq!(render_result_line(&r), r#"{"owner":"pkg.ops.f"}"#);
     }
 }

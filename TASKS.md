@@ -79,14 +79,31 @@ completed work is logged at the bottom. `→ blocked by #N` marks a dependency.
     root added to `PYTHONPATH` (prepend-mode flat-layout imports); pytest exit
     threaded into `query.pytest_exit` (non-zero ≠ error — failing tests still
     run code).
-  - **#9.3 · Phase 3 — effect-diff.** Join static `effects` closure vs the
-    observed ledger → confirmed / static-only / dynamic-only. Rides `--baseline`
-    (#4) when landed.
-  - **#9.4 · Phase 4 — change-coverage (`sys.monitoring`, 3.12+).** Per-line/
-    branch execution under the suite, joined to a diff. The oracle behind the
-    `tests` caveat; trims `deadcode` over-approximation. Gate + degrade.
-  - **#9.5 · Phase 5 — observed shapes + import hooks.** Feeds protocol surface
-    (#21) and real import-time effects / import graph. Long tail.
+  - **#9.3 · Phase 3 — effect-diff.** *Done.* `pyq effect-diff [pytest args]`
+    joins the project-wide static effect surface against the observed ledger on
+    `(owner FQN, category)` → `confirmed` / `dynamic-only` (runtime hit an
+    effect the syntactic surface can't match, e.g. a `getattr`-built callee —
+    the payoff) / `static-only` (predicted, unexercised or over-approx) /
+    `unverifiable` (category the audit hook can't see: env-read/random/clock/
+    global). Dynamic `import` excluded (not a static category). Carries the
+    ledger's caveats through. Rides `--baseline` (#4) when landed.
+  - **#9.4 · Phase 4 — change-coverage (`sys.monitoring`, 3.12+).** *Done.*
+    `pyq change-coverage [--base <ref>] [pytest args]`: parses `git diff
+    --unified=0` for changed new-file lines (relativized to the scan root),
+    runs the suite under a per-test LINE-event coverage tracker, joins → each
+    changed line `covered` (+ the pytest nodeids that ran it) / `uncovered`,
+    plus changed files no test reaches. The oracle behind the `tests` caveat.
+    Pre-3.12 degrades to `unknown` with a warning (audit-hook effects still
+    work). Coverage tracker uses tool id 2, never `DISABLE`s (needs every line),
+    caches relpath on the hot path.
+  - **#9.5 · Phase 5 — observed shapes (+ import hooks deferred).** *Done
+    (shapes slice).* `pyq shapes [pytest args]`: records the concrete return
+    type each callable produced at runtime via `PY_RETURN` (3.12+, tool id 4),
+    unioned per FQN (`add -> float | int`) — runtime evidence next to ty's
+    static inference, the first slice of the protocol surface (#21).
+    Module-scope `<module>` returns filtered. Arg-type capture and the
+    import-hook import-graph (audit `import` events already land in the effect
+    ledger) deliberately left for later — return types are the high-signal half.
 - **#21 · Spike: convention extraction + protocol/concurrency surfaces.**
   Convention extraction (naming, import style, error-handling/logging idioms —
   scope tightly); protocol/structural conformance (what satisfies `Protocol P`);
