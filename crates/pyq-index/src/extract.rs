@@ -45,6 +45,7 @@ pub fn extract(path: &str, source: &str) -> FileIndex {
         mocks: Vec::new(),
         dunder_all: Vec::new(),
         dotted_strings: Vec::new(),
+        has_main_guard: false,
     };
     for stmt in &parsed.syntax().body {
         collector.visit_stmt(stmt);
@@ -59,6 +60,7 @@ pub fn extract(path: &str, source: &str) -> FileIndex {
         mocks: collector.mocks,
         dunder_all: collector.dunder_all,
         dotted_strings: collector.dotted_strings,
+        has_main_guard: collector.has_main_guard,
     }
 }
 
@@ -81,6 +83,8 @@ struct Collector<'src> {
     mocks: Vec<MockTarget>,
     dunder_all: Vec<String>,
     dotted_strings: Vec<String>,
+    /// Set when a top-level `if __name__ == "__main__":` guard is seen.
+    has_main_guard: bool,
 }
 
 impl<'src> Collector<'src> {
@@ -168,9 +172,10 @@ impl<'src> Collector<'src> {
                     return;
                 };
                 let first = call.arguments.args.first();
-                // env reads: getenv(...), environ.get(...), and
+                // env/config reads: getenv(...), the wrapper conventions
+                // (get_env/get_var/config/env.*), environ.get(...), and
                 // environ.setdefault(...) (a read-with-fallback like .get).
-                if is_getenv(&callee)
+                if is_env_accessor(&callee)
                     || callee.ends_with("environ.get")
                     || callee.ends_with("environ.setdefault")
                 {
@@ -398,6 +403,12 @@ impl<'src, 'ast> Visitor<'ast> for Collector<'src> {
                 let names = g.names.iter().map(|n| n.as_str()).collect::<Vec<_>>().join(", ");
                 self.push_effect(EffectKind::GlobalState, names, g.start());
             }
+            // A module-level `if __name__ == "__main__":` guard marks the file as
+            // a runnable script. The body is ordinary runtime code, so this arm
+            // only records the flag and falls through to walk it normally.
+            Stmt::If(if_stmt) if self.depth == 0 && is_main_guard(&if_stmt.test) => {
+                self.has_main_guard = true;
+            }
             _ => {}
         }
         walk_stmt(self, stmt);
@@ -531,9 +542,75 @@ fn is_type_checking(test: &Expr) -> bool {
 }
 
 /// A `getenv` callee, following the `import os as o` / `from os import getenv`
-/// aliases: bare `getenv` or any `*.getenv`.
+/// aliases: bare `getenv` or any `*.getenv`. Used by the env *effect* scan; the
+/// input scan uses the broader [`is_env_accessor`].
 fn is_getenv(callee: &str) -> bool {
     callee == "getenv" || callee.ends_with(".getenv")
+}
+
+/// Whether an `if` test is the `__name__ == "__main__"` script guard (either
+/// order). A best-effort syntactic match — the canonical form covers the cases
+/// that matter; exotic spellings just don't flag the file as a script.
+fn is_main_guard(test: &Expr) -> bool {
+    let Expr::Compare(cmp) = test else {
+        return false;
+    };
+    if !matches!(cmp.ops.first(), Some(CmpOp::Eq)) {
+        return false;
+    }
+    let is_dunder_name = |e: &Expr| matches!(dotted_name(e).as_deref(), Some("__name__"));
+    let is_main_str =
+        |e: &Expr| matches!(e, Expr::StringLiteral(s) if s.value.to_str() == "__main__");
+    let rhs = cmp.comparators.first();
+    (is_dunder_name(&cmp.left) && rhs.is_some_and(is_main_str))
+        || (is_main_str(&cmp.left) && rhs.is_some_and(is_dunder_name))
+}
+
+/// Whether a call's dotted callee reads an environment variable / config value,
+/// keyed by a literal first argument. Matched on the callee's **last segment**
+/// so it follows the conventions real codebases wrap config access in, not just
+/// the bare stdlib idiom:
+///   - `getenv` — `os.getenv`, `from os import getenv`
+///   - `get_env` — the common `env_utils.get_env(...)` helper
+///   - `get_var` / `getvar` — provider-style wrappers (`var_provider.get_var(...)`)
+///   - `config` — python-decouple's `config("NAME")`
+///   - `env` — django-environ's `env("NAME")`
+///   - `env.<cast>` — django-environ's typed reads (`env.str`, `env.bool`, …),
+///     handled by [`is_env_cast`]
+///
+/// Over-approximate by design (the verb's contract): a generic `obj.config(...)`
+/// matches too, but the caller still requires a string-literal first argument, so
+/// argless calls like `get_config()` never do.
+fn is_env_accessor(callee: &str) -> bool {
+    let last = callee.rsplit('.').next().unwrap_or(callee);
+    matches!(last, "getenv" | "get_env" | "get_var" | "getvar" | "config" | "env")
+        || is_env_cast(callee)
+}
+
+/// django-environ typed reads: the receiver segment is `env` and the method is a
+/// known cast — `env.str("X")`, `self.env.bool("Y")`, `settings.env.int("Z")`.
+fn is_env_cast(callee: &str) -> bool {
+    let mut segs = callee.rsplit('.');
+    let cast = segs.next().unwrap_or("");
+    let receiver = segs.next();
+    receiver == Some("env")
+        && matches!(
+            cast,
+            "str" | "bool"
+                | "int"
+                | "float"
+                | "list"
+                | "tuple"
+                | "dict"
+                | "json"
+                | "url"
+                | "db"
+                | "cache"
+                | "email"
+                | "search"
+                | "bytes"
+                | "path"
+        )
 }
 
 /// Whether a dotted name refers to `environ`, following `from os import environ`

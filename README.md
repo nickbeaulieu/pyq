@@ -12,8 +12,39 @@ structurally leave open.
 ## Install
 
 ```bash
-cargo build --release
-# binary at target/release/pyq
+curl -fsSL https://raw.githubusercontent.com/nickbeaulieu/pyq/main/install.sh | sh
+```
+
+This downloads the right prebuilt binary for your platform (macOS and Linux,
+x86_64 and arm64), verifies its checksum, installs it to `~/.local/bin`, and
+records the channel under `~/.pyq/`. Override either:
+
+```bash
+PYQ_CHANNEL=canary PYQ_INSTALL_DIR=~/bin \
+  curl -fsSL https://raw.githubusercontent.com/nickbeaulieu/pyq/main/install.sh | sh
+# or, if you've cloned the repo: ./install.sh --canary --dir=~/bin
+```
+
+### Channels & upgrading
+
+pyq ships on two channels. **stable** tracks tagged releases; **canary** rolls
+forward with every push to `main`. Switch between them and update in place
+without re-running the installer:
+
+```bash
+pyq channel            # show the current channel and this build's identity
+pyq channel canary     # follow canary from here on (records intent only)
+pyq upgrade            # pull the latest build on the current channel, in place
+pyq upgrade --check    # report what an upgrade would do, without installing
+```
+
+`upgrade` verifies the download's sha256 before replacing the running binary,
+and `--version` pins the exact build (`channel`, date, commit).
+
+### Build from source
+
+```bash
+cargo build --release      # binary at target/release/pyq
 ```
 
 Requires the Rust toolchain pinned in `rust-toolchain.toml`. The Python
@@ -37,7 +68,8 @@ pyq mock-targets              # resolve every mock.patch("…") — flag drifted
 pyq hierarchy Animal          # supertypes, subclasses, and the override map
 pyq deadcode                  # callables reachable from no entrypoint (candidates)
 pyq canonical                 # most-used helpers, untested public surface, test inventory
-pyq inputs                    # the external input surface of the project
+pyq inputs                    # the app's external input surface (env/config/settings)
+pyq inputs backfill_calls     # one script's own inputs (CLI args, env it reads)
 pyq imports pkg.models --reverse   # who imports pkg.models (blast radius)
 pyq imports --cycles          # import cycles among project modules
 pyq index                     # prewarm the cache so later verbs are dirt cheap
@@ -52,14 +84,14 @@ pyq index clean               # wipe this repo's cached index
 | `callers <symbol>` | Every call site of a symbol. |
 | `defs <symbol>` | Every definition (function/class/variable/import binding), each tagged `role` (`definition`/`binding`); a `binding` points at its canonical def via `resolves_to`. |
 | `graph <symbol>` | The transitive call graph: everything the symbol calls (forward closure), or — with `--reverse` — everything that calls it. Nodes are stable fully-qualified IDs (`pkg.models.User.__init__`) re-queryable after edits; `--depth N` caps the hops. |
-| `effects <symbol>` | The transitive effect surface: which side effects (`fs`, `network`, `subprocess`, `env`, `db`, `random`, `clock`, `global`) the symbol and everything it transitively calls statically perform, plus import-time effects of the modules involved. "Is this pure / safe in a test." |
-| `tests <symbol>` | A call-reachability lens (**not** a coverage metric): which collected tests are structurally wired to a symbol via the reverse call graph, each with the call path (`via`) and `depth`. A test is a `test_*` function in `test_*.py`/`*_test.py`, or a `test_*` method on a collected class — `Test*`-named **or** `*TestCase`-subclassing (unittest/Django/DRF). For "which tests to run before this edit," not "what's my coverage." Blind to dynamic dispatch (attribute calls, framework routing, signals) — a 0 is "no *static* reaching test," not "untested." See [Tests](#tests). |
-| `describe <symbol>` | One compact context pack for a symbol — its signature, decorators, docstring line, and def line-span, plus its **immediate** callers and callees (depth-1 call graph) and the collected tests that reach it. The token-frugal "tell me about X" in a single envelope, instead of separate `defs`/`callers`/`graph`/`tests` calls. Rows carry a `role` (`definition`/`caller`/`callee`/`test`). Same dynamic-dispatch blind spot as the call graph. See [Describe](#describe). |
+| `effects [symbol]` | The transitive effect surface (`fs`, `network`, `subprocess`, `env`, `db`, `random`, `clock`, `global`) of a symbol — or the whole project — **fused with a runtime ledger**: every row is labelled `confirmed` / `predicted` / `observed` / `unverifiable`. Runs the test suite on a cache miss to verify (`PYQ_NO_SUITE` skips). "Is this pure / what does it really touch." See [Effects](#effects). |
+| `tests [symbol]` | With a symbol: a call-reachability lens (**not** a coverage metric) — the collected tests structurally wired to it via the reverse call graph, each with `via` + `depth`. With `--base <ref>` (no symbol): the **runtime** oracle — which changed lines the suite actually covers, and by which tests (the absorbed `change-coverage`; runs your tests, Python 3.12+). A test is a `test_*` function in `test_*.py`/`*_test.py`, or a `test_*` method on a collected class (`Test*`-named or `*TestCase`-subclassing). See [Tests](#tests). |
+| `describe <symbol>` | One compact context pack for a symbol — its signature (with the **runtime-observed return type** beside it, the absorbed `shapes`), decorators, docstring line, and def line-span, plus its **immediate** callers and callees and the collected tests that reach it. The token-frugal "tell me about X" in a single envelope. Rows carry a `role` (`definition`/`caller`/`callee`/`test`). Runs the suite on a cache miss for the observed type (`PYQ_NO_SUITE` skips). See [Describe](#describe). |
 | `mock-targets` | Resolve every `mock.patch("a.b.c")` target against the project and flag *drifted* paths — a patch whose looked-up name no longer exists silently no-ops, so the test passes while exercising the real code. |
 | `hierarchy <class>` | The class's supertypes (bases, external marked), transitive subclasses, and the override map — which base methods it overrides and which subclasses override its methods. Resolved across files by ty, subclasses computed by inverting the supertype graph. The OO-refactor footgun, as data. |
 | `deadcode` | Functions/classes reachable from **no** entrypoint — candidate dead code, via forward reachability over the call graph. Roots are everything the runtime/framework enters without a project call: tests, dunders, decorated hooks, `__all__`, module-scope calls, entrypoint files (`manage.py`/`wsgi.py`/`urls.py`/`migrations/`/`management/commands/`/…), framework base classes (`BaseCommand`/`*View`/`*Serializer`/…), and `[project.scripts]`. Over-approximate liveness (so it under-reports death); residual dynamic dispatch is flagged. See [Dead code](#dead-code). |
 | `canonical` | The repo's canonical surface in one pass: the **most-used** helpers (internal callables ranked by how many distinct non-test callers reach them — what to reach for, not reinvent), the **untested-public** surface (top-level public functions/classes no collected test statically reaches), and the **test** inventory (every collected test with its markers). Rows carry a `section`. The project-level "tell me about this codebase." Same dynamic-dispatch blind spot as the call graph (it cuts both ways). See [Canonical](#canonical). |
-| `inputs` | What the code needs to run: env vars, literal files opened, CLI args (argparse/click), pydantic settings fields. |
+| `inputs [script]` | What the code needs to run: env vars / config reads, literal files opened, CLI args (argparse/click), pydantic settings fields. With no argument, the **app** surface — config the running service reads (settings, services, models) — with per-script inputs (Django management commands, `scripts/`, `__main__`-guarded files) held back behind a one-line hint. Pass a script's command name or path (`inputs backfill_calls`) for that script's own inputs. Env detection follows the wrapper conventions real codebases use, not just `os.getenv`/`os.environ`: `get_env`/`get_var`-style helpers, [django-environ](https://github.com/joke2k/django-environ) (`env("X")`, `env.str/bool/int/…`), and [python-decouple](https://github.com/HBNetwork/python-decouple) (`config("X")`). See [Inputs](#inputs). |
 | `imports [module]` | The import graph. No arg: every edge. With a module: what it imports; `--reverse`: who imports it (blast radius); `--cycles`: import cycles. Accepts a module name or a file path. |
 | `index` | Build the analysis cache for this repo up front (parse + call graph) so later verbs replay from `~/.pyq` instead of reconstructing ty — the first run pays, the rest are dirt cheap. Idempotent. `index clean` removes this repo's cached index. |
 
@@ -124,35 +156,67 @@ pkg/models.py:5:5  function pkg.models.make_user (depth 1, via app.main)
 ## Effects
 
 `effects` is the first projection of the call graph: it walks the forward
-closure of a symbol and, for every reachable callable, scans its body for
-side-effecting calls — `open`/`shutil` (`fs`), `requests`/`httpx`/`socket`
-(`network`), `subprocess`/`os.system` (`subprocess`), `os.getenv`/`os.environ`
-(`env`), `*.execute`/`sqlite3.connect` (`db`), `random`/`secrets`/`uuid`
-(`random`), `time`/`datetime.now` (`clock`), and `global` declarations
-(`global`). Each hit is attributed to the FQN that actually performs it, so a
-"pure-looking" entry point reveals the network call three hops down.
+closure of a symbol (or the whole project, with no symbol) and, for every
+reachable callable, scans its body for side-effecting calls — `open`/`shutil`
+(`fs`), `requests`/`httpx`/`socket` (`network`), `subprocess`/`os.system`
+(`subprocess`), `os.getenv`/`os.environ` (`env`), `*.execute`/`sqlite3.connect`
+(`db`), `random`/`secrets`/`uuid` (`random`), `time`/`datetime.now` (`clock`),
+and `global` declarations (`global`). Each hit is attributed to the FQN that
+actually performs it, so a "pure-looking" entry point reveals the network call
+three hops down.
+
+Static detection alone is over-approximate (a hit means "appears to") and blind
+to dynamic dispatch (it misses effects behind `getattr`/attribute calls). So
+`effects` **fuses the static surface with a runtime ledger** — it runs the test
+suite (once, then cached under `~/.pyq`; `pyq index` pre-warms it, `PYQ_NO_SUITE`
+skips it) and labels every row by **confidence**:
+
+- **`confirmed`** — static predicted it *and* the suite performed it.
+- **`predicted`** — static says so, the run didn't exercise it (over-approximation
+  *or* simply uncovered).
+- **`observed`** — the run performed it but static missed the edge (dynamic
+  dispatch) — the effect the static surface structurally can't see.
+- **`unverifiable`** — a category the audit hook can't watch (`env`-read,
+  `random`, `clock`, `global`).
 
 ```console
-$ pyq effects run --root path/to/project
-effects of `run`: db, network, random — 4 sites
-io_ops.py:6:12   network requests.get     in io_ops.fetch
-io_ops.py:9:12   db      sqlite3.connect   in io_ops.save
-io_ops.py:10:5   db      conn.execute      in io_ops.save
-io_ops.py:14:12  random  random.random     in io_ops.jitter
-! static over-approximation: effects behind dynamic/attribute-dispatched calls are not followed
+$ pyq effects --root path/to/project
+effects: 1 confirmed, 1 observed, 1 predicted, 1 unverifiable
+confirmed (1)
+  pkg/ops.py:3:12  fs  open  pkg.ops.confirmed_fs
+observed (1)
+  subprocess    pkg.ops.dynamic_only_subprocess   (static missed this edge)
+predicted (1)
+  pkg/ops.py:8:9  network  socket.socket  pkg.ops.static_only_net
+unverifiable (1)
+  pkg/ops.py:10:12  env  os.getenv  pkg.ops.reads_env
 ```
 
-Module- and class-body effects are flagged `import-time` (they run on import,
-not on call) and reported for every module that contributes a reachable
-callable. Detection is syntactic and over-approximate by design: a hit means the
-code *appears* to perform the effect, and — as with `callers` — effects behind
-calls that resolve through attribute/dynamic dispatch aren't followed, so "pure"
-means "no effect found," not a proof of purity.
+This is the absorbed `effect-diff`: there's no separate verb — the join *is* what
+`effects` returns. When the suite can't run (no interpreter/pytest, or
+`PYQ_NO_SUITE`), every row degrades to `predicted`/`unverifiable` with a note,
+never an error. Module- and class-body effects are still flagged `import-time`.
+Only `confirmed` is proof the effect runs; `predicted` is a candidate to verify.
 
 ## Tests
 
-`tests` is a reverse-call-graph projection: it walks the closure of callers of a
-symbol and keeps the ones a test runner would collect — `test_*` functions in
+`tests` has two modes. With a **symbol** it's the static reaching-tests map
+(below). With **`--base <ref>`** and no symbol it's the runtime oracle — the
+absorbed `change-coverage`: it runs the suite under per-test line coverage and
+reports which lines changed since `<ref>` were actually executed, and by which
+tests (Python 3.12+ for real line coverage; degrades on older). Use it to answer
+"did my edit land on a covered line?"
+
+```console
+$ pyq tests --base main --root path/to/project
+change-coverage vs main: 3/4 changed lines covered, 1 uncovered across 2 file(s)
+pkg/core.py:42  covered    tests.test_core.test_parse
+pkg/core.py:58  uncovered
+```
+
+The symbol form is a reverse-call-graph projection: it walks the closure of
+callers of a symbol and keeps the ones a test runner would collect — `test_*`
+functions in
 `test_*.py`/`*_test.py`, and `test_*` methods on a collected class (`Test*`-named
 **or** subclassing a `*TestCase`: unittest, Django, DRF — collected by
 inheritance). Each reaching test carries the `via` edge and `depth`, so you see
@@ -205,7 +269,11 @@ a single envelope:
 
 - **Definition** — signature (parameters + return annotation; for a class, its
   bases), decorators as written, the first docstring line, and the def's line
-  span (`[first, last]`), read straight off the syntactic index.
+  span (`[first, last]`), read straight off the syntactic index — plus the
+  **runtime-observed return type** beside the declared one (`observed int | str`,
+  the absorbed `shapes`) when the suite has run. Runs the suite on a cache miss
+  to collect it (Python 3.12+; `PYQ_NO_SUITE` skips), so on a cold repo the
+  observed type may be absent until the first run.
 - **Immediate callers / callees** — the depth-1 call graph in both directions
   (what it calls in one hop, who calls it in one hop).
 - **Reaching tests** — the collected tests that reach it transitively, each with
@@ -405,11 +473,63 @@ dispatch is *undercounted* in `most-used`. Subtracting the framework entrypoints
 removes the bulk of the false `untested-public` (the serializers/configs/tasks a
 test never calls directly), but a symbol reached only through *other* dynamic
 dispatch can still be flagged though it runs at runtime. So "untested" means "no
-*static* reaching test," **not** "uncovered" — `change-coverage` is the runtime
+*static* reaching test," **not** "uncovered" — `tests --base` is the runtime
 oracle for coverage. Test
 collection follows the same pytest + unittest/`TestCase`-inheritance rules as the
 `tests` verb (custom `python_files`/`python_classes` config isn't read); markers
 come from decorators, so a module-level `pytestmark` isn't captured.
+
+## Inputs
+
+`inputs` answers "what does this need to run" as relational facts: the env vars
+and config keys it reads, literal files it opens, CLI args it declares, and
+pydantic `BaseSettings` fields. Like `imports`, it's a **pure syntactic,
+over-approximate** scan — a computed key/path buckets to `<dynamic>` rather than
+guess, and a match means "appears to read this," not a proof.
+
+**App vs. script.** A bare `pyq inputs` reports the **app** surface — the inputs
+of the long-running service: settings modules, services, models, views. The
+per-script inputs that would otherwise drown it (a Django management command's
+`--dry-run`, a one-off in `scripts/`) are held back behind a one-line hint, and
+shown only when you name that script: `pyq inputs backfill_calls` (by command
+name) or `pyq inputs path/to/cmd.py` (by path). A file is treated as a *script*
+when it's a Django management command, lives in `scripts/`/`bin/`, is
+`manage.py`, or carries an `if __name__ == "__main__":` guard. Tests are excluded
+from the default view.
+
+**Env detection follows wrappers.** Real codebases rarely call `os.getenv`
+directly — they funnel config through a helper (`var_provider.get_var("DB_URL")`)
+or a library. `inputs` recognizes the conventions by call shape (a config-accessor
+name with a string-literal first argument), so the wrapped surface is visible,
+not just the stdlib idiom:
+
+- `os.getenv` / `os.environ[...]` / `.get` / `"X" in os.environ` (stdlib)
+- `get_env` / `get_var` / `getvar` — provider-style and `env_utils.get_env` helpers
+- [django-environ](https://github.com/joke2k/django-environ): `env("X")`, `env.str/bool/int/float/list/json/db/url/...("X")`
+- [python-decouple](https://github.com/HBNetwork/python-decouple): `config("X")`
+
+The string-literal-first-argument guard keeps argless lookalikes
+(`get_config()`) out, and the match is over-approximate by design (a generic
+`obj.config("x")` will register) — in keeping with the verb's contract.
+
+```console
+$ pyq inputs --root path/to/django-project
+118 app inputs
+
+env (115)
+  salessync/settings.py:38:10   DB_NAME
+  salessync/settings.py:40:10   DB_PASSWORD
+  salessync/settings.py:73:10   SECRET_KEY
+  salessync/settings.py:91:18   STRIPE_SECRET_KEY
+  ...
+
+setting (3)
+  ...
+
+notes
+  14 scripts have their own inputs (management commands, scripts/) — query one by name:
+  pyq inputs <name> — e.g. backfill_calls, seed_ppc_data, ppc_spend_coverage, …
+```
 
 ## Output envelope
 
@@ -424,7 +544,7 @@ columns. Warnings collect under a trailing `notes` block. The full clickable
 
 ```console
 $ pyq inputs --root examples/sample
-11 inputs
+11 app inputs
 
 env (4)
   config.py:3:9   DEBUG
@@ -451,8 +571,8 @@ the human renderer uses; consumers read the typed fields and ignore the rest.
 ```json
 {
   "tool": "pyq",
-  "query": { "kind": "inputs" },
-  "summary": "11 inputs",
+  "query": { "kind": "inputs", "target": null },
+  "summary": "11 app inputs",
   "count": 11,
   "results": [
     { "loc": "config.py:3:9", "label": "env DEBUG", "group": "env", "cols": ["DEBUG"] },

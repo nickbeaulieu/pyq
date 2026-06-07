@@ -1,12 +1,12 @@
 //! Capture build-time identity so `pyq --version`, `pyq channel`, and `pyq
 //! upgrade` know exactly which build is running and how to ask for a newer one:
 //!
-//!   * `PYQ_GIT_SHA`    — short commit sha (the canary comparison key).
-//!   * `PYQ_BUILD_DATE` — UTC `YYYY-MM-DD` the binary was built.
-//!   * `PYQ_CHANNEL`    — the release channel that produced it (`stable` /
-//!                        `canary`), or `dev` for an unmarked local build.
-//!   * `PYQ_TARGET`     — the target triple, so the updater asks for the asset
-//!                        named for exactly this build (`pyq-<ver>-<target>...`).
+//! - `PYQ_GIT_SHA` — short commit sha (the canary comparison key).
+//! - `PYQ_BUILD_DATE` — UTC `YYYY-MM-DD` the binary was built.
+//! - `PYQ_CHANNEL` — the channel that produced it (`stable` / `canary`), or
+//!   `dev` for an unmarked local build.
+//! - `PYQ_TARGET` — the target triple, so the updater asks for the asset named
+//!   for exactly this build (`pyq-<ver>-<target>...`).
 //!
 //! The release workflow sets `PYQ_CHANNEL`/`PYQ_BUILD_DATE` in the environment;
 //! everything falls back to a sensible local-build default so the env vars are

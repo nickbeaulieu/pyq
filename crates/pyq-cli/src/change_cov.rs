@@ -93,7 +93,7 @@ fn relativize(plus_path: &str, toplevel: &str, root: &str) -> Option<String> {
 /// deletion hunk is `+c,0` -> count 0, contributing no changed lines.
 fn hunk_new_range(header: &str) -> Option<(u32, u32)> {
     let plus = header.split('+').nth(1)?;
-    let spec = plus.split(|c| c == ' ' || c == '@').next()?;
+    let spec = plus.split([' ', '@']).next()?;
     let mut parts = spec.split(',');
     let start: u32 = parts.next()?.trim().parse().ok()?;
     let count: u32 = match parts.next() {

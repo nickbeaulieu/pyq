@@ -1,0 +1,138 @@
+name: release
+
+# Two channels, one workflow:
+#   * a `v*` tag  -> a normal, immutable **stable** release for that version.
+#   * a push to `main` -> the rolling **canary** prerelease, whose assets are
+#     replaced in place so `canary` always points at the tip of main.
+# Both publish the same asset set: `pyq-<slug>-<target>.tar.gz` plus a
+# `.sha256` sidecar, where <slug> is the version (stable) or `canary`.
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+
+# A new push to main supersedes an in-flight canary build; tag builds always
+# run to completion.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref == 'refs/heads/main' }}
+
+permissions:
+  contents: write
+
+jobs:
+  # Resolve channel/version once so every downstream job agrees on the naming.
+  setup:
+    runs-on: ubuntu-latest
+    outputs:
+      channel: ${{ steps.meta.outputs.channel }}
+      slug: ${{ steps.meta.outputs.slug }}
+      tag: ${{ steps.meta.outputs.tag }}
+      build_date: ${{ steps.meta.outputs.build_date }}
+    steps:
+      - id: meta
+        run: |
+          echo "build_date=$(date -u +%Y-%m-%d)" >> "$GITHUB_OUTPUT"
+          if [ "$GITHUB_REF_TYPE" = "tag" ]; then
+            echo "channel=stable"        >> "$GITHUB_OUTPUT"
+            echo "tag=$GITHUB_REF_NAME"   >> "$GITHUB_OUTPUT"
+            echo "slug=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+          else
+            echo "channel=canary" >> "$GITHUB_OUTPUT"
+            echo "tag=canary"     >> "$GITHUB_OUTPUT"
+            echo "slug=canary"    >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    needs: setup
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-latest
+          - target: x86_64-apple-darwin
+            os: macos-13
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04-arm
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            musl: true
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Install musl toolchain
+        if: ${{ matrix.musl }}
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: Build
+        env:
+          # Baked into the binary by build.rs so `--version` / `upgrade` know
+          # exactly which channel and day produced this artifact.
+          PYQ_CHANNEL: ${{ needs.setup.outputs.channel }}
+          PYQ_BUILD_DATE: ${{ needs.setup.outputs.build_date }}
+        run: cargo build --release -p pyq-cli --target ${{ matrix.target }}
+
+      - name: Package
+        run: |
+          asset="pyq-${{ needs.setup.outputs.slug }}-${{ matrix.target }}.tar.gz"
+          tar -C "target/${{ matrix.target }}/release" -czf "$asset" pyq
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            shasum -a 256 "$asset" > "$asset.sha256"
+          else
+            sha256sum "$asset" > "$asset.sha256"
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pyq-${{ matrix.target }}
+          path: |
+            pyq-*.tar.gz
+            pyq-*.tar.gz.sha256
+          if-no-files-found: error
+
+  publish:
+    needs: [setup, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Publish stable release
+        if: ${{ needs.setup.outputs.channel == 'stable' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ needs.setup.outputs.tag }}" dist/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "${{ needs.setup.outputs.tag }}" \
+            --generate-notes
+
+      - name: Publish canary release
+        if: ${{ needs.setup.outputs.channel == 'canary' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          short="${GITHUB_SHA::7}"
+          # Replace the rolling release wholesale so stale assets never linger;
+          # the body carries the sha marker `pyq upgrade` compares against.
+          gh release delete canary --repo "$GITHUB_REPOSITORY" --cleanup-tag --yes || true
+          gh release create canary dist/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --prerelease \
+            --title "canary" \
+            --notes "$(printf 'Rolling build of the latest \`main\`.\n\npyq-sha: %s\nbuilt: %s\n' "$short" "${{ needs.setup.outputs.build_date }}")"

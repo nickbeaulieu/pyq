@@ -36,6 +36,10 @@ fn run_json_in(root: &std::path::Path, args: &[&str]) -> (Value, bool) {
         .arg("--root")
         .arg(root)
         .arg("--json")
+        // These are static-surface assertions; `effects` now fuses a suite run on
+        // a cache miss, so skip it here for a deterministic, python-free static
+        // answer. The fusion itself is covered in tests/effects_fusion.rs.
+        .env("PYQ_NO_SUITE", "1")
         .output()
         .expect("pyq should run");
     let stdout = String::from_utf8(out.stdout).expect("utf-8 stdout");
@@ -133,6 +137,61 @@ fn inputs_surfaces_env_files_args_and_settings() {
     assert!(
         !labels.contains(&"setting debug".to_string()),
         "unannotated class attr must not be a setting"
+    );
+}
+
+#[test]
+fn inputs_default_view_is_the_app_surface_not_scripts() {
+    let root = fixture("inputs_app");
+    let (env, ok) = run_json_in(&root, &["inputs"]);
+    assert!(ok);
+    let labels = labels(&env);
+
+    // The app config surface — wrapped reads (settings + ordinary app code) and
+    // a direct stdlib read — is shown.
+    assert!(labels.contains(&"env DB_PASSWORD".to_string()), "{labels:?}");
+    assert!(labels.contains(&"env SECRET_KEY".to_string()), "{labels:?}");
+    assert!(labels.contains(&"env STRIPE_SECRET_KEY".to_string()), "{labels:?}");
+    assert!(labels.contains(&"env WEBHOOK_URL".to_string()), "{labels:?}");
+    assert!(labels.contains(&"env DEBUG".to_string()), "{labels:?}");
+
+    // A management command's args/env are a *script's* inputs — held back.
+    assert!(!labels.contains(&"arg --dry-run".to_string()), "{labels:?}");
+    assert!(!labels.contains(&"env BACKFILL_TOKEN".to_string()), "{labels:?}");
+    // A test module's env reads are excluded from the app surface.
+    assert!(!labels.contains(&"env TEST_ONLY_VAR".to_string()), "{labels:?}");
+
+    // The summary reflects the app framing and a hint names the held-back script.
+    assert_eq!(env["summary"], "5 app inputs");
+    let notes = env["notes"].as_array().expect("notes present");
+    let joined = notes.iter().filter_map(Value::as_str).collect::<Vec<_>>().join("\n");
+    assert!(joined.contains("script"), "{joined}");
+    assert!(joined.contains("backfill"), "{joined}");
+}
+
+#[test]
+fn inputs_with_a_script_name_shows_that_scripts_own_inputs() {
+    let root = fixture("inputs_app");
+    let (env, ok) = run_json_in(&root, &["inputs", "backfill"]);
+    assert!(ok);
+    let labels = labels(&env);
+
+    // The command's CLI args and its own env read — now visible.
+    assert!(labels.contains(&"arg --dry-run".to_string()), "{labels:?}");
+    assert!(labels.contains(&"arg start_date".to_string()), "{labels:?}");
+    assert!(labels.contains(&"env BACKFILL_TOKEN".to_string()), "{labels:?}");
+    // …and the app surface is not mixed in.
+    assert!(!labels.contains(&"env DB_PASSWORD".to_string()), "{labels:?}");
+    assert_eq!(env["query"]["target"], "backfill");
+
+    // An unknown target resolves to nothing, with a clear summary.
+    let (miss, ok) = run_json_in(&root, &["inputs", "no_such_script"]);
+    assert!(ok);
+    assert_eq!(miss["count"], 0);
+    assert!(
+        miss["summary"].as_str().unwrap().contains("no file matches"),
+        "{}",
+        miss["summary"]
     );
 }
 

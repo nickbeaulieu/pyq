@@ -16,6 +16,7 @@
 //! definition row per resolved def so the signatures stay distinct.
 
 use crate::{plural, tests_map, walk};
+use pyq_dynamic::default_python;
 use pyq_index::{Def, DefKind, FileIndex};
 use pyq_output::Envelope;
 use pyq_resolve::{scope_fqn, Direction, GraphNode};
@@ -43,6 +44,11 @@ pub fn query(root: &str, symbol: &str) -> anyhow::Result<Envelope> {
         }
     }
 
+    // Observed return types (the absorbed `shapes`): runtime evidence next to
+    // ty's declared signature. Runs the suite on a cache miss; absent (no column)
+    // when it can't (pre-3.12, no pytest, or `PYQ_NO_SUITE`).
+    let shapes = crate::cache::ledger_shapes(root, &fingerprint, &default_python());
+
     let graph = crate::cache::call_graph(root, &files, scope, &fingerprint)?;
     // Depth-1 callees; the full reverse closure (immediate callers are its
     // depth-1 nodes, reaching tests its test nodes at any depth) — two walks
@@ -53,10 +59,12 @@ pub fn query(root: &str, symbol: &str) -> anyhow::Result<Envelope> {
 
     let mut results: Vec<Value> = Vec::new();
 
-    // The definition facet: one row per resolved root.
+    // The definition facet: one row per resolved root, with the runtime-observed
+    // return type appended when the shapes ledger has one for that FQN.
     for root_fqn in roots {
         if let Some((f, d)) = def_by_fqn.get(root_fqn) {
-            results.push(definition_row(root_fqn, f, d));
+            let observed = shapes.returns.get(root_fqn).map(|v| v.join(" | "));
+            results.push(definition_row(root_fqn, f, d, observed.as_deref()));
         }
     }
 
@@ -126,8 +134,10 @@ pub fn query(root: &str, symbol: &str) -> anyhow::Result<Envelope> {
 }
 
 /// The definition facet: signature/decorators/docstring/span for one resolved
-/// root, both as structured fields and a one-line human label.
-fn definition_row(fqn: &str, f: &FileIndex, d: &Def) -> Value {
+/// root, both as structured fields and a one-line human label. `observed_return`
+/// is the runtime-observed return type (the absorbed `shapes`), shown next to the
+/// declared signature when present.
+fn definition_row(fqn: &str, f: &FileIndex, d: &Def, observed_return: Option<&str>) -> Value {
     let loc = format!("{}:{}:{}", f.path, d.pos.line, d.pos.col);
     let kind = if d.kind == DefKind::Class { "class" } else { "def" };
     // A function's signature is its param/return list; a class's is its bases.
@@ -137,13 +147,17 @@ fn definition_row(fqn: &str, f: &FileIndex, d: &Def) -> Value {
         _ => d.signature.clone().unwrap_or_default(),
     };
     let decos: String = d.decorators.iter().map(|x| format!("@{x} ")).collect();
-    let mut label = format!("{decos}{kind} {}{sig}  [L{}-{}]", d.name, d.pos.line, d.end_line);
+    let observed = observed_return.map(|t| format!("  observed {t}")).unwrap_or_default();
+    let mut label = format!(
+        "{decos}{kind} {}{sig}{observed}  [L{}-{}]",
+        d.name, d.pos.line, d.end_line
+    );
     if let Some(doc) = &d.doc {
         label.push_str("  — ");
         label.push_str(&truncate(doc, 80));
     }
-    // Human columns: the signature line, the span, and the docstring (when any).
-    let signature_cell = format!("{decos}{kind} {}{sig}", d.name);
+    // Human columns: the signature line (+ observed return), span, docstring.
+    let signature_cell = format!("{decos}{kind} {}{sig}{observed}", d.name);
     let mut cols = vec![signature_cell, format!("L{}-{}", d.pos.line, d.end_line)];
     if let Some(doc) = &d.doc {
         cols.push(format!("— {}", truncate(doc, 80)));
@@ -155,6 +169,7 @@ fn definition_row(fqn: &str, f: &FileIndex, d: &Def) -> Value {
         "fqn": fqn,
         "node_kind": kind,
         "signature": sig,
+        "observed_return": observed_return,
         "decorators": d.decorators,
         "doc": d.doc,
         "lines": [d.pos.line, d.end_line],

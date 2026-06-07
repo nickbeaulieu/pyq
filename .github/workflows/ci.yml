@@ -1,0 +1,47 @@
+name: ci
+
+# Gate every push and PR on clippy + tests, so a `v*` tag (which fires the
+# release workflow straight to publish) is only ever cut from a green commit.
+# `cargo fmt --check` is intentionally NOT gated: the tree is hand-formatted
+# (notably the aligned `--help` menu) and isn't rustfmt-clean — add a fmt gate
+# only alongside a deliberate repo-wide `cargo fmt`.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      # The dynamic tier (trace / effect-diff / shapes / change-coverage) drives
+      # a real pytest run; its tests self-skip when pytest is absent, so without
+      # this the whole tier would go unexercised. 3.12 specifically because
+      # `shapes`/`change-coverage` need `sys.monitoring` (3.12+).
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install pytest
+        run: python -m pip install --upgrade pytest
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo test --workspace

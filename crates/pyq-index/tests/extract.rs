@@ -189,6 +189,79 @@ def run(count, name):
 }
 
 #[test]
+fn captures_wrapped_and_library_env_accessors() {
+    // Real codebases funnel config through helpers and config libs, not bare
+    // `os.getenv`. The detector matches by call shape (accessor name + literal
+    // first arg), so the wrapped surface is visible.
+    let src = r#"
+DB_NAME = var_provider.get_var("DB_NAME")
+SECRET = config.get_var("SECRET_KEY")
+token = env_utils.get_env("API_TOKEN")
+raw = getvar("RAW_VAR")
+decoupled = config("DECOUPLE_KEY")
+bare = env("DJANGO_ENVIRON_BARE")
+typed = env.str("DJANGO_ENVIRON_STR")
+flag = settings.env.bool("DJANGO_ENVIRON_BOOL")
+computed = var_provider.get_var(name)
+# not config access: argless call, and a non-accessor method name
+noise = get_config()
+other = obj.fetch("NOT_AN_ENV_VAR")
+"#;
+    let idx = extract("settings.py", src);
+    let env: Vec<&str> = idx
+        .inputs
+        .iter()
+        .filter(|i| i.kind == InputKind::Env)
+        .map(|i| i.value.as_str())
+        .collect();
+
+    // wrapper conventions + env_utils helper
+    assert!(env.contains(&"DB_NAME"), "{env:?}");
+    assert!(env.contains(&"SECRET_KEY"), "{env:?}");
+    assert!(env.contains(&"API_TOKEN"), "{env:?}");
+    assert!(env.contains(&"RAW_VAR"), "{env:?}");
+    // python-decouple
+    assert!(env.contains(&"DECOUPLE_KEY"), "{env:?}");
+    // django-environ: bare call, typed cast, and a cast on a receiver chain
+    assert!(env.contains(&"DJANGO_ENVIRON_BARE"), "{env:?}");
+    assert!(env.contains(&"DJANGO_ENVIRON_STR"), "{env:?}");
+    assert!(env.contains(&"DJANGO_ENVIRON_BOOL"), "{env:?}");
+    // computed key on a real accessor is bucketed, never guessed
+    assert!(env.contains(&"<dynamic>"), "{env:?}");
+    // argless lookalike and an unrelated method name are NOT env reads
+    assert!(!env.contains(&"NOT_AN_ENV_VAR"), "{env:?}");
+    assert!(idx.inputs.iter().all(|i| i.value != "get_config"), "{env:?}");
+}
+
+#[test]
+fn detects_module_level_main_guard() {
+    let with_guard = r#"
+def main():
+    pass
+
+if __name__ == "__main__":
+    main()
+"#;
+    assert!(extract("script.py", with_guard).has_main_guard);
+
+    // reversed comparison order is still the guard
+    let reversed = "if \"__main__\" == __name__:\n    pass\n";
+    assert!(extract("script.py", reversed).has_main_guard);
+
+    // a plain library module has none
+    let library = "def helper():\n    return 1\n";
+    assert!(!extract("lib.py", library).has_main_guard);
+
+    // a guard nested in a function is not the module-level entry signal
+    let nested = r#"
+def run():
+    if __name__ == "__main__":
+        pass
+"#;
+    assert!(!extract("lib.py", nested).has_main_guard);
+}
+
+#[test]
 fn captures_import_edges_with_module_level_and_names() {
     let src = r#"
 import os

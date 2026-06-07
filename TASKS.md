@@ -51,21 +51,34 @@ accuracy thesis" and "The analysis cache."
   - **#38.4** persist/load the ledger layer; pre-warm + progress streaming.
     *Prewarm shipped as the `index` verb:* `pyq index` builds the parse + graph
     layers up front (idempotent — replays when the tree is unchanged), `pyq index
-    clean` wipes this repo's cache dir. *Remaining:* the ledger layer + streaming
+    clean` wipes this repo's cache dir. *Ledger layer started:* `cache::ledger_effects`
+    runs the suite on a miss and caches observed `(owner, category)` effect pairs to
+    `ledger.bin` keyed by the tree fingerprint (`PYQ_NO_SUITE` skips; a failed run
+    degrades, isn't cached). *Remaining:* extend the ledger to coverage + shapes
+    (one instrumented run feeding all three), have `index` pre-warm it, and stream
     progress during the cold build.
   - **#38.5** v2 incremental: re-resolve only edges touching changed FQNs; re-run only tests the coverage map ties to changed lines.
 - **#39 · Per-row `confidence` in the envelope.** Structural provenance tag on every
   result — `proven`/`observed`/`confirmed`/`predicted`/`refuted`/`unverifiable` —
-  replacing free-text caveats so an agent can machine-filter. `pyq-output` gains the
-  field + renders it (human + JSON). The already-exact verbs are `proven`; the
-  irreducible residue is named `unverifiable`, not hidden.
+  replacing free-text caveats so an agent can machine-filter. *Started:* `effects`
+  rows now carry `confidence` (`confirmed`/`predicted`/`observed`/`unverifiable`).
+  *Remaining:* generalize across the other folded verbs; the already-exact verbs
+  should carry `proven`.
 - **#40 · Automatic verification — fold the dynamic verbs into the static ones.**
-  Over-approximate verbs (`effects`/`tests`/`deadcode`/`canonical`/reverse `graph`)
-  auto-fuse the cached ledger and relabel rows; already-exact verbs stay `proven` and
-  never run the suite. Folds: `effect-diff`→`effects`, `shapes`→`describe`/`defs`
-  (declared next to observed), `change-coverage`→`tests --base`, `trace`→internal dump.
-  Degrade to static `predicted` (never error/hang) when no interpreter/pytest/tests or
-  pre-3.12. → blocked by #38, #39.
+  *Done — all four folds.* Over-approximate verbs auto-fuse a cached ledger (suite
+  run on a cache miss; `PYQ_NO_SUITE` skips; degrade, never error/hang):
+  - `effect-diff`→`effects` — optional symbol (omit = project-wide), every row
+    labelled `confirmed`/`predicted`/`observed`/`unverifiable` (`tests/effects_fusion.rs`).
+  - `shapes`→`describe` — the definition row shows the runtime-observed return type
+    (`observed_return`) beside the declared signature; `cache::ledger_shapes` caches
+    it to `shapes.bin` (`tests/describe_shapes.rs`).
+  - `change-coverage`→`tests --base <ref>` — `tests` takes an optional symbol + a
+    `--base`; with `--base` it's the changed-line coverage oracle (`tests/change_coverage.rs`).
+  - `trace`→internal — hidden (`#[command(hide = true)]`), kept for debugging the
+    dynamic tier; `effects` surfaces the fused ledger instead.
+  Verb count: 17 → 13 user-facing. *Caveat:* effects/describe/tests-base each run a
+  *separate* suite (effects=audit hook, shapes/coverage=`sys.monitoring`); unifying
+  into one instrumented run that feeds all three is the remaining #38.4 work.
 
 ### P2 — highest leverage
 - **#12 · `hierarchy` verb — class tree + override map.** Subclasses / supers /

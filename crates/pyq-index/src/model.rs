@@ -217,4 +217,9 @@ pub struct FileIndex {
     /// over-approximately (any path-shaped literal); the resolver filters to ones
     /// that name a real symbol.
     pub dotted_strings: Vec<String>,
+    /// Whether the module has a top-level `if __name__ == "__main__":` guard —
+    /// the language-level signal that the file is meant to be *run* directly
+    /// (a standalone script), not just imported. Used to separate per-script
+    /// inputs from the app's own input surface.
+    pub has_main_guard: bool,
 }

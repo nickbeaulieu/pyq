@@ -41,6 +41,12 @@ pub struct Envelope {
     /// fall back to reading the file. Omitted from JSON when empty.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<String>,
+    /// Informational pointers — not problems, just things worth surfacing (e.g.
+    /// "N scripts have their own inputs — query them by name"). Rendered as a
+    /// plain `notes` block, without the warning glyph. Omitted from JSON when
+    /// empty.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub notes: Vec<String>,
 }
 
 impl Envelope {
@@ -52,6 +58,7 @@ impl Envelope {
             query,
             results,
             warnings: Vec::new(),
+            notes: Vec::new(),
         }
     }
 
@@ -62,6 +69,11 @@ impl Envelope {
 
     pub fn with_warnings(mut self, warnings: Vec<String>) -> Self {
         self.warnings = warnings;
+        self
+    }
+
+    pub fn with_notes(mut self, notes: Vec<String>) -> Self {
+        self.notes = notes;
         self
     }
 
@@ -98,6 +110,15 @@ impl Envelope {
 
         if self.results.is_empty() && self.summary.is_empty() {
             blocks.push("no results".to_string());
+        }
+
+        if !self.notes.is_empty() {
+            let mut block = String::from("notes");
+            for n in &self.notes {
+                block.push_str("\n  ");
+                block.push_str(n);
+            }
+            blocks.push(block);
         }
 
         if !self.warnings.is_empty() {

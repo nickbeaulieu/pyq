@@ -36,7 +36,7 @@ use crate::walk;
 
 /// Bumped whenever the on-disk parse shape changes (a new `FileIndex` field, a
 /// format switch). A mismatch discards the cache rather than misreading it.
-const SCHEMA_VERSION: u32 = 1;
+const SCHEMA_VERSION: u32 = 2;
 
 /// Independent version for the graph layer (the recorded ty edges). Bumped when
 /// the `GraphRecording` shape changes.
@@ -275,6 +275,172 @@ pub fn call_graph(
         }
     }
     Ok(graph)
+}
+
+/// Independent version for the runtime-ledger layer (observed effects from a
+/// suite run). Bumped when the stored shape changes.
+const LEDGER_SCHEMA: u32 = 1;
+
+/// The persisted runtime ledger: the `(owner FQN, effect category)` pairs the
+/// suite actually performed, keyed by the tree fingerprint it was observed
+/// against.
+#[derive(Serialize, Deserialize)]
+struct LedgerCache {
+    schema: u32,
+    fingerprint: String,
+    effects: Vec<(String, String)>,
+    pytest_exit: Option<i64>,
+    warnings: Vec<String>,
+}
+
+/// What a suite run observed — or why it couldn't. `available` is false when the
+/// suite was skipped (`PYQ_NO_SUITE`) or couldn't run (no interpreter/pytest);
+/// callers degrade to static `predicted` rather than erroring.
+pub struct ObservedEffects {
+    pub pairs: HashSet<(String, String)>,
+    pub available: bool,
+    pub pytest_exit: Option<i64>,
+    pub warnings: Vec<String>,
+}
+
+/// The observed effect ledger for `root`: served from `ledger.bin` when its
+/// fingerprint matches, otherwise the suite is **run on demand** and the result
+/// cached. Set `PYQ_NO_SUITE` to skip the run entirely (CI, sandboxes, or when
+/// the static prediction is enough). A failed run degrades to `available:false`
+/// and is not cached, so the next call retries.
+pub fn ledger_effects(root: &str, fingerprint: &str, python: &str) -> ObservedEffects {
+    let unavailable = |warning: String| ObservedEffects {
+        pairs: HashSet::new(),
+        available: false,
+        pytest_exit: None,
+        warnings: vec![warning],
+    };
+
+    if std::env::var_os("PYQ_NO_SUITE").is_some() {
+        return unavailable(
+            "suite run skipped (PYQ_NO_SUITE set) — effects are static predictions".to_string(),
+        );
+    }
+
+    let dir = cache_dir(root);
+    if !fingerprint.is_empty() {
+        if let Some(lc) = dir.as_ref().and_then(|d| read_bin::<LedgerCache>(&d.join("ledger.bin"))) {
+            if lc.schema == LEDGER_SCHEMA && lc.fingerprint == fingerprint {
+                return ObservedEffects {
+                    pairs: lc.effects.into_iter().collect(),
+                    available: true,
+                    pytest_exit: lc.pytest_exit,
+                    warnings: lc.warnings,
+                };
+            }
+        }
+    }
+
+    // Cache miss → run the suite under the dynamic tier.
+    let mut opts = pyq_dynamic::TraceOptions::new(root.to_string());
+    opts.python = python.to_string();
+    let env = match pyq_dynamic::observed_effects(&opts) {
+        Ok(env) => env,
+        Err(e) => {
+            return unavailable(format!(
+                "could not run the test suite ({e}) — effects are static predictions"
+            ))
+        }
+    };
+
+    let mut pairs = HashSet::new();
+    for r in &env.results {
+        if let (Some(owner), Some(cat)) = (
+            r.get("owner").and_then(|v| v.as_str()),
+            r.get("effect").and_then(|v| v.as_str()),
+        ) {
+            // `import` is a load event, not one of the static effect categories.
+            if cat != "import" {
+                pairs.insert((owner.to_string(), cat.to_string()));
+            }
+        }
+    }
+    let pytest_exit = env.query.get("pytest_exit").and_then(|v| v.as_i64());
+    let warnings = env.warnings.clone();
+
+    if !fingerprint.is_empty() {
+        if let Some(dir) = dir {
+            let lc = LedgerCache {
+                schema: LEDGER_SCHEMA,
+                fingerprint: fingerprint.to_string(),
+                effects: pairs.iter().cloned().collect(),
+                pytest_exit,
+                warnings: warnings.clone(),
+            };
+            let _ = write_bin(&dir, "ledger.bin", &lc);
+        }
+    }
+
+    ObservedEffects {
+        pairs,
+        available: true,
+        pytest_exit,
+        warnings,
+    }
+}
+
+/// Independent version for the observed-shapes layer (runtime return types).
+const SHAPES_SCHEMA: u32 = 1;
+
+#[derive(Serialize, Deserialize)]
+struct ShapesCache {
+    schema: u32,
+    fingerprint: String,
+    returns: Vec<(String, Vec<String>)>,
+}
+
+/// The runtime return types each callable produced, keyed by FQN. Empty when the
+/// suite was skipped/failed or the interpreter is pre-3.12 (`sys.monitoring`
+/// absent) — callers simply omit the observed column in that case.
+pub struct ObservedShapes {
+    pub returns: BTreeMap<String, Vec<String>>,
+}
+
+/// The observed-shapes ledger for `root`: served from `shapes.bin` on a
+/// fingerprint match, else the suite is run on demand and cached. `PYQ_NO_SUITE`
+/// skips it; a pre-3.12 / failed run yields an empty map and isn't cached (so a
+/// later capable interpreter retries).
+pub fn ledger_shapes(root: &str, fingerprint: &str, python: &str) -> ObservedShapes {
+    let empty = || ObservedShapes {
+        returns: BTreeMap::new(),
+    };
+    if std::env::var_os("PYQ_NO_SUITE").is_some() {
+        return empty();
+    }
+    let dir = cache_dir(root);
+    if !fingerprint.is_empty() {
+        if let Some(sc) = dir.as_ref().and_then(|d| read_bin::<ShapesCache>(&d.join("shapes.bin"))) {
+            if sc.schema == SHAPES_SCHEMA && sc.fingerprint == fingerprint {
+                return ObservedShapes {
+                    returns: sc.returns.into_iter().collect(),
+                };
+            }
+        }
+    }
+    let mut opts = pyq_dynamic::TraceOptions::new(root.to_string());
+    opts.python = python.to_string();
+    let shapes = match pyq_dynamic::observed_shapes(&opts) {
+        Ok(s) if s.monitoring_available => s,
+        _ => return empty(),
+    };
+    if !fingerprint.is_empty() {
+        if let Some(dir) = dir {
+            let sc = ShapesCache {
+                schema: SHAPES_SCHEMA,
+                fingerprint: fingerprint.to_string(),
+                returns: shapes.returns.clone().into_iter().collect(),
+            };
+            let _ = write_bin(&dir, "shapes.bin", &sc);
+        }
+    }
+    ObservedShapes {
+        returns: shapes.returns,
+    }
 }
 
 fn read_bin<T: DeserializeOwned>(path: &Path) -> Option<T> {

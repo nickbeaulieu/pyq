@@ -8,18 +8,18 @@
 mod cache;
 mod canonical;
 mod change_cov;
+mod channel;
 mod deadcode;
 mod describe;
 mod graph;
 mod hierarchy;
 mod mock;
 mod tests_map;
+mod upgrade;
 mod walk;
 
 use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
-use pyq_dynamic::{
-    default_python, observed_coverage, observed_effects, observed_shapes, TraceOptions,
-};
+use pyq_dynamic::{default_python, observed_coverage, observed_effects, TraceOptions};
 use pyq_index::{extract, EffectKind, FileIndex, InputKind};
 use pyq_output::{Channel, Envelope};
 use pyq_resolve::{
@@ -84,26 +84,42 @@ enum Command {
         #[arg(long)]
         depth: Option<usize>,
     },
-    /// The transitive effect surface of a symbol: which side effects (files,
-    /// network, subprocess, env, db, randomness, clock, global mutation) it and
-    /// everything it transitively calls statically touch — plus import-time
-    /// effects of the modules involved. "Is this pure / safe in a test."
-    Effects { symbol: String },
-    /// Which tests statically reach a symbol — the test↔code map. Projects the
-    /// reverse call graph and keeps the callers pytest would collect as tests
-    /// (`test_*` functions in `test_*.py`/`*_test.py`, `test_*` methods on
-    /// `Test*` classes). Each test carries the call path (`via`) and `depth` by
-    /// which it reaches the symbol. The foundation for static change coverage.
-    Tests { symbol: String },
+    /// The transitive effect surface — which side effects (files, network,
+    /// subprocess, env, db, randomness, clock, global mutation) a symbol and
+    /// everything it transitively calls touch (omit the symbol for the whole
+    /// project). Each row is labelled by confidence — `confirmed` (the suite
+    /// performed it), `predicted` (static says so, unverified), `observed` (the
+    /// run did it but static missed the edge), `unverifiable` (audit-blind
+    /// category). Runs your test suite on a cache miss to verify (set
+    /// `PYQ_NO_SUITE` to skip). "Is this pure / what does it really touch."
+    Effects { symbol: Option<String> },
+    /// Which tests reach code. With a symbol: the static test↔code map — the
+    /// collected tests whose reverse call graph reaches it, each with the call
+    /// path (`via`) and `depth`. With `--base <ref>` (no symbol): the runtime
+    /// oracle — which lines changed since that ref the suite actually covers, and
+    /// by which tests (`sys.monitoring`, Python 3.12+; degrades on older). The
+    /// `--base` form runs your tests.
+    Tests {
+        /// The symbol whose reaching tests to map. Omit when using `--base`.
+        symbol: Option<String>,
+        /// Report changed-line coverage since this git ref instead of a symbol's
+        /// reaching tests (the absorbed `change-coverage`).
+        #[arg(long)]
+        base: Option<String>,
+    },
     /// One compact context pack for a symbol — signature, decorators, docstring
     /// line, and def line-span, plus its immediate callers, immediate callees,
     /// and the collected tests that reach it. The token-frugal "tell me about
     /// X": everything an agent would otherwise grep for, in one envelope.
     /// Accepts a bare name, a qualified name, or a full FQN.
     Describe { symbol: String },
-    /// The external input surface — env vars, literal files opened, CLI args,
-    /// and pydantic settings fields. "What does this need to run."
-    Inputs,
+    /// The external input surface — env vars, config reads, literal files
+    /// opened, CLI args, and pydantic settings fields. "What does this need to
+    /// run." With no argument, the **app** surface (config the running service
+    /// reads), with per-script inputs (management commands, `scripts/`) held
+    /// back behind a hint. Pass a script name or path (`inputs backfill_calls`)
+    /// to see that script's own inputs.
+    Inputs { target: Option<String> },
     /// Resolve every `mock.patch("a.b.c")` target against the project and flag
     /// drifted paths — a patch whose target no longer exists silently does
     /// nothing, so the test passes while exercising the real code.
@@ -140,53 +156,11 @@ enum Command {
         #[arg(long)]
         cycles: bool,
     },
-    /// Run the project's test suite under the dynamic tier and report the side
-    /// effects it *actually* performs at runtime — the runtime oracle that
-    /// confirms/refutes the static `effects` verb on its dynamic-dispatch blind
-    /// spot. Keyed by the same FQNs, so the two join (effect-diff, #9.3). Runs
-    /// your tests: invoking it is consent, the same as typing `pytest`.
+    /// Internal: the raw runtime effect ledger (what the suite actually did),
+    /// without the static join. Hidden — `effects` surfaces this fused and
+    /// labelled; `trace` stays for debugging the dynamic tier. Runs your tests.
+    #[command(hide = true)]
     Trace {
-        /// Arguments passed through to pytest (test paths, `-k`, `-m`, …).
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
-        pytest_args: Vec<String>,
-        /// Python interpreter to drive (defaults to `$PYQ_PYTHON` or `python3`).
-        #[arg(long)]
-        python: Option<String>,
-    },
-    /// Join the static effect surface against what the suite actually performs
-    /// at runtime: `confirmed` (both), `dynamic-only` (runtime did it, static
-    /// missed the edge — the dynamic-dispatch blind spot), `static-only` (static
-    /// predicted it, runtime didn't — over-approximation or unexercised), and
-    /// `unverifiable` (a category the audit hook can't see). Runs your tests.
-    EffectDiff {
-        /// Arguments passed through to pytest (test paths, `-k`, `-m`, …).
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
-        pytest_args: Vec<String>,
-        /// Python interpreter to drive (defaults to `$PYQ_PYTHON` or `python3`).
-        #[arg(long)]
-        python: Option<String>,
-    },
-    /// Which lines changed since `--base` are exercised by the test suite, and
-    /// by which tests — the runtime oracle behind the `tests` verb's "a static
-    /// 0 is not 'untested'" caveat. Joins `git diff` against per-test line
-    /// coverage (`sys.monitoring`, Python 3.12+; degrades on older). Runs your
-    /// tests.
-    ChangeCoverage {
-        /// Git ref to diff against (default: `HEAD`, i.e. uncommitted changes).
-        #[arg(long, default_value = "HEAD")]
-        base: String,
-        /// Arguments passed through to pytest (test paths, `-k`, `-m`, …).
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
-        pytest_args: Vec<String>,
-        /// Python interpreter to drive (defaults to `$PYQ_PYTHON` or `python3`).
-        #[arg(long)]
-        python: Option<String>,
-    },
-    /// The concrete return type each callable actually produced at runtime —
-    /// runtime evidence complementing ty's static inference, for spotting
-    /// missing/loose annotations. Needs Python 3.12+ (`sys.monitoring`); runs
-    /// your tests.
-    Shapes {
         /// Arguments passed through to pytest (test paths, `-k`, `-m`, …).
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         pytest_args: Vec<String>,
@@ -201,6 +175,27 @@ enum Command {
     Index {
         #[command(subcommand)]
         action: Option<IndexAction>,
+    },
+    /// Show or switch the release channel `pyq upgrade` follows. With no
+    /// argument, report the configured channel and this build's identity; with
+    /// `stable` or `canary`, switch and persist the choice to `~/.pyq/channel`.
+    /// Stable tracks tagged releases; canary tracks `main`. Switching only
+    /// records intent — run `pyq upgrade` to actually move.
+    Channel {
+        /// `stable` or `canary`. Omit to show the current channel.
+        channel: Option<String>,
+    },
+    /// Upgrade `pyq` in place to the latest build on the configured channel,
+    /// verifying its checksum before replacing the running binary. `--check`
+    /// reports what an upgrade would do without installing; `--force`
+    /// reinstalls even when already current.
+    Upgrade {
+        /// Report the available version without installing.
+        #[arg(long)]
+        check: bool,
+        /// Reinstall even when already up to date.
+        #[arg(long)]
+        force: bool,
     },
 }
 
@@ -275,7 +270,9 @@ fn help_menu(color: bool) -> String {
         format!("  {c}{name}{r}{args}{gap}{d}{desc}{r}\n")
     };
 
-    let groups: [(&str, &[(&str, &str, &str)]); 5] = [
+    // One menu group: a heading and its `(name, args, desc)` command rows.
+    type Group = (&'static str, &'static [(&'static str, &'static str, &'static str)]);
+    let groups: [Group; 5] = [
         ("Find & describe a symbol", &[
             ("refs", "<symbol>", "Every reference (reads, writes, calls) to a symbol, cross-file."),
             ("callers", "<symbol>", "Every call site of a symbol."),
@@ -293,15 +290,13 @@ fn help_menu(color: bool) -> String {
             ("deadcode", "", "Callables reachable from no entrypoint (candidates)."),
         ]),
         ("Project surface", &[
-            ("inputs", "", "Env vars, files, CLI args & settings the project reads."),
+            ("inputs", "[script]", "App env/config & settings; a script name for its own inputs."),
             ("mock-targets", "", "Resolve every mock.patch(...) and flag drifted targets."),
             ("canonical", "", "Most-used helpers, untested public surface, test inventory."),
         ]),
-        ("Dynamic", &[
-            ("trace", "", "Side effects actually performed at runtime."),
-            ("effect-diff", "", "Static effect surface vs. what code really executes."),
-            ("change-coverage", "", "Which changed lines the test suite covers (--base <ref>)."),
-            ("shapes", "", "Concrete return types each callable produced at runtime."),
+        ("Distribution", &[
+            ("channel", "[name]", "Show or switch the release channel (stable / canary)."),
+            ("upgrade", "", "Update pyq in place to the latest build on the channel."),
         ]),
     ];
 
@@ -333,10 +328,8 @@ fn dispatch(cli: &Cli) -> anyhow::Result<Envelope> {
         | Command::Callers { symbol }
         | Command::Defs { symbol }
         | Command::Graph { symbol, .. }
-        | Command::Tests { symbol }
         | Command::Hierarchy { symbol }
-        | Command::Describe { symbol }
-        | Command::Effects { symbol } => Some(symbol.as_str()),
+        | Command::Describe { symbol } => Some(symbol.as_str()),
         _ => None,
     };
     if matches!(symbol, Some(s) if s.trim().is_empty()) {
@@ -347,9 +340,9 @@ fn dispatch(cli: &Cli) -> anyhow::Result<Envelope> {
     // `refs`/`callers`/`defs` the Resolver trait merges ty (authoritative,
     // cross-file) with the syntactic scan (ty's blind spots) into one answer.
     let mut envelope = match &cli.command {
-        Command::Inputs => {
+        Command::Inputs { target } => {
             let files = cache::index_tree(&cli.root)?;
-            query_inputs(&files)
+            query_inputs(&files, target.as_deref())
         }
         Command::MockTargets => query_mock_targets(cli)?,
         Command::Hierarchy { symbol } => query_hierarchy(cli, symbol)?,
@@ -371,30 +364,27 @@ fn dispatch(cli: &Cli) -> anyhow::Result<Envelope> {
             reverse,
             depth,
         } => query_graph(cli, symbol, *reverse, *depth)?,
-        Command::Effects { symbol } => query_effects(cli, symbol)?,
+        Command::Effects { symbol } => query_effects(cli, symbol.as_deref())?,
         Command::Describe { symbol } => describe::query(&cli.root, symbol)?,
-        Command::Tests { symbol } => query_tests(cli, symbol)?,
+        Command::Tests { symbol, base } => match (base, symbol) {
+            // `--base` is the absorbed change-coverage (runtime line coverage of
+            // the diff); a bare symbol is the static reaching-tests map.
+            (Some(base), _) => query_change_cov(cli, base, &[], None)?,
+            (None, Some(symbol)) => query_tests(cli, symbol)?,
+            (None, None) => anyhow::bail!(
+                "`tests` needs a symbol (reaching tests) or `--base <ref>` (changed-line coverage)"
+            ),
+        },
         Command::Trace {
             pytest_args,
             python,
         } => query_trace(cli, pytest_args, python.as_deref())?,
-        Command::EffectDiff {
-            pytest_args,
-            python,
-        } => query_effect_diff(cli, pytest_args, python.as_deref())?,
-        Command::ChangeCoverage {
-            base,
-            pytest_args,
-            python,
-        } => query_change_cov(cli, base, pytest_args, python.as_deref())?,
-        Command::Shapes {
-            pytest_args,
-            python,
-        } => query_shapes(cli, pytest_args, python.as_deref())?,
         Command::Index { action } => match action {
             Some(IndexAction::Clean) => query_index_clean(cli)?,
             None => query_index(cli)?,
         },
+        Command::Channel { channel } => channel::query(channel.as_deref())?,
+        Command::Upgrade { check, force } => upgrade::run(*check, *force)?,
     };
 
     // Anchor every result to one resolved root, echoed in the query — so the
@@ -592,111 +582,231 @@ fn node_to_json(node: &GraphNode) -> serde_json::Value {
 /// The transitive effect surface of a symbol: the side effects performed by the
 /// symbol and everything it transitively calls (forward call closure), plus the
 /// import-time effects of every module that contributes a reachable callable.
-fn query_effects(cli: &Cli, symbol: &str) -> anyhow::Result<Envelope> {
+/// The transitive effect surface of a symbol (or the whole project when no
+/// symbol is given), **fused with the runtime ledger** so every row is labelled
+/// by how sure we are — the absorbed `effect-diff`:
+///   `confirmed`     static predicted it and the suite performed it;
+///   `predicted`     static says so, the run didn't exercise it (over-approx or
+///                   uncovered) — or the suite couldn't run at all;
+///   `observed`      the run did it but static missed the edge (dynamic dispatch
+///                   — the reason to run the suite); has no static loc;
+///   `unverifiable`  an effect category the audit hook can't watch
+///                   (env-read/random/clock/global).
+/// The suite is run on a ledger cache miss (set `PYQ_NO_SUITE` to skip it).
+fn query_effects(cli: &Cli, symbol: Option<&str>) -> anyhow::Result<Envelope> {
     let (files, fingerprint) = cache::indexed(&cli.root)?;
-    let scope = walk::walked_py_files(&cli.root);
-    let graph = cache::call_graph(&cli.root, &files, scope, &fingerprint)?;
-    let closure = graph.closure(symbol, Direction::Forward, None);
 
-    // Everything reachable from the symbol, the roots included.
-    let reachable: HashSet<String> = closure
-        .roots
-        .iter()
-        .cloned()
-        .chain(closure.nodes.iter().map(|n| n.fqn.clone()))
-        .collect();
-    // A file is "in play" if it defines a reachable callable — importing such a
-    // module runs its import-time effects, so we surface those too.
+    // --- Static effect surface (per site) ---
+    // Scoped to a symbol's forward closure, or project-wide with no symbol.
+    let scoped = symbol.is_some();
+    let mut roots_empty = false;
+    let mut reachable: HashSet<String> = HashSet::new();
+    if let Some(sym) = symbol {
+        let scope = walk::walked_py_files(&cli.root);
+        let graph = cache::call_graph(&cli.root, &files, scope, &fingerprint)?;
+        let closure = graph.closure(sym, Direction::Forward, None);
+        roots_empty = closure.roots.is_empty();
+        reachable = closure
+            .roots
+            .iter()
+            .cloned()
+            .chain(closure.nodes.iter().map(|n| n.fqn.clone()))
+            .collect();
+    }
+    // A file is "in play" if it defines a reachable callable — importing it runs
+    // its import-time effects. (Project-wide: every file is in play.)
     let in_play: HashSet<&str> = files
         .iter()
         .filter(|f| {
-            f.defs.iter().any(|d| {
-                matches!(d.kind, pyq_index::DefKind::Function | pyq_index::DefKind::Class)
-                    && reachable.contains(&owner_fqn(&f.path, &d.container, &d.name))
-            })
+            !scoped
+                || f.defs.iter().any(|d| {
+                    matches!(d.kind, pyq_index::DefKind::Function | pyq_index::DefKind::Class)
+                        && reachable.contains(&owner_fqn(&f.path, &d.container, &d.name))
+                })
         })
         .map(|f| f.path.as_str())
         .collect();
 
-    let mut rows: Vec<(String, serde_json::Value, &'static str)> = Vec::new();
-    let mut categories: BTreeSet<&'static str> = BTreeSet::new();
+    struct Site {
+        loc: String,
+        path: String,
+        owner: String,
+        cat: &'static str,
+        api: String,
+        import_time: bool,
+    }
+    let mut sites: Vec<Site> = Vec::new();
     for f in &files {
         for e in &f.effects {
             let owner = scope_fqn(&f.path, &e.scope);
-            let keep = if e.import_time {
+            let keep = if !scoped {
+                true
+            } else if e.import_time {
                 in_play.contains(f.path.as_str())
             } else {
                 reachable.contains(&owner)
             };
-            if !keep {
-                continue;
+            if keep {
+                sites.push(Site {
+                    loc: format!("{}:{}:{}", f.path, e.pos.line, e.pos.col),
+                    path: f.path.clone(),
+                    owner,
+                    cat: effect_kind_str(e.kind),
+                    api: e.detail.clone(),
+                    import_time: e.import_time,
+                });
             }
-            let cat = effect_kind_str(e.kind);
-            categories.insert(cat);
-            let loc = format!("{}:{}:{}", f.path, e.pos.line, e.pos.col);
-            let in_label = if e.import_time {
-                format!("{} (import-time)", module_label(&f.path))
-            } else {
-                owner.clone()
-            };
-            let label = format!("{cat} {}  in {in_label}", e.detail);
-            // Section by category; columns are the API, its owner, and an
-            // import-time flag (blank when it runs inside a function).
-            let flag = if e.import_time { "import-time" } else { "" };
-            rows.push((
-                loc.clone(),
+        }
+    }
+
+    // --- Runtime ledger (cached, or the suite run on demand) ---
+    let observed = cache::ledger_effects(&cli.root, &fingerprint, &default_python());
+    let static_keys: HashSet<(String, String)> =
+        sites.iter().map(|s| (s.owner.clone(), s.cat.to_string())).collect();
+    let confidence = |owner: &str, cat: &str| -> &'static str {
+        if observed.available && observed.pairs.contains(&(owner.to_string(), cat.to_string())) {
+            "confirmed"
+        } else if AUDITABLE.contains(&cat) {
+            "predicted"
+        } else {
+            "unverifiable"
+        }
+    };
+    // Display order: certain first, then the dynamic-only payoff, then the
+    // unverified static predictions, then the audit-blind categories.
+    let rank = |c: &str| match c {
+        "confirmed" => 0u8,
+        "observed" => 1,
+        "predicted" => 2,
+        _ => 3,
+    };
+
+    let mut entries: Vec<(u8, String, String, serde_json::Value)> = Vec::new();
+    let mut categories: BTreeSet<String> = BTreeSet::new();
+    let mut counts: std::collections::BTreeMap<&'static str, usize> =
+        std::collections::BTreeMap::new();
+    let mut seen: HashSet<(String, String)> = HashSet::new(); // (loc, api)
+
+    for s in &sites {
+        if !seen.insert((s.loc.clone(), s.api.clone())) {
+            continue;
+        }
+        categories.insert(s.cat.to_string());
+        let conf = confidence(&s.owner, s.cat);
+        *counts.entry(conf).or_default() += 1;
+        let in_label = if s.import_time {
+            format!("{} (import-time)", module_label(&s.path))
+        } else {
+            s.owner.clone()
+        };
+        let flag = if s.import_time { "import-time" } else { "" };
+        entries.push((
+            rank(conf),
+            s.cat.to_string(),
+            s.loc.clone(),
+            json!({
+                "loc": s.loc,
+                "label": format!("{conf} {} {}  in {in_label}", s.cat, s.api),
+                "confidence": conf,
+                "effect": s.cat,
+                "api": s.api,
+                "owner": s.owner,
+                "import_time": s.import_time,
+                "group": conf,
+                "cols": [s.cat.to_string(), s.api.clone(), s.owner.clone(), flag.to_string()],
+            }),
+        ));
+    }
+
+    // Observed-only: effects the runtime performed that the static surface never
+    // predicted — the dynamic-dispatch edges. Scoped queries keep only owners the
+    // static closure already reaches (a sound attribution without dynamic call
+    // edges); project-wide keeps them all.
+    if observed.available {
+        let mut dyn_only: Vec<&(String, String)> = observed
+            .pairs
+            .iter()
+            .filter(|(owner, cat)| {
+                !static_keys.contains(&(owner.clone(), cat.clone()))
+                    && (!scoped || reachable.contains(owner))
+            })
+            .collect();
+        dyn_only.sort();
+        for (owner, cat) in dyn_only {
+            categories.insert(cat.clone());
+            *counts.entry("observed").or_default() += 1;
+            entries.push((
+                rank("observed"),
+                cat.clone(),
+                String::new(),
                 json!({
-                    "loc": loc,
-                    "label": label,
+                    "label": format!("observed {cat}  in {owner} (static missed this edge)"),
+                    "confidence": "observed",
                     "effect": cat,
-                    "api": e.detail,
                     "owner": owner,
-                    "import_time": e.import_time,
-                    "group": cat,
-                    "cols": [e.detail.clone(), owner.clone(), flag.to_string()],
+                    "import_time": false,
+                    "group": "observed",
+                    "cols": [cat.clone(), String::new(), owner.clone(), String::new()],
                 }),
-                cat,
             ));
         }
     }
 
-    rows.sort_by(|a, b| (a.2, &a.0).cmp(&(b.2, &b.0)));
-    rows.dedup_by(|a, b| a.0 == b.0 && a.1["api"] == b.1["api"]);
-    let results: Vec<serde_json::Value> = rows.iter().map(|(_, v, _)| v.clone()).collect();
+    entries.sort_by(|a, b| (a.0, &a.1, &a.2).cmp(&(b.0, &b.1, &b.2)));
+    let results: Vec<serde_json::Value> = entries.into_iter().map(|e| e.3).collect();
+    let cats: Vec<String> = categories.into_iter().collect();
 
-    let cats: Vec<&str> = categories.iter().copied().collect();
-    let summary = if closure.roots.is_empty() {
-        format!("no function or class named `{symbol}` found")
+    let target_label = symbol.map(|s| format!(" of `{s}`")).unwrap_or_default();
+    let summary = if roots_empty {
+        format!("no function or class named `{}` found", symbol.unwrap_or(""))
     } else if results.is_empty() {
-        format!(
-            "`{symbol}` is pure — no static effects across {} reachable {}",
-            reachable.len(),
-            plural(reachable.len(), "callable")
-        )
+        match symbol {
+            Some(s) => format!(
+                "`{s}` is pure — no static effects across {} reachable {}",
+                reachable.len(),
+                plural(reachable.len(), "callable")
+            ),
+            None => "no effects found".to_string(),
+        }
     } else {
-        format!(
-            "effects of `{symbol}`: {} — {} {}",
-            cats.join(", "),
-            results.len(),
-            plural(results.len(), "site")
-        )
+        let parts: Vec<String> = ["confirmed", "observed", "predicted", "unverifiable"]
+            .iter()
+            .filter_map(|c| counts.get(c).map(|n| format!("{n} {c}")))
+            .collect();
+        format!("effects{target_label}: {}", parts.join(", "))
     };
-    let query = json!({ "kind": "effects", "target": symbol, "categories": cats });
-    let mut envelope = Envelope::new(query, results).with_summary(summary);
 
-    let mut warnings = Vec::new();
-    if closure.roots.is_empty() {
-        warnings.push(format!("no function or class named `{symbol}` found"));
+    let query = json!({ "kind": "effects", "target": symbol, "categories": cats });
+    let mut warnings: Vec<String> = Vec::new();
+    if roots_empty {
+        warnings.push(format!(
+            "no function or class named `{}` found",
+            symbol.unwrap_or("")
+        ));
     } else {
-        // Honest about the boundary: detection is syntactic/over-approximate, and
-        // effects behind calls ty couldn't resolve (attribute/dynamic dispatch)
-        // aren't reached — so "pure" means "no effect found", not "proven pure."
+        // The honesty footer, now scoped to what the labels can't settle: a
+        // `predicted` row may be over-approximation or merely unexercised, and
+        // `unverifiable` categories are audit-blind. `confirmed` means the suite
+        // performed it; `observed` is an edge the static surface can't see.
+        if !observed.available {
+            warnings.extend(observed.warnings.iter().cloned());
+        } else if !matches!(observed.pytest_exit, None | Some(0) | Some(5)) {
+            // Non-zero (and not pytest's "no tests collected" 5): the run was
+            // partial, so absence of a `confirmed` label is less conclusive.
+            warnings.push(format!(
+                "the test suite exited non-zero (code {}) — the runtime ledger may be incomplete",
+                observed.pytest_exit.unwrap_or_default()
+            ));
+        }
         warnings.push(
-            "static over-approximation: effects behind dynamic/attribute-dispatched calls are not followed".to_string(),
+            "static over-approximation: a `predicted` effect may be unexercised or behind \
+             dynamic dispatch; only `confirmed` is proven to run"
+                .to_string(),
         );
     }
-    envelope = envelope.with_warnings(warnings);
-    Ok(envelope)
+    Ok(Envelope::new(query, results)
+        .with_summary(summary)
+        .with_warnings(warnings))
 }
 
 /// Effect categories the runtime audit hook can actually observe, so a
@@ -704,143 +814,6 @@ fn query_effects(cli: &Cli, symbol: &str) -> anyhow::Result<Envelope> {
 /// `random`, `clock`, and `global` have no audit event — a static-only finding
 /// there is "the dynamic tier can't see it," not "the static tier over-reached."
 const AUDITABLE: &[&str] = &["fs", "network", "subprocess", "db"];
-
-/// effect-diff (#9.3): join the static effect surface against what the suite
-/// actually performed at runtime, into three buckets —
-///   `confirmed`     static predicted it, runtime did it;
-///   `dynamic-only`  runtime did it, static missed it (the dynamic-dispatch
-///                   blind spot — the finding that makes the dynamic tier worth
-///                   running);
-///   `static-only`   static predicted it, runtime didn't — over-approximation
-///                   or simply not exercised by the suite (distinguishing the
-///                   two wants change-coverage, #9.4); in an unaudited category
-///                   it is instead `unverifiable`.
-/// Both tiers key effects on the same `(owner FQN, category)`, so the join is
-/// exact.
-fn query_effect_diff(
-    cli: &Cli,
-    pytest_args: &[String],
-    python: Option<&str>,
-) -> anyhow::Result<Envelope> {
-    // Static side: every effect site across the project, keyed (owner, cat),
-    // keeping one representative location for the report.
-    let files = cache::index_tree(&cli.root)?;
-    let mut static_map: std::collections::BTreeMap<(String, &'static str), String> =
-        std::collections::BTreeMap::new();
-    for f in &files {
-        for e in &f.effects {
-            let owner = scope_fqn(&f.path, &e.scope);
-            let cat = effect_kind_str(e.kind);
-            let loc = format!("{}:{}:{}", f.path, e.pos.line, e.pos.col);
-            static_map.entry((owner, cat)).or_insert(loc);
-        }
-    }
-
-    // Dynamic side: run the suite under the ledger; collect observed (owner,
-    // cat), dropping `import` (a load event, not one of the static effect
-    // categories).
-    let mut opts = TraceOptions::new(cli.root.clone());
-    opts.python = python.map(str::to_string).unwrap_or_else(default_python);
-    opts.pytest_args = pytest_args.to_vec();
-    let observed = observed_effects(&opts)?;
-    let pytest_exit = observed.query.get("pytest_exit").cloned();
-    let mut dynamic_set: BTreeSet<(String, String)> = BTreeSet::new();
-    for r in &observed.results {
-        let (owner, cat) = match (r.get("owner").and_then(|v| v.as_str()),
-                                  r.get("effect").and_then(|v| v.as_str())) {
-            (Some(o), Some(c)) if c != "import" => (o.to_string(), c.to_string()),
-            _ => continue,
-        };
-        dynamic_set.insert((owner, cat));
-    }
-
-    let static_keys: BTreeSet<(String, String)> = static_map
-        .keys()
-        .map(|(o, c)| (o.clone(), c.to_string()))
-        .collect();
-
-    let mut results: Vec<serde_json::Value> = Vec::new();
-    let (mut n_confirmed, mut n_dynamic, mut n_static, mut n_unverif) = (0, 0, 0, 0);
-
-    // confirmed + static-only/unverifiable, walking the static surface.
-    for ((owner, cat), loc) in &static_map {
-        let key = (owner.clone(), cat.to_string());
-        if dynamic_set.contains(&key) {
-            n_confirmed += 1;
-            results.push(json!({
-                "status": "confirmed", "effect": cat, "owner": owner, "loc": loc,
-                "label": format!("confirmed {cat}  {owner}"),
-                "group": "confirmed", "cols": [cat.to_string(), owner.clone()],
-            }));
-        } else if AUDITABLE.contains(cat) {
-            n_static += 1;
-            results.push(json!({
-                "status": "static-only", "effect": cat, "owner": owner, "loc": loc,
-                "label": format!("static-only {cat}  {owner} (over-approx or unexercised)"),
-                "group": "static-only", "cols": [cat.to_string(), owner.clone(), "over-approx or unexercised".to_string()],
-            }));
-        } else {
-            n_unverif += 1;
-            results.push(json!({
-                "status": "unverifiable", "effect": cat, "owner": owner, "loc": loc,
-                "label": format!("unverifiable {cat}  {owner} (category not audited)"),
-                "group": "unverifiable", "cols": [cat.to_string(), owner.clone(), "category not audited".to_string()],
-            }));
-        }
-    }
-    // dynamic-only: observed effects the static surface never predicted.
-    for (owner, cat) in &dynamic_set {
-        if !static_keys.contains(&(owner.clone(), cat.clone())) {
-            n_dynamic += 1;
-            results.push(json!({
-                "status": "dynamic-only", "effect": cat, "owner": owner,
-                "label": format!("dynamic-only {cat}  {owner} (static missed this edge)"),
-                "group": "dynamic-only", "cols": [cat.clone(), owner.clone(), "static missed this edge".to_string()],
-            }));
-        }
-    }
-
-    // Stable order: status bucket, then category, then owner.
-    let bucket_rank = |s: &str| match s {
-        "dynamic-only" => 0,
-        "confirmed" => 1,
-        "static-only" => 2,
-        _ => 3,
-    };
-    results.sort_by(|a, b| {
-        let sa = a["status"].as_str().unwrap_or("");
-        let sb = b["status"].as_str().unwrap_or("");
-        bucket_rank(sa)
-            .cmp(&bucket_rank(sb))
-            .then(a["effect"].as_str().cmp(&b["effect"].as_str()))
-            .then(a["owner"].as_str().cmp(&b["owner"].as_str()))
-    });
-
-    let summary = format!(
-        "effect-diff: {n_dynamic} dynamic-only, {n_confirmed} confirmed, \
-         {n_static} static-only, {n_unverif} unverifiable"
-    );
-    let mut query = json!({ "kind": "effect-diff" });
-    if let (Some(obj), Some(exit)) = (query.as_object_mut(), pytest_exit) {
-        obj.insert("pytest_exit".to_string(), exit);
-    }
-
-    let mut warnings = vec![
-        "dynamic-only effects are the dynamic-dispatch edges the static surface \
-         can't see — the reason to run this."
-            .to_string(),
-        "static-only ≠ over-approximation: the suite may simply not exercise that \
-         path. change-coverage (#9.4) will separate the two."
-            .to_string(),
-    ];
-    // Carry through the ledger's own caveats (unaudited categories, dropped
-    // non-project hits) so they aren't lost in the join.
-    warnings.extend(observed.warnings.iter().cloned());
-
-    Ok(Envelope::new(query, results)
-        .with_summary(summary)
-        .with_warnings(warnings))
-}
 
 /// change-coverage (#9.4): join the lines changed since `base` against per-test
 /// runtime line coverage. Each changed line is `covered` (with the tests that
@@ -965,65 +938,6 @@ fn query_change_cov(
         .with_warnings(warnings))
 }
 
-/// observed shapes (#9.5): the concrete return types each callable produced at
-/// runtime. Runtime evidence next to ty's static inference — a callable that
-/// only ever returned `int` while annotated `-> Any`, or no annotation at all,
-/// is a candidate to tighten. Needs 3.12+; degrades with a warning otherwise.
-fn query_shapes(
-    cli: &Cli,
-    pytest_args: &[String],
-    python: Option<&str>,
-) -> anyhow::Result<Envelope> {
-    let mut opts = TraceOptions::new(cli.root.clone());
-    opts.python = python.map(str::to_string).unwrap_or_else(default_python);
-    opts.pytest_args = pytest_args.to_vec();
-    let shapes = observed_shapes(&opts)?;
-
-    let query = json!({
-        "kind": "shapes",
-        "python": shapes.python,
-        "pytest_exit": shapes.pytest_exit,
-    });
-
-    if !shapes.monitoring_available {
-        return Ok(Envelope::new(query, Vec::new())
-            .with_summary(format!(
-                "observed shapes need Python 3.12+; ran under {}",
-                shapes.python
-            ))
-            .with_warnings(vec![format!(
-                "return-type observation needs the `sys.monitoring` API (Python \
-                 3.12+); ran under {} — no shapes collected",
-                shapes.python
-            )]));
-    }
-
-    let results: Vec<serde_json::Value> = shapes
-        .returns
-        .iter()
-        .map(|(fqn, types)| {
-            json!({
-                "owner": fqn,
-                "returns": types,
-                "label": format!("{fqn} -> {}", types.join(" | ")),
-                // No loc (runtime observation); two columns: callable and the
-                // union of return types it was seen to produce.
-                "cols": [fqn.clone(), format!("-> {}", types.join(" | "))],
-            })
-        })
-        .collect();
-
-    let summary = format!(
-        "observed return shapes for {} callable(s)",
-        results.len()
-    );
-    Ok(Envelope::new(query, results).with_summary(summary).with_warnings(vec![
-        "runtime evidence from this suite only — a type never seen here may still \
-         occur; absence is not proof. Static inference (ty) remains the oracle."
-            .to_string(),
-    ]))
-}
-
 /// The owner FQN of a def (`module + container + name`) — the call-graph node id.
 fn owner_fqn(path: &str, container: &[String], name: &str) -> String {
     let mut scope = container.to_vec();
@@ -1050,28 +964,106 @@ fn effect_kind_str(kind: EffectKind) -> &'static str {
     }
 }
 
-/// The external input surface across the tree (syntactic).
-fn query_inputs(files: &[FileIndex]) -> Envelope {
-    let mut results = Vec::new();
-    for f in files {
-        for i in &f.inputs {
-            let kind = match i.kind {
-                InputKind::Env => "env",
-                InputKind::File => "file",
-                InputKind::Arg => "arg",
-                InputKind::Setting => "setting",
+/// The external input surface (syntactic). With no `target`, the **app**
+/// surface — inputs from files that are neither runnable scripts nor tests —
+/// plus a hint pointing at the scripts that carry their own inputs. With a
+/// `target`, the inputs of the script(s)/file(s) it names (by command name,
+/// basename, or path suffix).
+fn query_inputs(files: &[FileIndex], target: Option<&str>) -> Envelope {
+    match target {
+        Some(t) => {
+            let matched: Vec<&FileIndex> =
+                files.iter().filter(|f| file_matches(&f.path, t)).collect();
+            let mut results = Vec::new();
+            for f in &matched {
+                input_rows(f, &mut results);
+            }
+            let summary = match matched.as_slice() {
+                [] => format!("no file matches `{t}`"),
+                [f] => format!("{} inputs in {}", results.len(), f.path),
+                _ => {
+                    format!("{} inputs across {} files matching `{t}`", results.len(), matched.len())
+                }
             };
-            results.push(json!({
-                "loc": format!("{}:{}:{}", f.path, i.pos.line, i.pos.col),
-                "label": format!("{kind} {}", i.value),
-                "group": kind,
-                "cols": [i.value.clone()],
-            }));
+            Envelope::new(json!({ "kind": "inputs", "target": t }), results).with_summary(summary)
+        }
+        None => {
+            let mut results = Vec::new();
+            let mut scripts: Vec<String> = Vec::new();
+            for f in files {
+                if deadcode::is_script_file(&f.path, f.has_main_guard) {
+                    // A script's inputs are its own — surfaced only when queried.
+                    if !f.inputs.is_empty() {
+                        scripts.push(script_name(&f.path));
+                    }
+                    continue;
+                }
+                if tests_map::is_test_file(&f.path) {
+                    continue;
+                }
+                input_rows(f, &mut results);
+            }
+            let summary = format!("{} app inputs", results.len());
+            let mut env = Envelope::new(json!({ "kind": "inputs", "target": null }), results)
+                .with_summary(summary);
+            if !scripts.is_empty() {
+                scripts.sort();
+                scripts.dedup();
+                let n = scripts.len();
+                let shown = scripts.iter().take(6).cloned().collect::<Vec<_>>().join(", ");
+                let more = if n > 6 { format!(", … (+{} more)", n - 6) } else { String::new() };
+                let (possessive, verb) =
+                    if n == 1 { ("", "has its") } else { ("s", "have their") };
+                env = env.with_notes(vec![
+                    format!(
+                        "{n} script{possessive} {verb} own inputs (management commands, scripts/) — query one by name:",
+                    ),
+                    format!("pyq inputs <name> — e.g. {shown}{more}"),
+                ]);
+            }
+            env
         }
     }
-    let summary = format!("{} inputs", results.len());
-    // Uniform query schema: every verb echoes kind + target (null where none).
-    Envelope::new(json!({ "kind": "inputs", "target": null }), results).with_summary(summary)
+}
+
+/// Push one row per input of `f` into `out` (env/file/arg/setting sections).
+fn input_rows(f: &FileIndex, out: &mut Vec<serde_json::Value>) {
+    for i in &f.inputs {
+        let kind = match i.kind {
+            InputKind::Env => "env",
+            InputKind::File => "file",
+            InputKind::Arg => "arg",
+            InputKind::Setting => "setting",
+        };
+        out.push(json!({
+            "loc": format!("{}:{}:{}", f.path, i.pos.line, i.pos.col),
+            "label": format!("{kind} {}", i.value),
+            "group": kind,
+            "cols": [i.value.clone()],
+        }));
+    }
+}
+
+/// A script's queryable name — its file stem (`…/commands/backfill_calls.py` →
+/// `backfill_calls`), the token a Django management command is invoked by.
+fn script_name(path: &str) -> String {
+    std::path::Path::new(path)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or(path)
+        .to_string()
+}
+
+/// Whether `path` is named by `target`: exact path, basename, command name
+/// (file stem), or a segment-aligned path suffix (`a/b.py` matches `…/a/b.py`).
+fn file_matches(path: &str, target: &str) -> bool {
+    let p = std::path::Path::new(path);
+    let base = p.file_name().and_then(|s| s.to_str()).unwrap_or(path);
+    let stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or(path);
+    path == target
+        || base == target
+        || stem == target
+        || (target.contains('/') && path.ends_with(&format!("/{target}")))
 }
 
 /// The class hierarchy of a symbol — supertypes, subclasses, and the override

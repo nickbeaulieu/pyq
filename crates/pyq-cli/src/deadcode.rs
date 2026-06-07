@@ -387,6 +387,32 @@ fn windowed_contains(comps: &[&str], a: &str, b: &str) -> bool {
     comps.windows(2).any(|w| w[0] == a && w[1] == b)
 }
 
+/// Whether a file is a *runnable script* — meant to be invoked on its own, not
+/// part of the long-running app. The `inputs` verb uses this to keep per-script
+/// CLI args / env reads out of the default (app-surface) view; a script's inputs
+/// show only when that script is queried by name.
+///
+/// This is the runnable *subset* of [`is_entrypoint_file`] — deliberately
+/// narrower: `settings.py`, `wsgi.py`/`asgi.py`, `urls.py`, and `migrations/`
+/// are the app's own config/launch surface, **not** scripts. A file qualifies
+/// when it is a Django management command, lives in a `scripts/`/`bin/` tree,
+/// is `manage.py`, or carries a `if __name__ == "__main__":` guard.
+pub fn is_script_file(path: &str, has_main_guard: bool) -> bool {
+    let base = Path::new(path)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(path);
+    if base == "__init__.py" {
+        return false;
+    }
+    let comps: Vec<&str> = path.split(['/', '\\']).collect();
+    has_main_guard
+        || base == "manage.py"
+        || windowed_contains(&comps, "management", "commands")
+        || comps.first() == Some(&"scripts")
+        || comps.first() == Some(&"bin")
+}
+
 /// Whether a console-script target (`module.func`, as written in pyproject)
 /// names the def with this FQN — exact, or by suffix to tolerate a source root
 /// (pyproject's `pkg.cli` vs the file-derived `src.pkg.cli`).
@@ -426,4 +452,33 @@ fn console_script_targets(root: &str) -> Vec<String> {
             .and_then(|p| p.get("scripts")),
     );
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_script_file;
+
+    #[test]
+    fn classifies_runnable_scripts_but_not_app_config() {
+        // Runnable scripts.
+        assert!(is_script_file("manage.py", false));
+        assert!(is_script_file("app/management/commands/backfill.py", false));
+        assert!(is_script_file("scripts/seed.py", false));
+        assert!(is_script_file("bin/run.py", false));
+        // A `__main__`-guarded module anywhere is a script.
+        assert!(is_script_file("pkg/tool.py", true));
+
+        // App config / launch surface is NOT a script — `inputs` shows it by
+        // default. This is the distinction that separates this from
+        // `is_entrypoint_file`, which lumps them together.
+        assert!(!is_script_file("salessync/settings.py", false));
+        assert!(!is_script_file("salessync/wsgi.py", false));
+        assert!(!is_script_file("salessync/asgi.py", false));
+        assert!(!is_script_file("api/urls.py", false));
+        assert!(!is_script_file("api/migrations/0001_initial.py", false));
+        assert!(!is_script_file("api/services/email_service.py", false));
+
+        // A package marker is never a script, even under a commands/ tree.
+        assert!(!is_script_file("app/management/commands/__init__.py", false));
+    }
 }

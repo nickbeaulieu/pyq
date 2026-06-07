@@ -1,7 +1,7 @@
-//! change-coverage (#9.4) over the built `pyq` binary: build a git repo, change
-//! one tested line and one untested line, assert the covered/uncovered split
-//! and the covering test. Needs git + python3 + pytest (3.12+ for real line
-//! coverage); skips if any piece is missing.
+//! Changed-line coverage — the absorbed `change-coverage`, now `tests --base`:
+//! build a git repo, change one tested line and one untested line, assert the
+//! covered/uncovered split and the covering test. Needs git + python3 + pytest
+//! (3.12+ for real line coverage); skips if any piece is missing.
 
 use std::fs;
 use std::process::Command;
@@ -57,7 +57,7 @@ fn change_coverage_splits_covered_and_uncovered() {
     let out = Command::new(env!("CARGO_BIN_EXE_pyq"))
         .args(["--json", "--root"])
         .arg(p)
-        .args(["change-coverage", "-q"])
+        .args(["tests", "--base", "HEAD"])
         .output()
         .expect("run pyq");
     let stdout = String::from_utf8_lossy(&out.stdout);
